@@ -1,4 +1,5 @@
 import sys
+import os
 import argparse
 import logging
 from pathlib import Path
@@ -25,27 +26,39 @@ logger = logging.getLogger("backtest.cli")
 
 
 def load_historical_nifty_data(days: int = 180) -> pd.DataFrame:
-    """Fetches historical NIFTY 5m bars from local cache or Kite Connect, filtered to requested days."""
+    """Fetches historical NIFTY 5m bars from local/sibling cache or Kite Connect, filtered to requested days."""
+    env_cache = os.getenv("HISTORICAL_CACHE_PATH")
     cache_path = Path(__file__).resolve().parent / "data" / "nifty_5m_cache.parquet"
     sibling_cache = Path("D:/code/Sharads_monthly_option_selling_desk/data_cache/NSEI_5m_historical.parquet")
 
-    if cache_path.exists():
+    if env_cache and Path(env_cache).exists():
+        logger.info("Loading NIFTY 5m bars from HISTORICAL_CACHE_PATH: %s", env_cache)
+        df = pd.read_parquet(Path(env_cache))
+    elif cache_path.exists():
         logger.info("Loading cached NIFTY 5-minute bars from %s", cache_path)
         df = pd.read_parquet(cache_path)
     elif sibling_cache.exists():
         logger.info("Loading NIFTY 5m bars from sibling desk cache: %s", sibling_cache)
         df = pd.read_parquet(sibling_cache)
     else:
-        logger.info("Fetching %d days of NIFTY 5m bars via Kite Connect API...", days)
+        logger.info("Fetching %d days of NIFTY 5m bars via Kite Connect API (in 60-day chunks)...", days)
         kite = get_kite_client()
         end_dt = datetime.now()
         start_dt = end_dt - timedelta(days=days)
         
-        # NIFTY 50 token on NSE
-        records = kite.historical_data(256265, start_dt, end_dt, "5minute")
-        df = pd.DataFrame(records)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(cache_path)
+        chunks = []
+        cur_start = start_dt
+        while cur_start < end_dt:
+            cur_end = min(cur_start + timedelta(days=60), end_dt)
+            records = kite.historical_data(256265, cur_start, cur_end, "5minute")
+            if records:
+                chunks.extend(records)
+            cur_start = cur_end
+
+        df = pd.DataFrame(chunks)
+        if not df.empty:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(cache_path)
 
     if not df.empty and days > 0:
         ts_col = "timestamps" if "timestamps" in df.columns else ("date" if "date" in df.columns else df.columns[0])

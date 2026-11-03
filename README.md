@@ -65,6 +65,8 @@ uv run python run_backtest.py --days 180 --lots 10
 uv run python run_backtest.py --days 90 --slippage 0.75 --lots 5 --output data/custom_log.csv
 ```
 
+> **Data Caching**: Historical bars can be loaded from `HISTORICAL_CACHE_PATH` (if set), `data/nifty_5m_cache.parquet`, or fetched via Kite Connect in 60-day slices.
+
 ### 3. Run 10:00 AM Strangle Strategy Desk
 Executes or simulates the 10:00 AM Short Strangle desk:
 - **0 DTE Rule**: When today is Thursday (weekly expiry), automatically selects next week's expiry.
@@ -76,8 +78,11 @@ Executes or simulates the 10:00 AM Short Strangle desk:
 # Dry-run strike lookup and strategy plan (without placing orders)
 uv run python run_strategy.py --paper --dry-run
 
-# Run Paper Trading simulation
+# Run Paper Trading simulation (polling loop)
 uv run python run_strategy.py --paper --lots 10
+
+# Single evaluation pass (for tests or one-shot automation)
+uv run python run_strategy.py --paper --once
 
 # Execute Live Trading via Kite Connect
 uv run python run_strategy.py --live --lots 10
