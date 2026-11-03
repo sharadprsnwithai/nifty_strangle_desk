@@ -143,3 +143,57 @@ def test_desk_clear_state(tmp_path):
 
     # Clearing again when file does not exist should not raise
     desk.clear_state()
+
+
+def test_order_manager_paper_get_order_status_and_cancel():
+    om = OrderManager(mode="PAPER", kite=None)
+    order = om.sell(symbol="NIFTY26NOV24200CE", quantity=650, price=32.0)
+    oid = order["order_id"]
+
+    status = om.get_order_status(oid)
+    assert status["order_id"] == oid
+    assert status["status"] == "COMPLETE"
+    assert status["filled_quantity"] == 650
+    assert status["pending_quantity"] == 0
+    assert status["average_price"] == 32.0
+
+    # Cancel paper order
+    res = om.cancel_order(oid)
+    assert res is True
+    cancelled_status = om.get_order_status(oid)
+    assert cancelled_status["status"] == "CANCELLED"
+    assert cancelled_status["pending_quantity"] == 0
+
+
+def test_order_manager_live_get_order_status_and_cancel():
+    mock_kite = MagicMock()
+    mock_kite.order_history.return_value = [
+        {"order_id": "ORD_LIVE_1", "status": "OPEN", "filled_quantity": 0, "pending_quantity": 650, "average_price": 0.0},
+        {"order_id": "ORD_LIVE_1", "status": "COMPLETE", "filled_quantity": 650, "pending_quantity": 0, "average_price": 31.85, "status_message": None}
+    ]
+
+    om = OrderManager(mode="LIVE", kite=mock_kite)
+    status = om.get_order_status("ORD_LIVE_1")
+
+    assert status["order_id"] == "ORD_LIVE_1"
+    assert status["status"] == "COMPLETE"
+    assert status["filled_quantity"] == 650
+    assert status["pending_quantity"] == 0
+    assert status["average_price"] == 31.85
+    mock_kite.order_history.assert_called_once_with("ORD_LIVE_1")
+
+    # Test cancel
+    mock_kite.cancel_order.return_value = {"order_id": "ORD_LIVE_1"}
+    cancelled = om.cancel_order("ORD_LIVE_1")
+    assert cancelled is True
+    mock_kite.cancel_order.assert_called_once_with(variety="regular", order_id="ORD_LIVE_1")
+
+    # Test error handling when Kite API raises
+    mock_kite.order_history.side_effect = Exception("Network timeout")
+    err_status = om.get_order_status("ORD_LIVE_1")
+    assert err_status["status"] == "ERROR"
+    assert "Network timeout" in err_status["status_message"]
+
+    mock_kite.cancel_order.side_effect = Exception("Order already executed")
+    err_cancel = om.cancel_order("ORD_LIVE_1")
+    assert err_cancel is False

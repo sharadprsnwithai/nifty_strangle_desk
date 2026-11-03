@@ -73,6 +73,7 @@ Executes or simulates the 10:00 AM Short Strangle desk:
 - **Contract Specifications**: NIFTY lot size is 65 (10 lots = 650 shares).
 - **Strike Selection**: Lowest OTM strikes with LTP $\ge ₹30.0$.
 - **Risk Management**: Independent $+50\%$ Stop Loss per leg, independent $80\%$ decay profit target per leg, hard ₹10,000 per-leg max loss exit, and mandatory 3:00 PM square-off.
+- **Order Execution Verification & Timeout**: Monitors entry order status for up to 5 minutes (`--order-timeout 300`). If unfilled, pending orders are automatically cancelled. If partially filled, pending portions are cancelled and filled shares are immediately squared off (`buy_to_cover`) to prevent unhedged or unmatched exposure.
 - **Market Protection**: Uses marketable `LIMIT` orders with customizable price buffer (default: 5% off LTP) rounded to NSE ₹0.05 ticks to prevent Zerodha RMS freak-trade order rejections.
 - **NSE Holiday Protection**: Automatically checks weekend and official NSE trading holiday calendars and skips non-trading sessions.
 - **Telegram Alerts**: Real-time notifications on entry fills, SL/Max-Loss triggers, decay targets, and 15:00 summary.

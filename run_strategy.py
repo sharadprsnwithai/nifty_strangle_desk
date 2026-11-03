@@ -35,6 +35,7 @@ def run_strategy_cli(args=None) -> int:
     parser.add_argument("--order-type", choices=["LIMIT", "MARKET"], default="LIMIT", help="Order execution type (default: LIMIT)")
     parser.add_argument("--limit-buffer-pct", type=float, default=0.05, help="Marketable limit price buffer percentage (default: 0.05 / 5%)")
     parser.add_argument("--ignore-holidays", action="store_true", help="Ignore NSE holiday and weekend checks")
+    parser.add_argument("--order-timeout", type=int, default=300, help="Order fill timeout in seconds before cancellation (default: 300)")
     parser.add_argument("--dry-run", action="store_true", help="Perform single strike lookup and print plan without waiting")
     parser.add_argument("--once", action="store_true", help="Run single monitoring iteration and exit")
 
@@ -60,7 +61,8 @@ def run_strategy_cli(args=None) -> int:
             max_loss_per_leg=parsed.max_loss,
             order_type=parsed.order_type,
             limit_buffer_pct=parsed.limit_buffer_pct,
-            ignore_holidays=parsed.ignore_holidays
+            ignore_holidays=parsed.ignore_holidays,
+            order_timeout=parsed.order_timeout
         )
         return 0
     except Exception as e:

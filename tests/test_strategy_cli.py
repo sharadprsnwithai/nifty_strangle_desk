@@ -165,7 +165,8 @@ def test_run_strategy_cli_once_flag():
             max_loss_per_leg=10000.0,
             order_type="LIMIT",
             limit_buffer_pct=0.05,
-            ignore_holidays=False
+            ignore_holidays=False,
+            order_timeout=300
         )
 
 
@@ -331,7 +332,8 @@ def test_run_strategy_cli_max_loss_flag():
             max_loss_per_leg=8000.0,
             order_type="LIMIT",
             limit_buffer_pct=0.05,
-            ignore_holidays=False
+            ignore_holidays=False,
+            order_timeout=300
         )
 
 
@@ -369,5 +371,113 @@ def test_run_strategy_cli_order_type_and_holiday_flags():
             max_loss_per_leg=10000.0,
             order_type="MARKET",
             limit_buffer_pct=0.08,
-            ignore_holidays=True
+            ignore_holidays=True,
+            order_timeout=300
         )
+
+
+def test_run_strategy_cli_order_timeout_flag():
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client") as mock_kite_fn, \
+         patch("run_strategy.StrangleDesk") as mock_desk_cls:
+        
+        mock_kite = MagicMock()
+        mock_kite_fn.return_value = mock_kite
+        mock_desk = MagicMock()
+        mock_desk_cls.return_value = mock_desk
+
+        exit_code = run_strategy_cli(["--paper", "--order-timeout", "120", "--once"])
+        assert exit_code == 0
+        mock_desk.run_session.assert_called_once_with(
+            underlying="NIFTY",
+            lots=10,
+            poll_seconds=5,
+            dry_run=False,
+            execute_once=True,
+            kite=mock_kite,
+            max_loss_per_leg=10000.0,
+            order_type="LIMIT",
+            limit_buffer_pct=0.05,
+            ignore_holidays=False,
+            order_timeout=120
+        )
+
+
+def test_strangle_desk_run_session_order_timeout_zero_fill_aborts(tmp_path):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+    ]
+    mock_kite.ltp.return_value = {
+        "NFO:NIFTY26NOV24200CE": {"last_price": 32.0},
+        "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}
+    }
+
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    om.mode = "LIVE"
+    om.sell.side_effect = [
+        {"order_id": "ORD_CE_1", "status": "SUBMITTED"},
+        {"order_id": "ORD_PE_1", "status": "SUBMITTED"}
+    ]
+    # Simulate both orders still OPEN with 0 filled after timeout
+    om.get_order_status.side_effect = [
+        {"order_id": "ORD_CE_1", "status": "OPEN", "filled_quantity": 0, "pending_quantity": 65, "average_price": 0.0},
+        {"order_id": "ORD_PE_1", "status": "OPEN", "filled_quantity": 0, "pending_quantity": 65, "average_price": 0.0}
+    ]
+
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+    res = desk.run_session(lots=1, order_timeout=1, poll_seconds=0, execute_once=True, kite=mock_kite)
+
+    assert res is not None
+    assert res["status"] == "ABORTED"
+    assert res["reason"] == "ENTRY_ORDER_TIMEOUT"
+    # Verify cancellation was called for both orders
+    om.cancel_order.assert_any_call("ORD_CE_1")
+    om.cancel_order.assert_any_call("ORD_PE_1")
+    # Verify buy_to_cover was NOT called because filled_quantity == 0
+    om.buy_to_cover.assert_not_called()
+    assert state_file.exists()
+
+
+def test_strangle_desk_run_session_partial_fill_aborts_and_squares_off(tmp_path):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+    ]
+    mock_kite.ltp.return_value = {
+        "NFO:NIFTY26NOV24200CE": {"last_price": 32.5},
+        "NFO:NIFTY26NOV23700PE": {"last_price": 30.5}
+    }
+
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    om.mode = "LIVE"
+    om.sell.side_effect = [
+        {"order_id": "ORD_CE_2", "status": "SUBMITTED"},
+        {"order_id": "ORD_PE_2", "status": "SUBMITTED"}
+    ]
+    # CE was completely filled (650 shares), PE only partially filled (130 shares)
+    om.get_order_status.side_effect = [
+        {"order_id": "ORD_CE_2", "status": "COMPLETE", "filled_quantity": 650, "pending_quantity": 0, "average_price": 32.0},
+        {"order_id": "ORD_PE_2", "status": "OPEN", "filled_quantity": 130, "pending_quantity": 520, "average_price": 31.0}
+    ]
+
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+    res = desk.run_session(lots=10, order_timeout=1, poll_seconds=0, execute_once=True, kite=mock_kite)
+
+    assert res is not None
+    assert res["status"] == "ABORTED"
+    assert res["reason"] == "ENTRY_ORDER_TIMEOUT"
+    # PE still had pending quantity, so cancel_order must be called on PE
+    om.cancel_order.assert_called_with("ORD_PE_2")
+    # Both CE and PE filled quantities must be squared off to prevent unmatched or partial exposure
+    om.buy_to_cover.assert_any_call(
+        "NIFTY26NOV24200CE", 650, 32.5, reason="ABORT_UNMATCHED_LEG", order_type="LIMIT", buffer_pct=0.05
+    )
+    om.buy_to_cover.assert_any_call(
+        "NIFTY26NOV23700PE", 130, 30.5, reason="ABORT_PARTIAL_FILL", order_type="LIMIT", buffer_pct=0.05
+    )
+    assert state_file.exists()

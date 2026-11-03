@@ -4,6 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: nifty_strangle_desk
+    image: ${DOCKER_USER:-sharadprsn}/nifty_strangle_desk:latest
     restart: unless-stopped
     env_file:
       - .env
