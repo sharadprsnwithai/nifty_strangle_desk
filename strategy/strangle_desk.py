@@ -420,6 +420,19 @@ class StrangleDesk:
             ce_ltp = self._extract_ltp(quotes, ce_sym, default=state["ce"]["entry_price"])
             pe_ltp = self._extract_ltp(quotes, pe_sym, default=state["pe"]["entry_price"])
 
+            ce_status = state["ce"].get("status")
+            pe_status = state["pe"].get("status")
+            ce_entry = float(state["ce"]["entry_price"])
+            pe_entry = float(state["pe"]["entry_price"])
+            ce_pnl = (ce_entry - ce_ltp) * qty if ce_status == "OPEN" else (ce_entry - float(state["ce"].get("exit_price") or ce_ltp)) * qty
+            pe_pnl = (pe_entry - pe_ltp) * qty if pe_status == "OPEN" else (pe_entry - float(state["pe"].get("exit_price") or pe_ltp)) * qty
+            logger.debug(
+                "Tick | CE (%s): LTP=%.2f, P&L=Rs %.2f [%s] | PE (%s): LTP=%.2f, P&L=Rs %.2f [%s] | Total P&L=Rs %.2f",
+                ce_sym, ce_ltp, ce_pnl, ce_status,
+                pe_sym, pe_ltp, pe_pnl, pe_status,
+                ce_pnl + pe_pnl
+            )
+
             # Evaluate CE leg
             if state["ce"].get("status") == "OPEN":
                 ce_sl = state["ce"]["sl_price"]

@@ -403,6 +403,26 @@ def test_run_strategy_cli_order_timeout_flag():
         )
 
 
+def test_run_strategy_cli_log_flags(tmp_path):
+    log_dir = tmp_path / "custom_cli_logs"
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client") as mock_kite_fn, \
+         patch("run_strategy.StrangleDesk") as mock_desk_cls:
+        
+        mock_kite = MagicMock()
+        mock_kite_fn.return_value = mock_kite
+        mock_desk = MagicMock()
+        mock_desk_cls.return_value = mock_desk
+
+        exit_code = run_strategy_cli(["--paper", "--log-level", "DEBUG", "--log-dir", str(log_dir), "--once"])
+        assert exit_code == 0
+        assert log_dir.exists()
+        log_file = log_dir / "strangle_desk.log"
+        assert log_file.exists()
+        content = log_file.read_text(encoding="utf-8")
+        assert "Initializing 10:00 AM NIFTY Short Strangle Desk" in content
+
+
 def test_strangle_desk_run_session_order_timeout_zero_fill_aborts(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [

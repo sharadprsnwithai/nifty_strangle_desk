@@ -77,14 +77,14 @@ Executes or simulates the 10:00 AM Short Strangle desk:
 - **Market Protection**: Uses marketable `LIMIT` orders with customizable price buffer (default: 5% off LTP) rounded to NSE ₹0.05 ticks to prevent Zerodha RMS freak-trade order rejections.
 - **NSE Holiday Protection**: Automatically checks weekend and official NSE trading holiday calendars and skips non-trading sessions.
 - **Telegram Alerts**: Real-time notifications on entry fills, SL/Max-Loss triggers, decay targets, and 15:00 summary.
-- **State Recovery**: Crash-resilient tracking persisted to `data/trades_today.json`.
+- **State Recovery & Host Event Logging**: Crash-resilient tracking persisted to `data/trades_today.json`, and rotating detailed event logs persisted directly to `logs/strangle_desk.log` on the host machine.
 
 ```bash
 # Dry-run strike lookup and strategy plan (without placing orders)
 uv run python run_strategy.py --paper --dry-run
 
-# Run Paper Trading simulation (polling loop, 5% limit order buffer)
-uv run python run_strategy.py --paper --lots 10 --order-type LIMIT --limit-buffer-pct 0.05
+# Run Paper Trading simulation (polling loop, 5% limit order buffer, debug logging)
+uv run python run_strategy.py --paper --lots 10 --order-type LIMIT --limit-buffer-pct 0.05 --log-level DEBUG
 
 # Single evaluation pass (for tests or one-shot automation)
 uv run python run_strategy.py --paper --once
@@ -95,7 +95,7 @@ uv run python run_strategy.py --live --lots 1 --order-type LIMIT --max-loss 1000
 
 ### 4. Docker & Cloud VPS Deployment
 
-The desk is fully containerized with Indian Standard Time (`Asia/Kolkata`) pre-configured and state volume mounts.
+The desk is fully containerized with Indian Standard Time (`Asia/Kolkata`) pre-configured, state volume mounts, and host event log streaming.
 
 #### Using Docker Compose (Recommended)
 
@@ -116,7 +116,11 @@ The desk is fully containerized with Indian Standard Time (`Asia/Kolkata`) pre-c
 
 3. **Stream Real-Time Strategy Logs**:
    ```bash
+   # From container stdout
    docker compose logs -f
+
+   # Or inspect persisted log file on host machine directly
+   tail -f logs/strangle_desk.log
    ```
 
 4. **Stop or Restart**:
@@ -129,7 +133,7 @@ The desk is fully containerized with Indian Standard Time (`Asia/Kolkata`) pre-c
 
 - **Dry Run Verification**:
   ```bash
-  docker run --rm --env-file .env -v "${PWD}/data:/app/data" nifty-strangle-desk:test --paper --dry-run
+  docker run --rm --env-file .env -v "${PWD}/data:/app/data" -v "${PWD}/logs:/app/logs" nifty-strangle-desk:test --paper --dry-run
   ```
 
 - **Live Production Trading**:
@@ -137,6 +141,7 @@ The desk is fully containerized with Indian Standard Time (`Asia/Kolkata`) pre-c
   docker run -d --name nifty_desk --restart unless-stopped \
     --env-file .env \
     -v "${PWD}/data:/app/data" \
+    -v "${PWD}/logs:/app/logs" \
     nifty-strangle-desk:test \
     --live --lots 1 --order-type LIMIT --limit-buffer-pct 0.05 --max-loss 1000
   ```

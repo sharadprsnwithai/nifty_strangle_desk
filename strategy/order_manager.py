@@ -81,18 +81,24 @@ class OrderManager:
         else:
             params["order_type"] = self.kite.ORDER_TYPE_MARKET
 
-        order_id = self.kite.place_order(**params)
-        return {
-            "order_id": order_id,
-            "mode": "LIVE",
-            "symbol": symbol,
-            "transaction_type": "SELL",
-            "quantity": quantity,
-            "order_type": order_type_norm,
-            "limit_price": limit_price,
-            "fill_price": price,
-            "status": "SUBMITTED"
-        }
+        try:
+            logger.info("[LIVE] Submitting SELL order: %s x %d (OrderType: %s, LimitPrice: %s)", symbol, quantity, order_type_norm, limit_price)
+            order_id = self.kite.place_order(**params)
+            logger.info("[LIVE] SELL order placed successfully: %s x %d (Order ID: %s)", symbol, quantity, order_id)
+            return {
+                "order_id": order_id,
+                "mode": "LIVE",
+                "symbol": symbol,
+                "transaction_type": "SELL",
+                "quantity": quantity,
+                "order_type": order_type_norm,
+                "limit_price": limit_price,
+                "fill_price": price,
+                "status": "SUBMITTED"
+            }
+        except Exception as e:
+            logger.exception("[LIVE] Failed to place SELL order for %s (qty: %d, type: %s): %s", symbol, quantity, order_type_norm, e)
+            raise
 
     def buy_to_cover(
         self,
@@ -155,19 +161,25 @@ class OrderManager:
         else:
             params["order_type"] = self.kite.ORDER_TYPE_MARKET
 
-        order_id = self.kite.place_order(**params)
-        return {
-            "order_id": order_id,
-            "mode": "LIVE",
-            "symbol": symbol,
-            "transaction_type": "BUY",
-            "quantity": quantity,
-            "order_type": order_type_norm,
-            "limit_price": limit_price,
-            "fill_price": price,
-            "reason": reason,
-            "status": "SUBMITTED"
-        }
+        try:
+            logger.info("[LIVE] Submitting BUY-TO-COVER order: %s x %d (OrderType: %s, LimitPrice: %s, Reason: %s)", symbol, quantity, order_type_norm, limit_price, reason)
+            order_id = self.kite.place_order(**params)
+            logger.info("[LIVE] BUY-TO-COVER order placed successfully: %s x %d (Order ID: %s, Reason: %s)", symbol, quantity, order_id, reason)
+            return {
+                "order_id": order_id,
+                "mode": "LIVE",
+                "symbol": symbol,
+                "transaction_type": "BUY",
+                "quantity": quantity,
+                "order_type": order_type_norm,
+                "limit_price": limit_price,
+                "fill_price": price,
+                "reason": reason,
+                "status": "SUBMITTED"
+            }
+        except Exception as e:
+            logger.exception("[LIVE] Failed to place BUY-TO-COVER order for %s (qty: %d, reason: %s): %s", symbol, quantity, reason, e)
+            raise
 
     def get_order_status(self, order_id: str) -> Dict[str, Any]:
         """
@@ -223,7 +235,7 @@ class OrderManager:
                 "status_message": latest.get("status_message")
             }
         except Exception as e:
-            logger.error("[LIVE] Error fetching order status for %s: %s", order_id, e)
+            logger.exception("[LIVE] Error fetching order status for %s: %s", order_id, e)
             return {
                 "order_id": order_id,
                 "status": "ERROR",
@@ -249,5 +261,5 @@ class OrderManager:
             logger.info("[LIVE] Cancel request sent successfully for order: %s", order_id)
             return True
         except Exception as e:
-            logger.error("[LIVE] Failed to cancel order %s: %s", order_id, e)
+            logger.exception("[LIVE] Failed to cancel order %s: %s", order_id, e)
             return False

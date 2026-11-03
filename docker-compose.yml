@@ -11,9 +11,12 @@ services:
     environment:
       - TZ=Asia/Kolkata
       - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
-      # Mount data directory so trades_today.json state and logs persist across container restarts
+      # Mount data directory so trades_today.json state persists across container restarts
       - ./data:/app/data
+      # Mount logs directory so detailed event logs persist directly on the host machine
+      - ./logs:/app/logs
     # -----------------------------------------------------------------------------------
     # Command Options:
     # 1. Live Incubation (1 Lot, Rs 1k Max Loss per leg, Marketable Limit Orders):

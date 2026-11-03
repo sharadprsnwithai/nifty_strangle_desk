@@ -31,8 +31,8 @@ COPY notifications/ ./notifications/
 # Ensure virtual environment binaries are in PATH
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Create data directory for trade logs and state persistence
-RUN mkdir -p /app/data
+# Create data and logs directories for trade state and host event log persistence
+RUN mkdir -p /app/data /app/logs
 
 # Default entrypoint
 ENTRYPOINT ["python", "run_strategy.py"]

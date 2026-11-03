@@ -1,3 +1,4 @@
+import os
 import sys
 import argparse
 import logging
@@ -6,6 +7,7 @@ from kite import get_kite_client
 from strategy.option_chain import find_strangle_strikes
 from strategy.order_manager import OrderManager
 from strategy.strangle_desk import StrangleDesk
+from strategy.logger import setup_logging
 from notifications.telegram import TelegramNotifier
 
 # Ensure stdout and stderr handle UTF-8 characters gracefully across OS platforms
@@ -36,10 +38,13 @@ def run_strategy_cli(args=None) -> int:
     parser.add_argument("--limit-buffer-pct", type=float, default=0.05, help="Marketable limit price buffer percentage (default: 0.05 / 5%)")
     parser.add_argument("--ignore-holidays", action="store_true", help="Ignore NSE holiday and weekend checks")
     parser.add_argument("--order-timeout", type=int, default=300, help="Order fill timeout in seconds before cancellation (default: 300)")
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default=os.getenv("LOG_LEVEL", "INFO"), help="Logging verbosity level (default: INFO)")
+    parser.add_argument("--log-dir", type=str, default=os.getenv("LOG_DIR", "logs"), help="Directory for host log files (default: logs)")
     parser.add_argument("--dry-run", action="store_true", help="Perform single strike lookup and print plan without waiting")
     parser.add_argument("--once", action="store_true", help="Run single monitoring iteration and exit")
 
     parsed = parser.parse_args(args)
+    setup_logging(log_dir=parsed.log_dir, log_level=parsed.log_level)
     mode = "LIVE" if parsed.live else "PAPER"
 
     logger.info("Initializing 10:00 AM NIFTY Short Strangle Desk in [%s] mode...", mode)
