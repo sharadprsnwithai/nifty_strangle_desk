@@ -22,7 +22,7 @@ def _normalize_date(d: Any) -> Optional[date]:
 
 def resolve_target_expiry(
     instruments: List[Dict[str, Any]],
-    today_date: Optional[date] = None,
+    today_date: Optional[Any] = None,
     underlying: str = "NIFTY"
 ) -> date:
     """
@@ -30,7 +30,7 @@ def resolve_target_expiry(
     If today is expiry day (0 DTE), selects the Next Week expiry.
     Otherwise, selects the Current Week nearest expiry.
     """
-    today = today_date or datetime.now().date()
+    today = _normalize_date(today_date) if today_date else datetime.now().date()
 
     raw_expiries = {
         _normalize_date(i["expiry"])
@@ -86,7 +86,7 @@ def find_strangle_strikes(
     if not ce_contracts or not pe_contracts:
         raise ValueError(f"No CE/PE option contracts found for {underlying} on {target_expiry}")
 
-    lot_size = int(ce_contracts[0].get("lot_size", 75))
+    lot_size = int(ce_contracts[0].get("lot_size") or 75)
     total_quantity = lots * lot_size
 
     # Batch query prices
@@ -98,7 +98,7 @@ def find_strangle_strikes(
     for c in ce_contracts:
         sym = c["tradingsymbol"]
         ltp_data = quotes.get(f"NFO:{sym}", {})
-        ltp = float(ltp_data.get("last_price", 0.0))
+        ltp = float(ltp_data.get("last_price") or 0.0)
         if ltp >= target_price:
             valid_ce.append((ltp, c))
 
@@ -112,7 +112,7 @@ def find_strangle_strikes(
     for p in pe_contracts:
         sym = p["tradingsymbol"]
         ltp_data = quotes.get(f"NFO:{sym}", {})
-        ltp = float(ltp_data.get("last_price", 0.0))
+        ltp = float(ltp_data.get("last_price") or 0.0)
         if ltp >= target_price:
             valid_pe.append((ltp, p))
 

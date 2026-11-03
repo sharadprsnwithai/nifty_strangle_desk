@@ -19,7 +19,7 @@ def calculate_trade_costs(
     Parameters:
         entry_price: Short option execution price
         exit_price: Buy-to-cover execution price
-        quantity: Traded quantity (absolute number of shares/units)
+        quantity: Traded quantity (absolute number of shares/units; signed values are safely normalized via abs())
         slippage_per_share: Friction per share applied to each leg (default 0.50)
         
     Returns:

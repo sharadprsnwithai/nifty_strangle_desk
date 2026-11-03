@@ -19,7 +19,9 @@ class StrangleDesk:
     def save_state(self, state: Dict[str, Any]) -> None:
         self.state = state
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        temp_file = self.state_file.with_suffix(".tmp")
+        temp_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        temp_file.replace(self.state_file)
 
     def load_state(self) -> Optional[Dict[str, Any]]:
         if not self.state_file.exists():

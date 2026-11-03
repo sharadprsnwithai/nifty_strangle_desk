@@ -5,6 +5,9 @@ A modular algorithmic trading desk connected to Zerodha Kite Connect API using a
 ## Features
 - **Headless TOTP 2FA**: Automated daily login via `pyotp` RFC 6238 without manual browser interaction.
 - **Smart Token Caching**: Caches and validates daily `access_token` in `.env` to avoid unnecessary logins.
+- **10:00 AM NIFTY Short Strangle Strategy**: Automated strike discovery ($\ge ₹30.0$), 0 DTE $\to$ next week shift, independent $+50\%$ SL, $80\%$ decay target, 3:00 PM time exit, and dual Paper/Live execution.
+- **Crash-Resilient State Machine**: Persists active legs and trade state to handle restarts gracefully.
+- **Realistic Backtesting Engine**: Day-by-day continuous fractional-DTE option simulation accounting for exact NSE transaction taxes, STT, SEBI fees, GST, brokerage, and execution slippage.
 - **Comprehensive Positions Viewer**: Displays both Net and Day positions with quantity, entry averages, LTP, MTM, and P&L metrics.
 - **Dual Output**: Formatted terminal tables or raw structured `--json` output.
 
@@ -33,29 +36,51 @@ A modular algorithmic trading desk connected to Zerodha Kite Connect API using a
 
 ## Usage
 
-### View Current Positions (Tabular)
+### 1. View Current Account Positions
 ```bash
+# Tabular positions view
 uv run python main.py
-```
 
-### View Only Open Positions
-```bash
+# Open positions only
 uv run python main.py --open-only
-```
 
-### View Intraday Day Positions
-```bash
+# Intraday day positions view
 uv run python main.py --day
-```
 
-### Output Clean JSON (for automations / pipelines)
-```bash
+# Structured JSON output
 uv run python main.py --json
+
+# Force fresh login (regenerate access token)
+uv run python main.py --force-login
 ```
 
-### Force Fresh Login (refresh access token)
+### 2. Run Historical Backtester
+Simulates the 10:00 AM Short Strangle across historical 5-minute NIFTY candles with continuous fractional DTE option pricing, exact NSE statutory taxes & charges, and execution slippage:
+
 ```bash
-uv run python main.py --force-login
+# Standard 180-day backtest with 10 lots
+uv run python run_backtest.py --days 180 --lots 10
+
+# Custom slippage and output CSV file
+uv run python run_backtest.py --days 90 --slippage 0.75 --lots 5 --output data/custom_log.csv
+```
+
+### 3. Run 10:00 AM Strangle Strategy Desk
+Executes or simulates the 10:00 AM Short Strangle desk:
+- **0 DTE Rule**: When today is Thursday (weekly expiry), automatically selects next week's expiry.
+- **Strike Selection**: Lowest OTM strikes with LTP $\ge ₹30.0$.
+- **Risk Management**: Independent $+50\%$ Stop Loss per leg, independent $80\%$ decay profit target per leg, and mandatory 3:00 PM square-off.
+- **State Recovery**: Crash-resilient tracking persisted to `data/trades_today.json`.
+
+```bash
+# Dry-run strike lookup and strategy plan (without placing orders)
+uv run python run_strategy.py --paper --dry-run
+
+# Run Paper Trading simulation
+uv run python run_strategy.py --paper --lots 10
+
+# Execute Live Trading via Kite Connect
+uv run python run_strategy.py --live --lots 10
 ```
 
 ## Running Tests

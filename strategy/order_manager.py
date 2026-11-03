@@ -9,6 +9,8 @@ class OrderManager:
 
     def __init__(self, mode: str = "PAPER", kite: Optional[KiteConnect] = None):
         self.mode = mode.upper()
+        if self.mode not in ("PAPER", "LIVE"):
+            raise ValueError(f"Invalid mode: {self.mode}")
         self.kite = kite
         if self.mode == "LIVE" and not self.kite:
             raise ValueError("KiteConnect instance required for LIVE mode.")

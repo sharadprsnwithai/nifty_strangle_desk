@@ -123,9 +123,9 @@ def run_backtest_simulation(
         ce_strike, ce_theo_price = select_strike_above_target(spot_10am, entry_dte, iv, "CE", 30.0, r)
         pe_strike, pe_theo_price = select_strike_above_target(spot_10am, entry_dte, iv, "PE", 30.0, r)
 
-        # Apply entry slippage
-        ce_entry = round(max(0.5, ce_theo_price - slippage), 2)
-        pe_entry = round(max(0.5, pe_theo_price - slippage), 2)
+        # Theoretical prices at entry
+        ce_entry = ce_theo_price
+        pe_entry = pe_theo_price
 
         ce_sl = round(ce_entry * 1.50, 2)
         ce_target = round(ce_entry * 0.20, 2)
@@ -157,12 +157,12 @@ def run_backtest_simulation(
 
                 if ce_max_price >= ce_sl:
                     ce_active = False
-                    ce_exit_price = round(ce_sl + slippage, 2)
+                    ce_exit_price = ce_sl
                     ce_exit_reason = "STOP_LOSS"
                     ce_exit_time = curr_dt
                 elif ce_min_price <= ce_target:
                     ce_active = False
-                    ce_exit_price = round(ce_target + slippage, 2)
+                    ce_exit_price = ce_target
                     ce_exit_reason = "DECAY_TARGET"
                     ce_exit_time = curr_dt
 
@@ -173,12 +173,12 @@ def run_backtest_simulation(
 
                 if pe_max_price >= pe_sl:
                     pe_active = False
-                    pe_exit_price = round(pe_sl + slippage, 2)
+                    pe_exit_price = pe_sl
                     pe_exit_reason = "STOP_LOSS"
                     pe_exit_time = curr_dt
                 elif pe_min_price <= pe_target:
                     pe_active = False
-                    pe_exit_price = round(pe_target + slippage, 2)
+                    pe_exit_price = pe_target
                     pe_exit_reason = "DECAY_TARGET"
                     pe_exit_time = curr_dt
 
@@ -189,13 +189,13 @@ def run_backtest_simulation(
         if ce_active:
             exit_bar = intraday_bars.iloc[-1] if not intraday_bars.empty else entry_bar
             curr_dte = compute_fractional_dte(target_expiry, exit_bar["dt"])
-            ce_exit_price = round(black_76_price(float(exit_bar["close"]), ce_strike, curr_dte, iv, r, "CE") + slippage, 2)
+            ce_exit_price = round(black_76_price(float(exit_bar["close"]), ce_strike, curr_dte, iv, r, "CE"), 2)
             ce_exit_time = exit_bar["dt"]
 
         if pe_active:
             exit_bar = intraday_bars.iloc[-1] if not intraday_bars.empty else entry_bar
             curr_dte = compute_fractional_dte(target_expiry, exit_bar["dt"])
-            pe_exit_price = round(black_76_price(float(exit_bar["close"]), pe_strike, curr_dte, iv, r, "PE") + slippage, 2)
+            pe_exit_price = round(black_76_price(float(exit_bar["close"]), pe_strike, curr_dte, iv, r, "PE"), 2)
             pe_exit_time = exit_bar["dt"]
 
         ce_cost = calculate_trade_costs(ce_entry, ce_exit_price, total_qty, slippage_per_share=slippage)
@@ -204,7 +204,7 @@ def run_backtest_simulation(
         day_gross_pnl = round(ce_cost["gross_pnl"] + pe_cost["gross_pnl"], 2)
         day_taxes = round(ce_cost["statutory_taxes"] + pe_cost["statutory_taxes"], 2)
         day_slippage = round(ce_cost["total_slippage"] + pe_cost["total_slippage"], 2)
-        day_net_pnl = round(day_gross_pnl - day_taxes - day_slippage, 2)
+        day_net_pnl = round(ce_cost["net_pnl"] + pe_cost["net_pnl"], 2)
 
         trade_logs.append({
             "date": str(t_date),
@@ -263,10 +263,9 @@ def run_backtest_simulation(
     profit_factor = round(gross_wins / gross_losses, 2) if gross_losses > 0 else 999.0
 
     # Drawdown
-    trades_df["cum_net"] = trades_df["net_pnl"].cumsum()
-    trades_df["peak"] = trades_df["cum_net"].cummax()
-    trades_df["dd"] = trades_df["cum_net"] - trades_df["peak"]
-    max_dd = round(float(trades_df["dd"].min()), 2)
+    cum_net = pd.concat([pd.Series([0.0]), trades_df["net_pnl"]]).cumsum()
+    peak = cum_net.cummax()
+    max_dd = round(float((cum_net - peak).min()), 2)
 
     # Monthly aggregation
     trades_df["month"] = pd.to_datetime(trades_df["date"]).dt.strftime("%Y-%m")
