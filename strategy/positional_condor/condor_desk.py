@@ -4,12 +4,13 @@ import time
 from datetime import date, datetime, timedelta, time as dt_time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
+import pandas as pd
 from kiteconnect import KiteConnect
 
 from strategy.order_manager import OrderManager
 from strategy.holidays import is_trading_holiday
 from notifications.telegram import TelegramNotifier
-from strategy.positional_condor.indicator import fetch_daily_nifty_rsi
+from strategy.positional_condor.indicator import fetch_daily_nifty_rsi, classify_regime
 from strategy.positional_condor.strike_solver import (
     get_monthly_expiry,
     get_directional_ratio_strikes,
@@ -430,13 +431,34 @@ class PositionalDesk:
             return self.state or {}
 
         # Fetch Daily RSI(14) and spot price
-        latest_rsi, regime, _ = fetch_daily_nifty_rsi(kite)
+        latest_rsi, regime, df = fetch_daily_nifty_rsi(kite)
         spot_quote = kite.ltp(["NSE:NIFTY 50"])
         spot_price = float(spot_quote.get("NSE:NIFTY 50", {}).get("last_price", 0.0))
         if spot_price <= 0:
             spot_price = float(spot_quote.get("NIFTY 50", {}).get("last_price", 0.0))
 
-        logger.info("Daily Evaluation at 15:20 IST | Spot: %.2f | RSI: %.2f | Regime: %s", spot_price, latest_rsi, regime)
+        # Extract previous day's RSI
+        valid_rsi = df["rsi"].dropna() if ("rsi" in df.columns and not df.empty) else pd.Series()
+        if len(valid_rsi) >= 2:
+            prev_day_rsi = float(valid_rsi.iloc[-2])
+            prev_day_regime = classify_regime(prev_day_rsi)
+        else:
+            prev_day_rsi = float(state.get("current_rsi", latest_rsi))
+            prev_day_regime = state.get("current_regime", regime)
+
+        last_recorded_rsi = float(state.get("current_rsi", prev_day_rsi))
+        last_recorded_regime = state.get("current_regime", prev_day_regime)
+
+        state["last_rsi"] = last_recorded_rsi
+        state["last_regime"] = last_recorded_regime
+        state["current_rsi"] = latest_rsi
+        state["current_regime"] = regime
+        state["last_evaluation_date"] = str(today_date)
+
+        logger.info(
+            "Daily Evaluation at 15:20 IST | Spot: %.2f | Prev RSI: %.2f (%s) | Today RSI: %.2f (%s)",
+            spot_price, last_recorded_rsi, last_recorded_regime, latest_rsi, regime
+        )
         instruments = kite.instruments(exchange="NFO")
 
         if not trade:
@@ -459,14 +481,14 @@ class PositionalDesk:
                         "regime": "SIDEWAYS",
                         "month": month_str,
                         "expiry": str(expiry_date),
+                        "prev_rsi": last_recorded_rsi,
+                        "current_rsi": latest_rsi,
                         "setup": condor_setup,
                         "monthly_realized_pnl": state.get("monthly_realized_pnl", 0.0)
                     }
                 new_trade = self.deploy_iron_condor(condor_setup)
                 state["current_trade"] = new_trade
                 state["regime"] = "SIDEWAYS"
-                self.save_state(state)
-                return state
             else:
                 ratio_setup = get_directional_ratio_strikes(spot_price, regime, expiry_date, instruments, lots=self.lots)
                 if dry_run:
@@ -476,23 +498,92 @@ class PositionalDesk:
                         "regime": regime,
                         "month": month_str,
                         "expiry": str(expiry_date),
+                        "prev_rsi": last_recorded_rsi,
+                        "current_rsi": latest_rsi,
                         "setup": ratio_setup,
                         "monthly_realized_pnl": state.get("monthly_realized_pnl", 0.0)
                     }
                 new_trade = self.deploy_directional_ratio(ratio_setup)
                 state["current_trade"] = new_trade
                 state["regime"] = regime
-                self.save_state(state)
-                return state
+
+            history = state.get("history", [])
+            history.append({
+                "date": str(today_date),
+                "spot": spot_price,
+                "prev_rsi": last_recorded_rsi,
+                "current_rsi": latest_rsi,
+                "regime": regime,
+                "action": f"DEPLOY_INITIAL_{regime}",
+                "monthly_realized_pnl": state.get("monthly_realized_pnl", 0.0)
+            })
+            state["history"] = history[-30:]
+            self.save_state(state)
+            return state
 
         # Trade is active: check for regime transition
         current_regime = trade.get("regime")
         if current_regime != regime:
-            logger.info("Regime transition detected (%s -> %s). Closing existing trade and re-evaluating.", current_regime, regime)
-            if not dry_run:
-                self.close_current_trade(kite, reason=f"REGIME_TRANSITION_TO_{regime}")
-                return self.evaluate_daily_close(kite, execute_once=execute_once, force_date=today_date, dry_run=dry_run, ignore_holidays=ignore_holidays)
-            return {"status": "DRY_RUN", "action": f"TRANSITION_{current_regime}_TO_{regime}"}
+            logger.info(
+                "Regime transition detected: %s (RSI: %.2f) -> %s (RSI: %.2f). Closing existing %s and deploying new %s setup.",
+                current_regime, last_recorded_rsi, regime, latest_rsi, trade.get("type"), regime
+            )
+            if dry_run:
+                return {
+                    "status": "DRY_RUN",
+                    "action": f"TRANSITION_{current_regime}_TO_{regime}",
+                    "prev_rsi": last_recorded_rsi,
+                    "current_rsi": latest_rsi,
+                    "prev_regime": current_regime,
+                    "current_regime": regime
+                }
+
+            # 1. Alert Telegram of the regime transition
+            if self.notifier:
+                mode = getattr(self.order_manager, "mode", "PAPER")
+                self.notifier.send_message(
+                    f"🔄 <b>NIFTY Positional Regime Transition Detected [{mode}]</b>\n"
+                    f"• Previous Regime: <b>{current_regime}</b> (RSI: {last_recorded_rsi:.2f})\n"
+                    f"• Current Regime: <b>{regime}</b> (RSI: {latest_rsi:.2f})\n"
+                    f"• Spot Price: <b>Rs {spot_price:,.2f}</b>\n\n"
+                    f"Squaring off existing <b>{trade.get('type')}</b> and deploying fresh <b>{regime}</b> setup."
+                )
+
+            # 2. Close existing trade
+            self.close_current_trade(kite, reason=f"REGIME_TRANSITION_TO_{regime}")
+
+            # 3. Deploy new positions according to the new regime
+            if regime == "SIDEWAYS":
+                pe_syms = [inst["tradingsymbol"] for inst in instruments if inst.get("name") == "NIFTY" and parse_expiry(inst.get("expiry")) == expiry_date and inst.get("instrument_type") == "PE"]
+                ce_syms = [inst["tradingsymbol"] for inst in instruments if inst.get("name") == "NIFTY" and parse_expiry(inst.get("expiry")) == expiry_date and inst.get("instrument_type") == "CE"]
+                all_syms = [f"NFO:{s}" for s in (pe_syms + ce_syms)]
+                chain_quotes: Dict[str, float] = {}
+                for i in range(0, len(all_syms), 100):
+                    q = kite.ltp(all_syms[i:i+100])
+                    for k, v in q.items():
+                        chain_quotes[k] = float(v.get("last_price", 0.0))
+
+                condor_setup = solve_1_to_1_iron_condor(spot_price, expiry_date, instruments, chain_quotes, lots=self.lots)
+                new_trade = self.deploy_iron_condor(condor_setup)
+            else:
+                ratio_setup = get_directional_ratio_strikes(spot_price, regime, expiry_date, instruments, lots=self.lots)
+                new_trade = self.deploy_directional_ratio(ratio_setup)
+
+            state["current_trade"] = new_trade
+            state["regime"] = regime
+
+            history = state.get("history", [])
+            history.append({
+                "date": str(today_date),
+                "spot": spot_price,
+                "prev_rsi": last_recorded_rsi,
+                "current_rsi": latest_rsi,
+                "action": f"TRANSITION_{current_regime}_TO_{regime}",
+                "realized_pnl": state.get("monthly_realized_pnl", 0.0)
+            })
+            state["history"] = history[-30:]
+            self.save_state(state)
+            return state
 
         # Check break-even breach for Iron Condors
         if current_regime == "SIDEWAYS" and trade.get("type") == "IRON_CONDOR":
@@ -505,6 +596,21 @@ class PositionalDesk:
                     self.close_current_trade(kite, reason="CONDOR_BE_BREACH_ROLL")
                     return self.evaluate_daily_close(kite, execute_once=execute_once, force_date=today_date, dry_run=dry_run, ignore_holidays=ignore_holidays)
                 return {"status": "DRY_RUN", "action": "ROLL_CONDOR_BE_BREACH"}
+
+        # Record daily history for active hold
+        history = state.get("history", [])
+        history.append({
+            "date": str(today_date),
+            "spot": spot_price,
+            "prev_rsi": last_recorded_rsi,
+            "current_rsi": latest_rsi,
+            "regime": regime,
+            "action": "HOLD",
+            "unrealized_mtm": round(unrealized_pnl, 2),
+            "monthly_realized_pnl": state.get("monthly_realized_pnl", 0.0)
+        })
+        state["history"] = history[-30:]
+        self.save_state(state)
 
         logger.info("Holding active %s trade. Regime: %s. Unrealized P&L: Rs %.2f", trade.get("type"), regime, unrealized_pnl)
         return state

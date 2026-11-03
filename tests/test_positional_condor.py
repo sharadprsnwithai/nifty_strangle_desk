@@ -520,6 +520,82 @@ def test_positional_desk_reconcile_with_broker_reconstruct_open_legs(tmp_path):
     assert loaded["current_trade"]["type"] == "IRON_CONDOR"
 
 
+def test_positional_desk_regime_transition_exit_and_deploy(tmp_path):
+    from unittest.mock import patch
+    from datetime import date
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+
+    state_file = tmp_path / "condor_state.json"
+    om = OrderManager(mode="PAPER", kite=None)
+    mock_notifier = MagicMock()
+    desk = PositionalDesk(order_manager=om, state_file=state_file, notifier=mock_notifier)
+
+    # Yesterday: RSI was 42.0 and state had an active Iron Condor in SIDEWAYS regime
+    state = {
+        "month": "2026-11",
+        "expiry": "2026-11-26",
+        "status": "ACTIVE",
+        "regime": "SIDEWAYS",
+        "last_rsi": 45.0,
+        "current_rsi": 42.0,
+        "monthly_realized_pnl": 0.0,
+        "current_trade": {
+            "type": "IRON_CONDOR",
+            "regime": "SIDEWAYS",
+            "expiry": "2026-11-26",
+            "legs": [
+                {"symbol": "NIFTY26NOV23400PE", "action": "BUY", "qty": 65, "entry_price": 30.0},
+                {"symbol": "NIFTY26NOV23700PE", "action": "SELL", "qty": 65, "entry_price": 90.0},
+                {"symbol": "NIFTY26NOV24300CE", "action": "SELL", "qty": 65, "entry_price": 100.0},
+                {"symbol": "NIFTY26NOV24600CE", "action": "BUY", "qty": 65, "entry_price": 35.0},
+            ]
+        }
+    }
+    desk.save_state(state)
+
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23750, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV23750PE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23550, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV23550PE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23500, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV23500PE", "lot_size": 65},
+    ]
+    mock_kite.ltp.return_value = {
+        "NSE:NIFTY 50": {"last_price": 23800.0},
+        "NFO:NIFTY26NOV23400PE": {"last_price": 25.0},
+        "NFO:NIFTY26NOV23700PE": {"last_price": 75.0},
+        "NFO:NIFTY26NOV24300CE": {"last_price": 80.0},
+        "NFO:NIFTY26NOV24600CE": {"last_price": 20.0},
+    }
+
+    # Today: RSI dropped to 39.0 (BEARISH)
+    df_rsi = pd.DataFrame({"rsi": [42.0, 39.0]})
+    with patch("strategy.positional_condor.condor_desk.fetch_daily_nifty_rsi", return_value=(39.0, "BEARISH", df_rsi)):
+        res = desk.evaluate_daily_close(kite=mock_kite, force_date=date(2026, 11, 4), ignore_holidays=True)
+
+    # 1. State must show transition from 42.0 to 39.0
+    assert res["last_rsi"] == 42.0
+    assert res["current_rsi"] == 39.0
+    assert res["regime"] == "BEARISH"
+
+    # 2. Previous Iron Condor was exited and new 1:2:1 Ratio deployed
+    assert res["current_trade"] is not None
+    assert res["current_trade"]["type"] == "DIRECTIONAL_RATIO"
+    assert res["current_trade"]["regime"] == "BEARISH"
+    assert len(res["current_trade"]["legs"]) == 3
+
+    # 3. History log recorded transition
+    assert len(res["history"]) >= 1
+    assert res["history"][-1]["action"] == "TRANSITION_SIDEWAYS_TO_BEARISH"
+    assert res["history"][-1]["prev_rsi"] == 42.0
+    assert res["history"][-1]["current_rsi"] == 39.0
+
+    # 4. Telegram alert was sent for transition
+    sent_texts = [call[0][0] for call in mock_notifier.send_message.call_args_list]
+    assert any("Regime Transition" in t for t in sent_texts)
+
+
+
 
 
 
