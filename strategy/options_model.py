@@ -1,6 +1,6 @@
 import math
-from datetime import date, datetime, time
-from typing import Optional
+from datetime import date, datetime
+import numpy as np
 from scipy.stats import norm
 
 TRADING_MINUTES_PER_DAY = 375.0  # 09:15 to 15:30
@@ -8,7 +8,7 @@ ANNUAL_TRADING_DAYS = 252.0
 
 def compute_fractional_dte(target_expiry: date, current_dt: datetime) -> float:
     """
-    Computes continuous fractional DTE down to the minute.
+    Computes continuous fractional DTE down to the minute using business trading days.
     
     Parameters:
         target_expiry: Expiry date
@@ -34,8 +34,12 @@ def compute_fractional_dte(target_expiry: date, current_dt: datetime) -> float:
     if calendar_days == 0:
         return max(fraction_of_day_today, 1e-4)
 
-    # For future days, remaining fraction today + intervening full days
-    return float(calendar_days - 1) + fraction_of_day_today
+    if np.is_busday(current_date):
+        trading_days_ahead = int(np.busday_count(current_date, target_expiry))
+        return max(float(trading_days_ahead) + fraction_of_day_today, 1e-4)
+    else:
+        trading_days_ahead = int(np.busday_count(current_date, target_expiry))
+        return max(float(trading_days_ahead + 1), 1e-4)
 
 def black_76_price(
     spot: float,
@@ -56,6 +60,13 @@ def black_76_price(
         r: Annualized risk-free rate (default 6.5%)
         opt_type: 'CE' or 'PE'
     """
+    if spot <= 0 or strike <= 0:
+        raise ValueError(f"spot and strike must be positive numbers. Got spot={spot}, strike={strike}")
+
+    opt_type_upper = opt_type.upper()
+    if opt_type_upper not in ("CE", "PE"):
+        raise ValueError(f"Invalid opt_type: {opt_type}. Must be 'CE' or 'PE'.")
+
     t = max(dte_days / ANNUAL_TRADING_DAYS, 1e-5)
     sigma = max(iv, 0.01)
     d = math.exp(-r * t)
@@ -65,7 +76,7 @@ def black_76_price(
     d1 = (math.log(spot / strike) + 0.5 * sigma * sigma * t) / denom
     d2 = d1 - denom
 
-    if opt_type.upper() == "CE":
+    if opt_type_upper == "CE":
         price = d * (spot * norm.cdf(d1) - strike * norm.cdf(d2))
     else:
         price = d * (strike * norm.cdf(-d2) - spot * norm.cdf(-d1))
