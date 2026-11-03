@@ -7,6 +7,8 @@ from typing import Dict, Any, Optional
 from kiteconnect import KiteConnect
 from strategy.order_manager import OrderManager
 from strategy.option_chain import find_strangle_strikes
+from strategy.holidays import is_trading_holiday
+from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger("strategy.desk")
 
@@ -16,9 +18,15 @@ DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "trades_t
 class StrangleDesk:
     """Manages strategy state, persistence, recovery, and intraday execution."""
 
-    def __init__(self, order_manager: OrderManager, state_file: Optional[Path] = None):
+    def __init__(
+        self,
+        order_manager: OrderManager,
+        state_file: Optional[Path] = None,
+        notifier: Optional[TelegramNotifier] = None
+    ):
         self.order_manager = order_manager
         self.state_file = state_file or DEFAULT_STATE_FILE
+        self.notifier = notifier
         self.state: Optional[Dict[str, Any]] = None
 
     def save_state(self, state: Dict[str, Any]) -> None:
@@ -76,13 +84,24 @@ class StrangleDesk:
         dry_run: bool = False,
         execute_once: bool = False,
         kite: Optional[KiteConnect] = None,
-        max_loss_per_leg: float = 10000.0
+        max_loss_per_leg: float = 10000.0,
+        order_type: str = "LIMIT",
+        limit_buffer_pct: float = 0.05,
+        ignore_holidays: bool = False
     ) -> Optional[Dict[str, Any]]:
         """
         Executes and monitors the 10:00 AM Short Strangle intraday session.
-        Handles strike discovery, dual-leg entry, live quote polling,
+        Handles holiday skip, strike discovery, dual-leg entry, live quote polling,
         independent stop-loss, profit-decay target, and 3:00 PM time square-off.
         """
+        if not ignore_holidays:
+            is_holiday, reason = is_trading_holiday()
+            if is_holiday:
+                logger.info("Exchange is closed today (%s). Skipping session.", reason)
+                if self.notifier:
+                    self.notifier.send_message(f"⏸ <b>Strangle Desk</b>: Exchange closed today ({reason}). Skipping session.")
+                return {"status": "HOLIDAY", "reason": reason}
+
         state = self.load_state()
         today_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -115,8 +134,25 @@ class StrangleDesk:
             pe_info = strikes["pe"]
             total_qty = strikes["total_quantity"]
 
-            ce_order = self.order_manager.sell(ce_info["symbol"], total_qty, ce_info["ltp"])
-            pe_order = self.order_manager.sell(pe_info["symbol"], total_qty, pe_info["ltp"])
+            ce_order = self.order_manager.sell(
+                ce_info["symbol"], total_qty, ce_info["ltp"], order_type=order_type, buffer_pct=limit_buffer_pct
+            )
+            pe_order = self.order_manager.sell(
+                pe_info["symbol"], total_qty, pe_info["ltp"], order_type=order_type, buffer_pct=limit_buffer_pct
+            )
+
+            if self.notifier:
+                entry_msg = (
+                    f"🚀 <b>NIFTY 10:00 AM Strangle Opened [{mode}]</b>\n"
+                    f"Expiry: <code>{strikes['expiry']}</code> | Qty: {total_qty} ({strikes['total_lots']} lots)\n"
+                    f"Order Type: <code>{order_type}</code> (Buffer: {limit_buffer_pct*100:.0f}%)\n"
+                    f"• <b>CALL</b>: <code>{ce_info['symbol']}</code> @ Rs {ce_info['ltp']:.2f}\n"
+                    f"  SL: Rs {ce_info['sl_price']:.2f} | Target: Rs {ce_info['target_price']:.2f}\n"
+                    f"• <b>PUT</b>: <code>{pe_info['symbol']}</code> @ Rs {pe_info['ltp']:.2f}\n"
+                    f"  SL: Rs {pe_info['sl_price']:.2f} | Target: Rs {pe_info['target_price']:.2f}\n"
+                    f"• Risk Cap: Max Rs {max_loss_per_leg:,.0f} loss per leg"
+                )
+                self.notifier.send_message(entry_msg)
 
             state = {
                 "status": "OPEN",
@@ -174,19 +210,27 @@ class StrangleDesk:
                 pe_ltp = self._extract_ltp(quotes, pe_sym, default=state["pe"]["entry_price"])
 
                 if state["ce"].get("status") == "OPEN":
-                    self.order_manager.buy_to_cover(ce_sym, qty, ce_ltp, reason="TIME_EXIT")
+                    self.order_manager.buy_to_cover(
+                        ce_sym, qty, ce_ltp, reason="TIME_EXIT", order_type=order_type, buffer_pct=limit_buffer_pct
+                    )
                     state["ce"]["status"] = "CLOSED"
                     state["ce"]["exit_price"] = ce_ltp
                     state["ce"]["exit_reason"] = "TIME_EXIT"
 
                 if state["pe"].get("status") == "OPEN":
-                    self.order_manager.buy_to_cover(pe_sym, qty, pe_ltp, reason="TIME_EXIT")
+                    self.order_manager.buy_to_cover(
+                        pe_sym, qty, pe_ltp, reason="TIME_EXIT", order_type=order_type, buffer_pct=limit_buffer_pct
+                    )
                     state["pe"]["status"] = "CLOSED"
                     state["pe"]["exit_price"] = pe_ltp
                     state["pe"]["exit_reason"] = "TIME_EXIT"
 
                 state["status"] = "COMPLETED"
                 self.save_state(state)
+                if self.notifier:
+                    self.notifier.send_message(
+                        f"🏁 <b>15:00 Cutoff Exit</b>: Closed open legs (CE @ Rs {ce_ltp:.2f}, PE @ Rs {pe_ltp:.2f})"
+                    )
                 break
 
             # Fetch live quotes
@@ -216,22 +260,34 @@ class StrangleDesk:
 
                 if ce_loss >= max_loss_per_leg:
                     logger.warning("CE leg loss Rs %.2f >= max loss limit Rs %.2f. Triggering immediate exit.", ce_loss, max_loss_per_leg)
-                    self.order_manager.buy_to_cover(ce_sym, qty, ce_ltp, reason="MAX_LOSS_10K")
+                    self.order_manager.buy_to_cover(
+                        ce_sym, qty, ce_ltp, reason="MAX_LOSS_10K", order_type=order_type, buffer_pct=limit_buffer_pct
+                    )
                     state["ce"]["status"] = "CLOSED"
                     state["ce"]["exit_price"] = ce_ltp
                     state["ce"]["exit_reason"] = "MAX_LOSS_10K"
+                    if self.notifier:
+                        self.notifier.send_message(f"⚠️ <b>MAX LOSS HIT</b>: CE <code>{ce_sym}</code> exited @ Rs {ce_ltp:.2f} (Loss: Rs {ce_loss:,.2f})")
                 elif ce_ltp >= ce_sl:
                     logger.warning("CE Stop-Loss hit! LTP: %.2f >= SL: %.2f", ce_ltp, ce_sl)
-                    self.order_manager.buy_to_cover(ce_sym, qty, ce_ltp, reason="STOP_LOSS")
+                    self.order_manager.buy_to_cover(
+                        ce_sym, qty, ce_ltp, reason="STOP_LOSS", order_type=order_type, buffer_pct=limit_buffer_pct
+                    )
                     state["ce"]["status"] = "CLOSED"
                     state["ce"]["exit_price"] = ce_ltp
                     state["ce"]["exit_reason"] = "STOP_LOSS"
+                    if self.notifier:
+                        self.notifier.send_message(f"🛑 <b>STOP LOSS HIT</b>: CE <code>{ce_sym}</code> exited @ Rs {ce_ltp:.2f} (SL: Rs {ce_sl:.2f})")
                 elif ce_ltp <= ce_target:
                     logger.info("CE Decay Target reached! LTP: %.2f <= Target: %.2f", ce_ltp, ce_target)
-                    self.order_manager.buy_to_cover(ce_sym, qty, ce_ltp, reason="DECAY_TARGET")
+                    self.order_manager.buy_to_cover(
+                        ce_sym, qty, ce_ltp, reason="DECAY_TARGET", order_type=order_type, buffer_pct=limit_buffer_pct
+                    )
                     state["ce"]["status"] = "CLOSED"
                     state["ce"]["exit_price"] = ce_ltp
                     state["ce"]["exit_reason"] = "DECAY_TARGET"
+                    if self.notifier:
+                        self.notifier.send_message(f"🎯 <b>DECAY TARGET REACHED</b>: CE <code>{ce_sym}</code> exited @ Rs {ce_ltp:.2f} (Target: Rs {ce_target:.2f})")
 
             # Evaluate PE leg
             if state["pe"].get("status") == "OPEN":
@@ -242,27 +298,50 @@ class StrangleDesk:
 
                 if pe_loss >= max_loss_per_leg:
                     logger.warning("PE leg loss Rs %.2f >= max loss limit Rs %.2f. Triggering immediate exit.", pe_loss, max_loss_per_leg)
-                    self.order_manager.buy_to_cover(pe_sym, qty, pe_ltp, reason="MAX_LOSS_10K")
+                    self.order_manager.buy_to_cover(
+                        pe_sym, qty, pe_ltp, reason="MAX_LOSS_10K", order_type=order_type, buffer_pct=limit_buffer_pct
+                    )
                     state["pe"]["status"] = "CLOSED"
                     state["pe"]["exit_price"] = pe_ltp
                     state["pe"]["exit_reason"] = "MAX_LOSS_10K"
+                    if self.notifier:
+                        self.notifier.send_message(f"⚠️ <b>MAX LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (Loss: Rs {pe_loss:,.2f})")
                 elif pe_ltp >= pe_sl:
                     logger.warning("PE Stop-Loss hit! LTP: %.2f >= SL: %.2f", pe_ltp, pe_sl)
-                    self.order_manager.buy_to_cover(pe_sym, qty, pe_ltp, reason="STOP_LOSS")
+                    self.order_manager.buy_to_cover(
+                        pe_sym, qty, pe_ltp, reason="STOP_LOSS", order_type=order_type, buffer_pct=limit_buffer_pct
+                    )
                     state["pe"]["status"] = "CLOSED"
                     state["pe"]["exit_price"] = pe_ltp
                     state["pe"]["exit_reason"] = "STOP_LOSS"
+                    if self.notifier:
+                        self.notifier.send_message(f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (SL: Rs {pe_sl:.2f})")
                 elif pe_ltp <= pe_target:
                     logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f", pe_ltp, pe_target)
-                    self.order_manager.buy_to_cover(pe_sym, qty, pe_ltp, reason="DECAY_TARGET")
+                    self.order_manager.buy_to_cover(
+                        pe_sym, qty, pe_ltp, reason="DECAY_TARGET", order_type=order_type, buffer_pct=limit_buffer_pct
+                    )
                     state["pe"]["status"] = "CLOSED"
                     state["pe"]["exit_price"] = pe_ltp
                     state["pe"]["exit_reason"] = "DECAY_TARGET"
+                    if self.notifier:
+                        self.notifier.send_message(f"🎯 <b>DECAY TARGET REACHED</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (Target: Rs {pe_target:.2f})")
 
             # If both legs closed, complete session
             if state["ce"].get("status") == "CLOSED" and state["pe"].get("status") == "CLOSED":
                 logger.info("Both strangle legs closed. Marking session as COMPLETED.")
                 state["status"] = "COMPLETED"
+                if self.notifier:
+                    ce_pnl = (state["ce"]["entry_price"] - (state["ce"]["exit_price"] or state["ce"]["entry_price"])) * qty
+                    pe_pnl = (state["pe"]["entry_price"] - (state["pe"]["exit_price"] or state["pe"]["entry_price"])) * qty
+                    gross_pnl = ce_pnl + pe_pnl
+                    summary_msg = (
+                        f"📊 <b>Strangle Session Completed</b>\n"
+                        f"• CE ({state['ce']['exit_reason']}): Rs {ce_pnl:+,.2f}\n"
+                        f"• PE ({state['pe']['exit_reason']}): Rs {pe_pnl:+,.2f}\n"
+                        f"• <b>Total Gross P&L</b>: <b>Rs {gross_pnl:+,.2f}</b>"
+                    )
+                    self.notifier.send_message(summary_msg)
 
             self.save_state(state)
 

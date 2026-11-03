@@ -72,21 +72,24 @@ Executes or simulates the 10:00 AM Short Strangle desk:
 - **0 DTE Rule**: When today is Tuesday (weekly expiry), automatically selects next week's expiry.
 - **Contract Specifications**: NIFTY lot size is 65 (10 lots = 650 shares).
 - **Strike Selection**: Lowest OTM strikes with LTP $\ge ₹30.0$.
-- **Risk Management**: Independent $+50\%$ Stop Loss per leg, independent $80\%$ decay profit target per leg, and mandatory 3:00 PM square-off.
+- **Risk Management**: Independent $+50\%$ Stop Loss per leg, independent $80\%$ decay profit target per leg, hard ₹10,000 per-leg max loss exit, and mandatory 3:00 PM square-off.
+- **Market Protection**: Uses marketable `LIMIT` orders with customizable price buffer (default: 5% off LTP) rounded to NSE ₹0.05 ticks to prevent Zerodha RMS freak-trade order rejections.
+- **NSE Holiday Protection**: Automatically checks weekend and official NSE trading holiday calendars and skips non-trading sessions.
+- **Telegram Alerts**: Real-time notifications on entry fills, SL/Max-Loss triggers, decay targets, and 15:00 summary.
 - **State Recovery**: Crash-resilient tracking persisted to `data/trades_today.json`.
 
 ```bash
 # Dry-run strike lookup and strategy plan (without placing orders)
 uv run python run_strategy.py --paper --dry-run
 
-# Run Paper Trading simulation (polling loop)
-uv run python run_strategy.py --paper --lots 10
+# Run Paper Trading simulation (polling loop, 5% limit order buffer)
+uv run python run_strategy.py --paper --lots 10 --order-type LIMIT --limit-buffer-pct 0.05
 
 # Single evaluation pass (for tests or one-shot automation)
 uv run python run_strategy.py --paper --once
 
-# Execute Live Trading via Kite Connect
-uv run python run_strategy.py --live --lots 10
+# Execute Live Trading via Kite Connect with marketable limit orders
+uv run python run_strategy.py --live --lots 1 --order-type LIMIT --max-loss 1000
 ```
 
 ## Running Tests

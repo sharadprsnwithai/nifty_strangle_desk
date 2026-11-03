@@ -19,17 +19,41 @@ def test_live_order_execution():
     mock_kite.place_order.return_value = "ORDER_12345"
     
     om = OrderManager(mode="LIVE", kite=mock_kite)
-    order = om.sell(symbol="NIFTY26NOV24200CE", quantity=750, price=32.0)
+    # Default is LIMIT with 5% buffer: 32.0 * 0.95 = 30.40
+    order = om.sell(symbol="NIFTY26NOV24200CE", quantity=650, price=32.0, order_type="LIMIT", buffer_pct=0.05)
     
     assert order["order_id"] == "ORDER_12345"
     assert order["mode"] == "LIVE"
     assert order["status"] == "SUBMITTED"
+    assert order["order_type"] == "LIMIT"
+    assert order["limit_price"] == 30.40
     mock_kite.place_order.assert_called_once_with(
         variety=mock_kite.VARIETY_REGULAR,
         exchange=mock_kite.EXCHANGE_NFO,
         tradingsymbol="NIFTY26NOV24200CE",
         transaction_type=mock_kite.TRANSACTION_TYPE_SELL,
-        quantity=750,
+        quantity=650,
+        product=mock_kite.PRODUCT_MIS,
+        order_type=mock_kite.ORDER_TYPE_LIMIT,
+        price=30.40
+    )
+
+
+def test_live_order_execution_market_mode():
+    mock_kite = MagicMock()
+    mock_kite.place_order.return_value = "ORDER_MKT"
+
+    om = OrderManager(mode="LIVE", kite=mock_kite)
+    order = om.sell(symbol="NIFTY26NOV24200CE", quantity=650, price=32.0, order_type="MARKET")
+
+    assert order["order_type"] == "MARKET"
+    assert order["limit_price"] is None
+    mock_kite.place_order.assert_called_once_with(
+        variety=mock_kite.VARIETY_REGULAR,
+        exchange=mock_kite.EXCHANGE_NFO,
+        tradingsymbol="NIFTY26NOV24200CE",
+        transaction_type=mock_kite.TRANSACTION_TYPE_SELL,
+        quantity=650,
         product=mock_kite.PRODUCT_MIS,
         order_type=mock_kite.ORDER_TYPE_MARKET
     )
@@ -53,19 +77,23 @@ def test_live_buy_to_cover():
     mock_kite.place_order.return_value = "ORDER_67890"
 
     om = OrderManager(mode="LIVE", kite=mock_kite)
-    order = om.buy_to_cover(symbol="NIFTY26NOV23700PE", quantity=750, price=6.2, reason="TARGET")
+    # Default is LIMIT with 5% buffer: 6.20 * 1.05 = 6.51 -> rounded to tick 6.50
+    order = om.buy_to_cover(symbol="NIFTY26NOV23700PE", quantity=650, price=6.2, reason="TARGET", order_type="LIMIT", buffer_pct=0.05)
     assert order["order_id"] == "ORDER_67890"
     assert order["mode"] == "LIVE"
     assert order["status"] == "SUBMITTED"
     assert order["reason"] == "TARGET"
+    assert order["order_type"] == "LIMIT"
+    assert order["limit_price"] == 6.50
     mock_kite.place_order.assert_called_once_with(
         variety=mock_kite.VARIETY_REGULAR,
         exchange=mock_kite.EXCHANGE_NFO,
         tradingsymbol="NIFTY26NOV23700PE",
         transaction_type=mock_kite.TRANSACTION_TYPE_BUY,
-        quantity=750,
+        quantity=650,
         product=mock_kite.PRODUCT_MIS,
-        order_type=mock_kite.ORDER_TYPE_MARKET
+        order_type=mock_kite.ORDER_TYPE_LIMIT,
+        price=6.50
     )
 
 def test_desk_state_persistence_and_recovery(tmp_path):

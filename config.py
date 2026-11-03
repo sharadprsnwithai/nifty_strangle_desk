@@ -12,6 +12,8 @@ class KiteConfig:
     password: str
     totp_key: str
     access_token: Optional[str] = None
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
 
 def load_config(env_path: Optional[Path] = None) -> KiteConfig:
     target_env = env_path or (Path(__file__).resolve().parent / ".env")
@@ -24,6 +26,8 @@ def load_config(env_path: Optional[Path] = None) -> KiteConfig:
     password = os.getenv("KITE_PASSWORD", "").strip()
     totp_key = os.getenv("KITE_TOTP_KEY", "").strip().replace(" ", "")
     access_token = os.getenv("KITE_ACCESS_TOKEN", "").strip() or None
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or None
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip() or None
 
     missing = []
     if not api_key: missing.append("KITE_API_KEY")
@@ -44,5 +48,7 @@ def load_config(env_path: Optional[Path] = None) -> KiteConfig:
         user_id=user_id,
         password=password,
         totp_key=totp_key,
-        access_token=access_token
+        access_token=access_token,
+        telegram_bot_token=telegram_bot_token,
+        telegram_chat_id=telegram_chat_id
     )

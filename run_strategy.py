@@ -6,6 +6,7 @@ from kite import get_kite_client
 from strategy.option_chain import find_strangle_strikes
 from strategy.order_manager import OrderManager
 from strategy.strangle_desk import StrangleDesk
+from notifications.telegram import TelegramNotifier
 
 # Ensure stdout and stderr handle UTF-8 characters gracefully across OS platforms
 if hasattr(sys.stdout, "reconfigure"):
@@ -31,6 +32,9 @@ def run_strategy_cli(args=None) -> int:
     parser.add_argument("--lots", type=int, default=10, help="Number of lots (default: 10)")
     parser.add_argument("--poll", type=int, default=5, help="Monitoring poll interval in seconds (default: 5)")
     parser.add_argument("--max-loss", type=float, default=10000.0, help="Per-leg maximum loss exit in Rs (default: 10000.0)")
+    parser.add_argument("--order-type", choices=["LIMIT", "MARKET"], default="LIMIT", help="Order execution type (default: LIMIT)")
+    parser.add_argument("--limit-buffer-pct", type=float, default=0.05, help="Marketable limit price buffer percentage (default: 0.05 / 5%)")
+    parser.add_argument("--ignore-holidays", action="store_true", help="Ignore NSE holiday and weekend checks")
     parser.add_argument("--dry-run", action="store_true", help="Perform single strike lookup and print plan without waiting")
     parser.add_argument("--once", action="store_true", help="Run single monitoring iteration and exit")
 
@@ -41,8 +45,9 @@ def run_strategy_cli(args=None) -> int:
     config = load_config()
     kite = get_kite_client(config=config)
 
+    notifier = TelegramNotifier(bot_token=config.telegram_bot_token, chat_id=config.telegram_chat_id)
     om = OrderManager(mode=mode, kite=kite if mode == "LIVE" else None)
-    desk = StrangleDesk(order_manager=om)
+    desk = StrangleDesk(order_manager=om, notifier=notifier)
 
     try:
         desk.run_session(
@@ -52,7 +57,10 @@ def run_strategy_cli(args=None) -> int:
             dry_run=parsed.dry_run,
             execute_once=parsed.once,
             kite=kite,
-            max_loss_per_leg=parsed.max_loss
+            max_loss_per_leg=parsed.max_loss,
+            order_type=parsed.order_type,
+            limit_buffer_pct=parsed.limit_buffer_pct,
+            ignore_holidays=parsed.ignore_holidays
         )
         return 0
     except Exception as e:

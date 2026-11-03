@@ -162,7 +162,10 @@ def test_run_strategy_cli_once_flag():
             dry_run=False,
             execute_once=True,
             kite=mock_kite,
-            max_loss_per_leg=10000.0
+            max_loss_per_leg=10000.0,
+            order_type="LIMIT",
+            limit_buffer_pct=0.05,
+            ignore_holidays=False
         )
 
 
@@ -325,5 +328,46 @@ def test_run_strategy_cli_max_loss_flag():
             dry_run=False,
             execute_once=True,
             kite=mock_kite,
-            max_loss_per_leg=8000.0
+            max_loss_per_leg=8000.0,
+            order_type="LIMIT",
+            limit_buffer_pct=0.05,
+            ignore_holidays=False
+        )
+
+
+def test_strangle_desk_run_session_skips_on_holiday(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    with patch("strategy.strangle_desk.is_trading_holiday", return_value=(True, "Independence Day")):
+        res = desk.run_session(ignore_holidays=False)
+        assert res["status"] == "HOLIDAY"
+        assert res["reason"] == "Independence Day"
+        om.sell.assert_not_called()
+
+
+def test_run_strategy_cli_order_type_and_holiday_flags():
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client") as mock_kite_fn, \
+         patch("run_strategy.StrangleDesk") as mock_desk_cls:
+        
+        mock_kite = MagicMock()
+        mock_kite_fn.return_value = mock_kite
+        mock_desk = MagicMock()
+        mock_desk_cls.return_value = mock_desk
+
+        exit_code = run_strategy_cli(["--paper", "--order-type", "MARKET", "--limit-buffer-pct", "0.08", "--ignore-holidays", "--once"])
+        assert exit_code == 0
+        mock_desk.run_session.assert_called_once_with(
+            underlying="NIFTY",
+            lots=10,
+            poll_seconds=5,
+            dry_run=False,
+            execute_once=True,
+            kite=mock_kite,
+            max_loss_per_leg=10000.0,
+            order_type="MARKET",
+            limit_buffer_pct=0.08,
+            ignore_holidays=True
         )
