@@ -206,12 +206,46 @@ class StrangleDesk:
             pe_info = strikes["pe"]
             total_qty = strikes["total_quantity"]
 
-            ce_order = self.order_manager.sell(
-                ce_info["symbol"], total_qty, ce_info["ltp"], order_type=order_type, buffer_pct=limit_buffer_pct
-            )
-            pe_order = self.order_manager.sell(
-                pe_info["symbol"], total_qty, pe_info["ltp"], order_type=order_type, buffer_pct=limit_buffer_pct
-            )
+            ce_order = None
+            pe_order = None
+            try:
+                ce_order = self.order_manager.sell(
+                    ce_info["symbol"], total_qty, ce_info["ltp"], order_type=order_type, buffer_pct=limit_buffer_pct
+                )
+            except Exception as e:
+                err_msg = f"Failed to place CE entry order ({ce_info['symbol']}): {e}"
+                logger.error(err_msg)
+                if self.notifier:
+                    self.notifier.send_message(f"🚨 <b>Strangle Desk Error</b>: {err_msg}")
+                return {"status": "ABORTED", "reason": err_msg}
+
+            try:
+                pe_order = self.order_manager.sell(
+                    pe_info["symbol"], total_qty, pe_info["ltp"], order_type=order_type, buffer_pct=limit_buffer_pct
+                )
+            except Exception as e:
+                err_msg = f"Failed to place PE entry order ({pe_info['symbol']}) after CE placed: {e}. Squaring off CE leg..."
+                logger.error(err_msg)
+                if self.notifier:
+                    self.notifier.send_message(f"🚨 <b>Strangle Desk Error</b>: {err_msg}")
+                ce_id = ce_order.get("order_id") if isinstance(ce_order, dict) else None
+                if ce_id:
+                    try:
+                        self.order_manager.cancel_order(ce_id)
+                        ce_status = self.wait_for_order_completion(ce_id, timeout_seconds=5, poll_seconds=1, execute_once=True)
+                        ce_filled = int(ce_status.get("filled_quantity") or 0)
+                        if ce_filled > 0:
+                            logger.warning("CE leg was partially/fully filled (%d qty). Buying back to close exposure...", ce_filled)
+                            self.order_manager.buy_to_cover(
+                                symbol=ce_info["symbol"],
+                                quantity=ce_filled,
+                                price=ce_info["ltp"] * 1.05,
+                                reason="ABORT_CLEANUP",
+                                order_type=order_type
+                            )
+                    except Exception as clean_err:
+                        logger.error("Failed to clean up CE leg after PE entry failure: %s", clean_err)
+                return {"status": "ABORTED", "reason": err_msg}
 
             ce_id = ce_order.get("order_id")
             pe_id = pe_order.get("order_id")

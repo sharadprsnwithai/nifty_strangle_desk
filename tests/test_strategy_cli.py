@@ -549,3 +549,62 @@ def test_strangle_desk_run_scheduler_loop(tmp_path):
         mock_notifier.send_message.assert_called_once()
         assert "Daemon Started" in mock_notifier.send_message.call_args[0][0]
 
+
+def test_strangle_desk_run_session_ce_entry_exception(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    om.mode = "LIVE"
+    om.sell.side_effect = RuntimeError("Your order could not be converted to a After Market Order (AMO).")
+    mock_notifier = MagicMock()
+    desk = StrangleDesk(order_manager=om, state_file=state_file, notifier=mock_notifier)
+
+    mock_kite = MagicMock()
+    with patch("strategy.strangle_desk.find_strangle_strikes") as mock_find:
+        mock_find.return_value = {
+            "expiry": "2026-11-09",
+            "total_lots": 1,
+            "total_quantity": 65,
+            "ce": {"symbol": "NIFTY26N0924300CE", "ltp": 30.5, "sl_price": 45.75, "target_price": 6.1},
+            "pe": {"symbol": "NIFTY26N0923800PE", "ltp": 31.0, "sl_price": 46.5, "target_price": 6.2},
+        }
+        res = desk.run_session(lots=1, kite=mock_kite, execute_once=True)
+
+    assert res["status"] == "ABORTED"
+    assert "Failed to place CE entry order" in res["reason"]
+    mock_notifier.send_message.assert_called_once()
+
+
+def test_strangle_desk_run_session_pe_entry_exception_cleans_up_ce(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    om.mode = "LIVE"
+    # First sell (CE) succeeds, second sell (PE) fails
+    om.sell.side_effect = [
+        {"order_id": "CE123", "status": "SUBMITTED"},
+        RuntimeError("Kite margin error on PE leg"),
+    ]
+    om.get_order_status.return_value = {"order_id": "CE123", "status": "COMPLETE", "filled_quantity": 65}
+    mock_notifier = MagicMock()
+    desk = StrangleDesk(order_manager=om, state_file=state_file, notifier=mock_notifier)
+
+    mock_kite = MagicMock()
+    with patch("strategy.strangle_desk.find_strangle_strikes") as mock_find:
+        mock_find.return_value = {
+            "expiry": "2026-11-09",
+            "total_lots": 1,
+            "total_quantity": 65,
+            "ce": {"symbol": "NIFTY26N0924300CE", "ltp": 30.5, "sl_price": 45.75, "target_price": 6.1},
+            "pe": {"symbol": "NIFTY26N0923800PE", "ltp": 31.0, "sl_price": 46.5, "target_price": 6.2},
+        }
+        res = desk.run_session(lots=1, kite=mock_kite, execute_once=True)
+
+    assert res["status"] == "ABORTED"
+    assert "Failed to place PE entry order" in res["reason"]
+    # Check that CE was cancelled and bought back
+    om.cancel_order.assert_called_with("CE123")
+    om.buy_to_cover.assert_called_once()
+    assert om.buy_to_cover.call_args[1]["symbol"] == "NIFTY26N0924300CE"
+    assert om.buy_to_cover.call_args[1]["quantity"] == 65
+    mock_notifier.send_message.assert_called_once()
+
+
