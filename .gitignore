@@ -6,7 +6,7 @@ __pycache__/
 *.log
 logs/
 .superpowers/
-data/trades_today.json
+data/*.json
 data/*.parquet
 data/*.csv
 

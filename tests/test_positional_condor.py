@@ -1,0 +1,347 @@
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock
+import numpy as np
+import pandas as pd
+import pytest
+
+from strategy.positional_condor.indicator import compute_rsi, classify_regime, fetch_daily_nifty_rsi
+
+
+def test_compute_rsi_known_series():
+    # Test on a monotonic upward series (RSI should approach 100)
+    prices = [100.0 + i * 2.0 for i in range(30)]
+    s = pd.Series(prices)
+    rsi = compute_rsi(s, period=14)
+    assert not rsi.empty
+    assert rsi.iloc[-1] > 95.0
+
+    # Test on a monotonic downward series (RSI should approach 0)
+    prices_down = [100.0 - i * 2.0 for i in range(30)]
+    s_down = pd.Series(prices_down)
+    rsi_down = compute_rsi(s_down, period=14)
+    assert rsi_down.iloc[-1] < 5.0
+
+
+def test_classify_regime_boundaries():
+    assert classify_regime(50.0) == "SIDEWAYS"
+    assert classify_regime(40.0) == "SIDEWAYS"
+    assert classify_regime(60.0) == "SIDEWAYS"
+    assert classify_regime(39.99) == "BEARISH"
+    assert classify_regime(25.0) == "BEARISH"
+    assert classify_regime(60.01) == "BULLISH"
+    assert classify_regime(75.0) == "BULLISH"
+
+
+def test_fetch_daily_nifty_rsi_mocked():
+    mock_kite = MagicMock()
+    # Mock instruments to find NIFTY 50 token
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY 50", "tradingsymbol": "NIFTY 50", "instrument_token": 256265, "exchange": "NSE"}
+    ]
+    # Generate 50 daily candles with sideways oscilation around 24000
+    base_date = datetime(2026, 9, 1)
+    candles = []
+    for i in range(50):
+        d = base_date + timedelta(days=i)
+        close = 24000 + (50 if i % 2 == 0 else -50)
+        candles.append({
+            "date": d,
+            "open": close - 10,
+            "high": close + 20,
+            "low": close - 20,
+            "close": close,
+            "volume": 100000
+        })
+    mock_kite.historical_data.return_value = candles
+
+    rsi_val, regime, df = fetch_daily_nifty_rsi(mock_kite, days=50)
+    assert 40.0 <= rsi_val <= 60.0
+    assert regime == "SIDEWAYS"
+    assert len(df) == 50
+    assert "rsi" in df.columns
+
+
+def test_get_monthly_expiry_selection():
+    from strategy.positional_condor.strike_solver import get_monthly_expiry
+    from datetime import date
+
+    # Mock instruments across Sep, Oct, Nov 2026
+    instruments = [
+        {"name": "NIFTY", "expiry": "2026-09-17"},
+        {"name": "NIFTY", "expiry": "2026-09-24"},  # Monthly Sep
+        {"name": "NIFTY", "expiry": "2026-10-15"},
+        {"name": "NIFTY", "expiry": "2026-10-29"},  # Monthly Oct
+        {"name": "NIFTY", "expiry": "2026-11-26"},  # Monthly Nov
+    ]
+
+    # If today is 2026-09-01 (well before Sep expiry), select Sep monthly
+    exp = get_monthly_expiry(instruments, current_date=date(2026, 9, 1))
+    assert exp == date(2026, 9, 24)
+
+    # If today is 2026-09-24 (expiry day or <= 2 days before), roll to Oct monthly
+    exp_rolled = get_monthly_expiry(instruments, current_date=date(2026, 9, 24))
+    assert exp_rolled == date(2026, 10, 29)
+
+
+def test_get_directional_ratio_strikes_bearish():
+    from strategy.positional_condor.strike_solver import get_directional_ratio_strikes
+    from datetime import date
+
+    expiry = date(2026, 11, 26)
+    instruments = [
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23950, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV23950PE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23750, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV23750PE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23700, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV23700PE", "lot_size": 65},
+    ]
+
+    # Spot is 24010 -> ATM is 24000
+    plan = get_directional_ratio_strikes(spot_price=24010.0, regime="BEARISH", expiry=expiry, instruments=instruments, lots=1)
+    assert plan["atm_strike"] == 24000
+    assert plan["regime"] == "BEARISH"
+    assert plan["buy_leg_1"]["strike"] == 23950  # ATM - 50
+    assert plan["buy_leg_1"]["quantity"] == 65   # 1 lot
+    assert plan["sell_body"]["strike"] == 23750  # ATM - 250
+    assert plan["sell_body"]["quantity"] == 130  # 2 lots
+    assert plan["buy_leg_2"]["strike"] == 23700  # ATM - 300
+    assert plan["buy_leg_2"]["quantity"] == 65   # 1 lot
+
+
+def test_get_directional_ratio_strikes_bullish():
+    from strategy.positional_condor.strike_solver import get_directional_ratio_strikes
+    from datetime import date
+
+    expiry = date(2026, 11, 26)
+    instruments = [
+        {"name": "NIFTY", "instrument_type": "CE", "strike": 24050, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV24050CE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "strike": 24250, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV24250CE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "strike": 24300, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV24300CE", "lot_size": 65},
+    ]
+
+    # Spot is 23990 -> ATM is 24000
+    plan = get_directional_ratio_strikes(spot_price=23990.0, regime="BULLISH", expiry=expiry, instruments=instruments, lots=2)
+    assert plan["atm_strike"] == 24000
+    assert plan["regime"] == "BULLISH"
+    assert plan["buy_leg_1"]["strike"] == 24050  # ATM + 50
+    assert plan["buy_leg_1"]["quantity"] == 130  # 2 lots
+    assert plan["sell_body"]["strike"] == 24250  # ATM + 250
+    assert plan["sell_body"]["quantity"] == 260  # 4 lots (2 * 2 lots)
+    assert plan["buy_leg_2"]["strike"] == 24300  # ATM + 300
+    assert plan["buy_leg_2"]["quantity"] == 130  # 2 lots
+
+
+def test_solve_1_to_1_iron_condor():
+    from strategy.positional_condor.strike_solver import solve_1_to_1_iron_condor
+    from datetime import date
+
+    expiry = date(2026, 11, 26)
+    instruments = [
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23400, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV23400PE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23700, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV23700PE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "strike": 24300, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV24300CE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "strike": 24600, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV24600CE", "lot_size": 65},
+    ]
+
+    # Put spread: Sell 23700 (90), Buy 23400 (30) -> 60 credit, width 300 -> Put Max Loss = 240
+    # Call spread: Sell 24300 (100), Buy 24600 (35) -> 65 credit, width 300 -> Call Max Loss = 235
+    # Total credit = 125, Width = 300 -> Max loss = 300 - 125 = 175
+    # Ratio = 125 / 175 ≈ 0.71
+    quotes = {
+        "NFO:NIFTY26NOV23400PE": 30.0,
+        "NFO:NIFTY26NOV23700PE": 90.0,
+        "NFO:NIFTY26NOV24300CE": 100.0,
+        "NFO:NIFTY26NOV24600CE": 35.0,
+    }
+
+    condor = solve_1_to_1_iron_condor(spot_price=24000.0, expiry=expiry, instruments=instruments, quotes=quotes, lots=1)
+    assert condor["pe_buy"]["strike"] == 23400
+    assert condor["pe_sell"]["strike"] == 23700
+    assert condor["ce_sell"]["strike"] == 24300
+    assert condor["ce_buy"]["strike"] == 24600
+    assert condor["net_credit"] == 125.0
+    assert condor["max_loss"] == 175.0
+    assert condor["lower_breakeven"] == 23700 - 125.0
+    assert condor["upper_breakeven"] == 24300 + 125.0
+
+
+def test_positional_desk_state_persistence(tmp_path):
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+
+    state_file = tmp_path / "condor_state.json"
+    om = OrderManager(mode="PAPER", kite=None)
+    desk = PositionalDesk(order_manager=om, state_file=state_file)
+
+    test_state = {
+        "month": "2026-11",
+        "status": "ACTIVE",
+        "regime": "SIDEWAYS",
+        "monthly_realized_pnl": 1200.0
+    }
+    desk.save_state(test_state)
+    assert state_file.exists()
+
+    desk_recovered = PositionalDesk(order_manager=om, state_file=state_file)
+    recovered = desk_recovered.load_state()
+    assert recovered["month"] == "2026-11"
+    assert recovered["monthly_realized_pnl"] == 1200.0
+
+
+def test_positional_desk_target_circuit_breaker(tmp_path):
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+
+    state_file = tmp_path / "condor_state.json"
+    om = OrderManager(mode="PAPER", kite=None)
+    mock_notifier = MagicMock()
+    desk = PositionalDesk(order_manager=om, state_file=state_file, notifier=mock_notifier, capital_per_lot=100000.0)
+
+    # Active state with +4,200 Rs profit (+4.2% on 100k capital)
+    state = {
+        "month": "2026-11",
+        "status": "ACTIVE",
+        "regime": "SIDEWAYS",
+        "monthly_realized_pnl": 4200.0,
+        "current_trade": None
+    }
+    desk.save_state(state)
+
+    res = desk.check_circuit_breakers(unrealized_pnl=0.0)
+    assert res == "TARGET_LOCKED"
+    assert desk.state["status"] == "TARGET_LOCKED"
+    mock_notifier.send_message.assert_called_once()
+    assert "Target" in mock_notifier.send_message.call_args[0][0]
+
+
+def test_positional_desk_stop_loss_circuit_breaker(tmp_path):
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+
+    state_file = tmp_path / "condor_state.json"
+    om = OrderManager(mode="PAPER", kite=None)
+    mock_notifier = MagicMock()
+    desk = PositionalDesk(order_manager=om, state_file=state_file, notifier=mock_notifier, capital_per_lot=100000.0)
+
+    # Active state with -4,100 Rs loss (-4.1% on 100k capital)
+    state = {
+        "month": "2026-11",
+        "status": "ACTIVE",
+        "regime": "SIDEWAYS",
+        "monthly_realized_pnl": -4100.0,
+        "current_trade": None
+    }
+    desk.save_state(state)
+
+    res = desk.check_circuit_breakers(unrealized_pnl=0.0)
+    assert res == "STOPPED_OUT"
+    assert desk.state["status"] == "STOPPED_OUT"
+    mock_notifier.send_message.assert_called_once()
+    assert "Max Loss" in mock_notifier.send_message.call_args[0][0]
+
+
+def test_positional_desk_evaluate_daily_close_bearish_deploy(tmp_path):
+    from unittest.mock import patch
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+    from datetime import date
+
+    state_file = tmp_path / "condor_state.json"
+    om = OrderManager(mode="PAPER", kite=None)
+    desk = PositionalDesk(order_manager=om, state_file=state_file)
+
+    mock_kite = MagicMock()
+    # Mock NFO instruments
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23950, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV23950PE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23750, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV23750PE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23700, "expiry": "2026-11-26", "tradingsymbol": "NIFTY26NOV23700PE", "lot_size": 65},
+    ]
+    # Mock spot LTP
+    mock_kite.ltp.return_value = {
+        "NSE:NIFTY 50": {"last_price": 24000.0}
+    }
+
+    # Patch fetch_daily_nifty_rsi to return RSI = 35.0 (BEARISH)
+    with patch("strategy.positional_condor.condor_desk.fetch_daily_nifty_rsi", return_value=(35.0, "BEARISH", pd.DataFrame())):
+        state = desk.evaluate_daily_close(kite=mock_kite, force_date=date(2026, 11, 3), ignore_holidays=True)
+
+    assert state is not None
+    assert state["status"] == "ACTIVE"
+    assert state["regime"] == "BEARISH"
+    assert state["current_trade"] is not None
+    assert state["current_trade"]["type"] == "DIRECTIONAL_RATIO"
+    assert len(state["current_trade"]["legs"]) == 3
+
+
+def test_positional_desk_evaluate_daily_close_holiday_skip(tmp_path):
+    from unittest.mock import patch
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+
+    state_file = tmp_path / "condor_state.json"
+    om = OrderManager(mode="PAPER", kite=None)
+    desk = PositionalDesk(order_manager=om, state_file=state_file)
+
+    mock_kite = MagicMock()
+
+    with patch("strategy.positional_condor.condor_desk.is_trading_holiday", return_value=(True, "Diwali Laxmi Pujan")):
+        res = desk.evaluate_daily_close(kite=mock_kite, ignore_holidays=False)
+
+    assert res["status"] == "HOLIDAY"
+    assert res["reason"] == "Diwali Laxmi Pujan"
+    assert desk.state is None
+
+
+def test_run_positional_monthly_backtest_simulation():
+    from strategy.positional_condor.backtest import run_positional_monthly_backtest
+
+    # Generate 60 days of synthetic daily candles spanning two months
+    dates = pd.date_range("2026-08-01", periods=60, freq="B")
+    prices = [24000.0 + (i * 10.0 if i < 30 else - (i - 30) * 15.0) for i in range(len(dates))]
+    df = pd.DataFrame({
+        "date": dates,
+        "open": prices,
+        "high": [p + 50.0 for p in prices],
+        "low": [p - 50.0 for p in prices],
+        "close": prices,
+        "volume": 100000
+    })
+
+    summary = run_positional_monthly_backtest(df, initial_capital=100000.0, lots=1)
+    assert summary["total_months"] >= 1
+    assert "profitable_months" in summary
+    assert "total_net_pnl" in summary
+    assert len(summary["monthly_records"]) >= 1
+
+
+def test_run_positional_cli_flags():
+    from unittest.mock import patch
+    from run_positional_condor import run_positional_cli
+
+    with patch("run_positional_condor.load_config"), \
+         patch("run_positional_condor.get_kite_client") as mock_kite_fn, \
+         patch("run_positional_condor.PositionalDesk") as mock_desk_cls:
+
+        mock_kite = MagicMock()
+        mock_kite_fn.return_value = mock_kite
+        mock_desk = MagicMock()
+        mock_desk.evaluate_daily_close.return_value = {
+            "status": "DRY_RUN",
+            "regime": "SIDEWAYS",
+            "month": "2026-11",
+            "expiry": "2026-11-26",
+            "monthly_realized_pnl": 0.0
+        }
+        mock_desk_cls.return_value = mock_desk
+
+        exit_code = run_positional_cli(["--paper", "--dry-run", "--lots", "2"])
+        assert exit_code == 0
+        mock_desk.evaluate_daily_close.assert_called_once_with(
+            kite=mock_kite,
+            execute_once=False,
+            dry_run=True,
+            ignore_holidays=False
+        )
+
+
+
+
