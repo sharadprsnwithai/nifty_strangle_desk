@@ -8,19 +8,19 @@ from strategy.costs import calculate_trade_costs
 logger = logging.getLogger("strategy.backtest")
 
 
-def get_weekly_expiry_for_date(d: date) -> Tuple[date, bool]:
+def get_weekly_expiry_for_date(d: date, expiry_weekday: int = 1) -> Tuple[date, bool]:
     """
     Returns (target_expiry, is_zero_dte).
-    NSE weekly expiry is Thursday (weekday 3).
-    If d is Thursday, is_zero_dte=True -> target is next Thursday (d + 7).
-    Otherwise, target is current Thursday.
+    NSE NIFTY weekly expiry is Tuesday (weekday 1).
+    If d is Tuesday, is_zero_dte=True -> target is next Tuesday (d + 7).
+    Otherwise, target is current/upcoming Tuesday.
     """
-    days_to_thurs = (3 - d.weekday()) % 7
-    current_thurs = d + timedelta(days=days_to_thurs)
-    if d == current_thurs:
+    days_to_expiry = (expiry_weekday - d.weekday()) % 7
+    current_expiry = d + timedelta(days=days_to_expiry)
+    if d == current_expiry:
         # 0 DTE: shift to next week
         return d + timedelta(days=7), True
-    return current_thurs, False
+    return current_expiry, False
 
 
 def select_strike_above_target(
@@ -64,9 +64,10 @@ def run_backtest_simulation(
     bars_df: pd.DataFrame,
     slippage: float = 0.50,
     lots: int = 10,
-    lot_size: int = 75,
+    lot_size: int = 65,
     iv: float = 0.13,
-    r: float = 0.065
+    r: float = 0.065,
+    expiry_weekday: int = 1
 ) -> Dict[str, Any]:
     """Runs day-by-day historical simulation of the 10:00 AM short strangle."""
     df = bars_df.copy()
@@ -116,7 +117,7 @@ def run_backtest_simulation(
         entry_time = entry_bar["dt"]
         spot_10am = float(entry_bar["open"])
 
-        target_expiry, is_0dte = get_weekly_expiry_for_date(t_date)
+        target_expiry, is_0dte = get_weekly_expiry_for_date(t_date, expiry_weekday=expiry_weekday)
         entry_dte = compute_fractional_dte(target_expiry, entry_time)
 
         # Select CE & PE strikes >= 30.0

@@ -155,7 +155,7 @@ class StrangleDesk:
 
         ce_sym = state["ce"]["symbol"]
         pe_sym = state["pe"]["symbol"]
-        qty = state.get("quantity", lots * 75)
+        qty = state.get("quantity", lots * 65)
 
         while state.get("status") == "OPEN":
             # Current time check: 3:00 PM cutoff

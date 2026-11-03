@@ -86,7 +86,7 @@ def find_strangle_strikes(
     if not ce_contracts or not pe_contracts:
         raise ValueError(f"No CE/PE option contracts found for {underlying} on {target_expiry}")
 
-    lot_size = int(ce_contracts[0].get("lot_size") or 75)
+    lot_size = int(ce_contracts[0].get("lot_size") or 65)
     total_quantity = lots * lot_size
 
     # Batch query prices

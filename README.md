@@ -69,7 +69,8 @@ uv run python run_backtest.py --days 90 --slippage 0.75 --lots 5 --output data/c
 
 ### 3. Run 10:00 AM Strangle Strategy Desk
 Executes or simulates the 10:00 AM Short Strangle desk:
-- **0 DTE Rule**: When today is Thursday (weekly expiry), automatically selects next week's expiry.
+- **0 DTE Rule**: When today is Tuesday (weekly expiry), automatically selects next week's expiry.
+- **Contract Specifications**: NIFTY lot size is 65 (10 lots = 650 shares).
 - **Strike Selection**: Lowest OTM strikes with LTP $\ge ₹30.0$.
 - **Risk Management**: Independent $+50\%$ Stop Loss per leg, independent $80\%$ decay profit target per leg, and mandatory 3:00 PM square-off.
 - **State Recovery**: Crash-resilient tracking persisted to `data/trades_today.json`.
