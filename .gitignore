@@ -7,4 +7,5 @@ __pycache__/
 .superpowers/
 data/trades_today.json
 data/*.parquet
+data/*.csv
 

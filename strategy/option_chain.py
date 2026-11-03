@@ -30,7 +30,7 @@ def resolve_target_expiry(
     If today is expiry day (0 DTE), selects the Next Week expiry.
     Otherwise, selects the Current Week nearest expiry.
     """
-    today = _normalize_date(today_date) if today_date else datetime.now().date()
+    today = _normalize_date(today_date) or datetime.now().date()
 
     raw_expiries = {
         _normalize_date(i["expiry"])

@@ -8,32 +8,50 @@ from tabulate import tabulate
 from kite import get_kite_client
 from strategy.backtest import run_backtest_simulation
 
+# Ensure stdout and stderr handle UTF-8 characters gracefully across OS platforms
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("backtest.cli")
 
 
 def load_historical_nifty_data(days: int = 180) -> pd.DataFrame:
-    """Fetches historical NIFTY 5m bars from local cache or Kite Connect."""
+    """Fetches historical NIFTY 5m bars from local cache or Kite Connect, filtered to requested days."""
     cache_path = Path(__file__).resolve().parent / "data" / "nifty_5m_cache.parquet"
+    sibling_cache = Path("D:/code/Sharads_monthly_option_selling_desk/data_cache/NSEI_5m_historical.parquet")
+
     if cache_path.exists():
         logger.info("Loading cached NIFTY 5-minute bars from %s", cache_path)
-        return pd.read_parquet(cache_path)
-
-    sibling_cache = Path("D:/code/Sharads_monthly_option_selling_desk/data_cache/NSEI_5m_historical.parquet")
-    if sibling_cache.exists():
+        df = pd.read_parquet(cache_path)
+    elif sibling_cache.exists():
         logger.info("Loading NIFTY 5m bars from sibling desk cache: %s", sibling_cache)
-        return pd.read_parquet(sibling_cache)
+        df = pd.read_parquet(sibling_cache)
+    else:
+        logger.info("Fetching %d days of NIFTY 5m bars via Kite Connect API...", days)
+        kite = get_kite_client()
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=days)
+        
+        # NIFTY 50 token on NSE
+        records = kite.historical_data(256265, start_dt, end_dt, "5minute")
+        df = pd.DataFrame(records)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(cache_path)
 
-    logger.info("Fetching %d days of NIFTY 5m bars via Kite Connect API...", days)
-    kite = get_kite_client()
-    end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=days)
-    
-    # NIFTY 50 token on NSE
-    records = kite.historical_data(256265, start_dt, end_dt, "5minute")
-    df = pd.DataFrame(records)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(cache_path)
+    if not df.empty and days > 0:
+        ts_col = "timestamps" if "timestamps" in df.columns else ("date" if "date" in df.columns else df.columns[0])
+        cutoff = pd.to_datetime(df[ts_col]).max() - timedelta(days=days)
+        df = df[pd.to_datetime(df[ts_col]) >= cutoff].copy()
+
     return df
 
 
@@ -62,7 +80,7 @@ def run_backtest_cli(args=None) -> int:
 
         summary = results["summary"]
         print("\n" + "=" * 60)
-        print("   📊 NIFTY 10:00 AM SHORT STRANGLE BACKTEST RESULTS")
+        print("   [+] NIFTY 10:00 AM SHORT STRANGLE BACKTEST RESULTS")
         print("=" * 60)
         
         sum_rows = [
@@ -80,7 +98,7 @@ def run_backtest_cli(args=None) -> int:
         print(tabulate(sum_rows, tablefmt="grid"))
 
         if results["monthly"]:
-            print("\n📅 Monthly Performance Breakdown:")
+            print("\n--- Monthly Performance Breakdown ---")
             m_rows = [[m["month"], f"Rs. {m['net_pnl']:+,.2f}"] for m in results["monthly"]]
             print(tabulate(m_rows, headers=["Month", "Net P&L (Rs.)"], tablefmt="simple"))
 
@@ -88,7 +106,7 @@ def run_backtest_cli(args=None) -> int:
             out_path = Path(parsed.output)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             pd.DataFrame(results["trades"]).to_csv(out_path, index=False)
-            print(f"\n💾 Saved full trade log ({len(results['trades'])} days) to: {out_path}\n")
+            print(f"\n[+] Saved full trade log ({len(results['trades'])} days) to: {out_path}\n")
 
         return 0
     except Exception as e:
