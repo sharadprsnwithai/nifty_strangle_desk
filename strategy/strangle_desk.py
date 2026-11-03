@@ -75,7 +75,8 @@ class StrangleDesk:
         poll_seconds: int = 5,
         dry_run: bool = False,
         execute_once: bool = False,
-        kite: Optional[KiteConnect] = None
+        kite: Optional[KiteConnect] = None,
+        max_loss_per_leg: float = 10000.0
     ) -> Optional[Dict[str, Any]]:
         """
         Executes and monitors the 10:00 AM Short Strangle intraday session.
@@ -210,7 +211,16 @@ class StrangleDesk:
             if state["ce"].get("status") == "OPEN":
                 ce_sl = state["ce"]["sl_price"]
                 ce_target = state["ce"]["target_price"]
-                if ce_ltp >= ce_sl:
+                ce_entry = state["ce"]["entry_price"]
+                ce_loss = (ce_ltp - ce_entry) * qty
+
+                if ce_loss >= max_loss_per_leg:
+                    logger.warning("CE leg loss Rs %.2f >= max loss limit Rs %.2f. Triggering immediate exit.", ce_loss, max_loss_per_leg)
+                    self.order_manager.buy_to_cover(ce_sym, qty, ce_ltp, reason="MAX_LOSS_10K")
+                    state["ce"]["status"] = "CLOSED"
+                    state["ce"]["exit_price"] = ce_ltp
+                    state["ce"]["exit_reason"] = "MAX_LOSS_10K"
+                elif ce_ltp >= ce_sl:
                     logger.warning("CE Stop-Loss hit! LTP: %.2f >= SL: %.2f", ce_ltp, ce_sl)
                     self.order_manager.buy_to_cover(ce_sym, qty, ce_ltp, reason="STOP_LOSS")
                     state["ce"]["status"] = "CLOSED"
@@ -227,7 +237,16 @@ class StrangleDesk:
             if state["pe"].get("status") == "OPEN":
                 pe_sl = state["pe"]["sl_price"]
                 pe_target = state["pe"]["target_price"]
-                if pe_ltp >= pe_sl:
+                pe_entry = state["pe"]["entry_price"]
+                pe_loss = (pe_ltp - pe_entry) * qty
+
+                if pe_loss >= max_loss_per_leg:
+                    logger.warning("PE leg loss Rs %.2f >= max loss limit Rs %.2f. Triggering immediate exit.", pe_loss, max_loss_per_leg)
+                    self.order_manager.buy_to_cover(pe_sym, qty, pe_ltp, reason="MAX_LOSS_10K")
+                    state["pe"]["status"] = "CLOSED"
+                    state["pe"]["exit_price"] = pe_ltp
+                    state["pe"]["exit_reason"] = "MAX_LOSS_10K"
+                elif pe_ltp >= pe_sl:
                     logger.warning("PE Stop-Loss hit! LTP: %.2f >= SL: %.2f", pe_ltp, pe_sl)
                     self.order_manager.buy_to_cover(pe_sym, qty, pe_ltp, reason="STOP_LOSS")
                     state["pe"]["status"] = "CLOSED"

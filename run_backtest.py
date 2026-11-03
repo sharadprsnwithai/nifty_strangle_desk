@@ -74,6 +74,7 @@ def run_backtest_cli(args=None) -> int:
     parser.add_argument("--slippage", type=float, default=0.50, help="Slippage in Rs per share (default: 0.50)")
     parser.add_argument("--lots", type=int, default=10, help="Number of lots (default: 10)")
     parser.add_argument("--lot-size", type=int, default=65, help="Lot size (default: 65)")
+    parser.add_argument("--max-loss", type=float, default=10000.0, help="Per-leg maximum loss exit in Rs (default: 10000.0)")
     parser.add_argument("--expiry-weekday", type=int, default=1, help="Expiry weekday (0=Mon, 1=Tue, ..., 3=Thu. Default: 1 for Tuesday)")
     parser.add_argument("--iv", type=float, default=0.13, help="Option IV (default: 0.13)")
     parser.add_argument("--output", type=str, default="data/backtest_trade_log.csv", help="CSV trade log path")
@@ -90,7 +91,8 @@ def run_backtest_cli(args=None) -> int:
             lots=parsed.lots,
             lot_size=parsed.lot_size,
             iv=parsed.iv,
-            expiry_weekday=parsed.expiry_weekday
+            expiry_weekday=parsed.expiry_weekday,
+            max_loss_per_leg=parsed.max_loss
         )
 
         summary = results["summary"]

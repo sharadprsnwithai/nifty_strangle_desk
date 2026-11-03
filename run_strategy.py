@@ -30,6 +30,7 @@ def run_strategy_cli(args=None) -> int:
     mode_group.add_argument("--paper", action="store_true", help="Run simulated PAPER trading (default)")
     parser.add_argument("--lots", type=int, default=10, help="Number of lots (default: 10)")
     parser.add_argument("--poll", type=int, default=5, help="Monitoring poll interval in seconds (default: 5)")
+    parser.add_argument("--max-loss", type=float, default=10000.0, help="Per-leg maximum loss exit in Rs (default: 10000.0)")
     parser.add_argument("--dry-run", action="store_true", help="Perform single strike lookup and print plan without waiting")
     parser.add_argument("--once", action="store_true", help="Run single monitoring iteration and exit")
 
@@ -50,7 +51,8 @@ def run_strategy_cli(args=None) -> int:
             poll_seconds=parsed.poll,
             dry_run=parsed.dry_run,
             execute_once=parsed.once,
-            kite=kite
+            kite=kite,
+            max_loss_per_leg=parsed.max_loss
         )
         return 0
     except Exception as e:

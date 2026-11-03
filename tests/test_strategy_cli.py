@@ -161,7 +161,8 @@ def test_run_strategy_cli_once_flag():
             poll_seconds=5,
             dry_run=False,
             execute_once=True,
-            kite=mock_kite
+            kite=mock_kite,
+            max_loss_per_leg=10000.0
         )
 
 
@@ -275,3 +276,54 @@ def test_load_historical_nifty_data_chunked_kite_fetch(monkeypatch):
         df = load_historical_nifty_data(days=150)
         assert mock_kite.historical_data.call_count == 3
         assert not df.empty
+
+
+def test_strangle_desk_run_session_max_loss_10k_exit(tmp_path):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+    ]
+    # CE Entry: 35.0 (SL is 52.50). 10 lots = 650 qty.
+    # At LTP 50.40, loss is (50.40 - 35.0) * 650 = 10,010 >= 10,000 (breaches max loss BEFORE 50% SL of 52.50)
+    mock_kite.ltp.side_effect = [
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 35.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}},
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 50.40}, "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}}
+    ]
+    state_file = tmp_path / "trades_today.json"
+    om = OrderManager(mode="PAPER", kite=mock_kite)
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    with patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
+        state = desk.run_session(lots=10, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite, max_loss_per_leg=10000.0)
+
+    assert state is not None
+    assert state["ce"]["status"] == "CLOSED"
+    assert state["ce"]["exit_reason"] == "MAX_LOSS_10K"
+    assert state["ce"]["exit_price"] == 50.40
+    # PE remained OPEN since it didn't trigger SL or 10k loss
+    assert state["pe"]["status"] == "OPEN"
+
+
+def test_run_strategy_cli_max_loss_flag():
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client") as mock_kite_fn, \
+         patch("run_strategy.StrangleDesk") as mock_desk_cls:
+        
+        mock_kite = MagicMock()
+        mock_kite_fn.return_value = mock_kite
+        mock_desk = MagicMock()
+        mock_desk_cls.return_value = mock_desk
+
+        exit_code = run_strategy_cli(["--paper", "--max-loss", "8000.0", "--once"])
+        assert exit_code == 0
+        mock_desk.run_session.assert_called_once_with(
+            underlying="NIFTY",
+            lots=10,
+            poll_seconds=5,
+            dry_run=False,
+            execute_once=True,
+            kite=mock_kite,
+            max_loss_per_leg=8000.0
+        )

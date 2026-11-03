@@ -67,7 +67,8 @@ def run_backtest_simulation(
     lot_size: int = 65,
     iv: float = 0.13,
     r: float = 0.065,
-    expiry_weekday: int = 1
+    expiry_weekday: int = 1,
+    max_loss_per_leg: float = 10000.0
 ) -> Dict[str, Any]:
     """Runs day-by-day historical simulation of the 10:00 AM short strangle."""
     df = bars_df.copy()
@@ -155,8 +156,15 @@ def run_backtest_simulation(
             if ce_active:
                 ce_max_price = black_76_price(bar_high_spot, ce_strike, curr_dte, iv, r, "CE")
                 ce_min_price = black_76_price(bar_low_spot, ce_strike, curr_dte, iv, r, "CE")
+                ce_loss = (ce_max_price - ce_entry) * total_qty
 
-                if ce_max_price >= ce_sl:
+                if ce_loss >= max_loss_per_leg:
+                    ce_active = False
+                    loss_exit_price = round(ce_entry + (max_loss_per_leg / total_qty), 2)
+                    ce_exit_price = min(loss_exit_price, ce_max_price)
+                    ce_exit_reason = "MAX_LOSS_10K"
+                    ce_exit_time = curr_dt
+                elif ce_max_price >= ce_sl:
                     ce_active = False
                     ce_exit_price = ce_sl
                     ce_exit_reason = "STOP_LOSS"
@@ -171,8 +179,15 @@ def run_backtest_simulation(
             if pe_active:
                 pe_max_price = black_76_price(bar_low_spot, pe_strike, curr_dte, iv, r, "PE")
                 pe_min_price = black_76_price(bar_high_spot, pe_strike, curr_dte, iv, r, "PE")
+                pe_loss = (pe_max_price - pe_entry) * total_qty
 
-                if pe_max_price >= pe_sl:
+                if pe_loss >= max_loss_per_leg:
+                    pe_active = False
+                    loss_exit_price = round(pe_entry + (max_loss_per_leg / total_qty), 2)
+                    pe_exit_price = min(loss_exit_price, pe_max_price)
+                    pe_exit_reason = "MAX_LOSS_10K"
+                    pe_exit_time = curr_dt
+                elif pe_max_price >= pe_sl:
                     pe_active = False
                     pe_exit_price = pe_sl
                     pe_exit_reason = "STOP_LOSS"
