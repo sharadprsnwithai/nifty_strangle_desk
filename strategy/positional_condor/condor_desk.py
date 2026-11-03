@@ -185,6 +185,17 @@ class PositionalDesk:
         self.save_state(self.state)
         logger.info("Closed %s trade. Realized Trade P&L: Rs %.2f. Cumulative Month P&L: Rs %.2f",
                     trade.get("type"), trade_pnl, self.state["monthly_realized_pnl"])
+
+        if self.notifier:
+            pnl_icon = "🟢" if trade_pnl >= 0 else "🔴"
+            self.notifier.send_message(
+                f"📤 <b>NIFTY Positional Trade Exited [{mode}]</b>\n"
+                f"Strategy: <b>{trade.get('type')}</b> ({trade.get('regime', 'UNKNOWN')})\n"
+                f"Reason: <code>{reason}</code>\n"
+                f"Trade Realized P&L: <b>{pnl_icon} Rs {trade_pnl:,.2f}</b>\n"
+                f"Month Realized P&L: <b>Rs {self.state['monthly_realized_pnl']:,.2f}</b>"
+            )
+
         return trade_pnl
 
     def deploy_iron_condor(self, condor_setup: Dict[str, Any]) -> Dict[str, Any]:

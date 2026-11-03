@@ -397,6 +397,49 @@ def test_positional_desk_run_scheduler(tmp_path):
         mock_sleep.assert_called_once_with(1)
 
 
+def test_positional_desk_close_current_trade_sends_telegram_alert(tmp_path):
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+
+    state_file = tmp_path / "condor_state.json"
+    om = OrderManager(mode="PAPER", kite=None)
+    mock_notifier = MagicMock()
+    desk = PositionalDesk(order_manager=om, state_file=state_file, notifier=mock_notifier)
+
+    state = {
+        "month": "2026-11",
+        "status": "ACTIVE",
+        "regime": "BEARISH",
+        "monthly_realized_pnl": 0.0,
+        "current_trade": {
+            "type": "DIRECTIONAL_RATIO",
+            "regime": "BEARISH",
+            "legs": [
+                {"symbol": "NIFTY26NOV23950PE", "action": "BUY", "qty": 65, "entry_price": 100.0},
+                {"symbol": "NIFTY26NOV23750PE", "action": "SELL", "qty": 130, "entry_price": 50.0},
+                {"symbol": "NIFTY26NOV23700PE", "action": "BUY", "qty": 65, "entry_price": 40.0},
+            ]
+        }
+    }
+    desk.save_state(state)
+
+    mock_kite = MagicMock()
+    mock_kite.ltp.return_value = {
+        "NFO:NIFTY26NOV23950PE": {"last_price": 120.0},
+        "NFO:NIFTY26NOV23750PE": {"last_price": 30.0},
+        "NFO:NIFTY26NOV23700PE": {"last_price": 25.0},
+    }
+
+    trade_pnl = desk.close_current_trade(mock_kite, reason="REGIME_TRANSITION")
+    assert trade_pnl != 0.0
+    mock_notifier.send_message.assert_called_once()
+    msg = mock_notifier.send_message.call_args[0][0]
+    assert "Trade Exited" in msg
+    assert "REGIME_TRANSITION" in msg
+    assert "Trade Realized P&L" in msg
+
+
+
 
 
 
