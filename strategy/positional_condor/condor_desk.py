@@ -292,6 +292,55 @@ class PositionalDesk:
 
         return trade_info
 
+    def reconcile_with_broker(self, kite: KiteConnect, state: Dict[str, Any], expiry_date: date) -> None:
+        """
+        Reconciles local trade state with actual open net positions on Zerodha Kite.
+        - If state records an active trade but all legs are flat on Kite (e.g. manual exit),
+          marks the trade closed locally to keep state in sync.
+        - If state has no active trade but open NIFTY monthly options exist on Kite,
+          reconstructs current_trade to prevent duplicate order placement.
+        """
+        try:
+            raw_pos = kite.positions()
+            net_positions = raw_pos.get("net", []) if isinstance(raw_pos, dict) else []
+            net_map = {p["tradingsymbol"]: p.get("quantity", 0) for p in net_positions if p.get("exchange") == "NFO"}
+
+            trade = state.get("current_trade")
+            if trade and trade.get("legs"):
+                # Check if all legs are closed in Kite
+                all_closed = all(net_map.get(leg["symbol"], 0) == 0 for leg in trade["legs"])
+                if all_closed:
+                    logger.warning("Reconciliation: Strategy legs are closed on Kite. Synchronizing local state to flat.")
+                    state["current_trade"] = None
+                    self.save_state(state)
+            elif not trade and state.get("status") == "ACTIVE":
+                # Check if there are open NIFTY options matching this monthly expiry
+                open_nifty_legs = []
+                for p in net_positions:
+                    sym = p.get("tradingsymbol", "")
+                    qty = p.get("quantity", 0)
+                    if p.get("exchange") == "NFO" and sym.startswith("NIFTY") and qty != 0:
+                        open_nifty_legs.append({
+                            "symbol": sym,
+                            "action": "BUY" if qty > 0 else "SELL",
+                            "qty": abs(qty),
+                            "entry_price": float(p.get("average_price", p.get("buy_price" if qty > 0 else "sell_price", 0.0)))
+                        })
+
+                if len(open_nifty_legs) >= 3:
+                    logger.info("Reconciliation: Found %d open NIFTY option legs on Kite. Restoring active trade in state.", len(open_nifty_legs))
+                    trade_type = "IRON_CONDOR" if len(open_nifty_legs) == 4 else "DIRECTIONAL_RATIO"
+                    state["current_trade"] = {
+                        "type": trade_type,
+                        "regime": state.get("regime", "UNKNOWN"),
+                        "expiry": str(expiry_date),
+                        "entry_date": datetime.now().strftime("%Y-%m-%d"),
+                        "legs": open_nifty_legs
+                    }
+                    self.save_state(state)
+        except Exception as e:
+            logger.warning("Broker position reconciliation failed: %s", e)
+
     def evaluate_daily_close(
         self,
         kite: KiteConnect,
@@ -350,6 +399,11 @@ class PositionalDesk:
             state["status"] = "ACTIVE"
             self.save_state(state)
             expiry_date = next_exp
+
+        # Broker Position Reconciliation (in LIVE mode)
+        mode = getattr(self.order_manager, "mode", "PAPER")
+        if mode == "LIVE":
+            self.reconcile_with_broker(kite, state, expiry_date)
 
         # Compute unrealized MTM of active position
         trade = state.get("current_trade")

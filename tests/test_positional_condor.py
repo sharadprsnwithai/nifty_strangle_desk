@@ -439,6 +439,88 @@ def test_positional_desk_close_current_trade_sends_telegram_alert(tmp_path):
     assert "Trade Realized P&L" in msg
 
 
+def test_positional_desk_reconcile_with_broker_closed_legs(tmp_path):
+    from datetime import date
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+
+    state_file = tmp_path / "condor_state.json"
+    om = OrderManager(mode="LIVE", kite=MagicMock())
+    desk = PositionalDesk(order_manager=om, state_file=state_file)
+
+    # State records an open trade
+    state = {
+        "month": "2026-11",
+        "status": "ACTIVE",
+        "regime": "BEARISH",
+        "monthly_realized_pnl": 0.0,
+        "current_trade": {
+            "type": "DIRECTIONAL_RATIO",
+            "legs": [
+                {"symbol": "NIFTY26NOV23950PE", "action": "BUY", "qty": 65},
+                {"symbol": "NIFTY26NOV23750PE", "action": "SELL", "qty": 130},
+                {"symbol": "NIFTY26NOV23700PE", "action": "BUY", "qty": 65},
+            ]
+        }
+    }
+    desk.save_state(state)
+
+    # Kite returns 0 quantity for these legs (e.g. manually closed on mobile)
+    mock_kite = MagicMock()
+    mock_kite.positions.return_value = {
+        "net": [
+            {"tradingsymbol": "NIFTY26NOV23950PE", "exchange": "NFO", "quantity": 0},
+            {"tradingsymbol": "NIFTY26NOV23750PE", "exchange": "NFO", "quantity": 0},
+            {"tradingsymbol": "NIFTY26NOV23700PE", "exchange": "NFO", "quantity": 0},
+        ]
+    }
+
+    desk.reconcile_with_broker(mock_kite, state, expiry_date=date(2026, 11, 26))
+    assert state["current_trade"] is None
+    loaded = desk.load_state()
+    assert loaded["current_trade"] is None
+
+
+def test_positional_desk_reconcile_with_broker_reconstruct_open_legs(tmp_path):
+    from datetime import date
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+
+    state_file = tmp_path / "condor_state.json"
+    om = OrderManager(mode="LIVE", kite=MagicMock())
+    desk = PositionalDesk(order_manager=om, state_file=state_file)
+
+    # State has no active trade (e.g. lost file or new container)
+    state = {
+        "month": "2026-11",
+        "status": "ACTIVE",
+        "regime": "SIDEWAYS",
+        "monthly_realized_pnl": 0.0,
+        "current_trade": None
+    }
+    desk.save_state(state)
+
+    # Kite has 4 open legs for an Iron Condor
+    mock_kite = MagicMock()
+    mock_kite.positions.return_value = {
+        "net": [
+            {"tradingsymbol": "NIFTY26NOV23400PE", "exchange": "NFO", "quantity": 65, "buy_price": 30.0},
+            {"tradingsymbol": "NIFTY26NOV23700PE", "exchange": "NFO", "quantity": -65, "sell_price": 90.0},
+            {"tradingsymbol": "NIFTY26NOV24300CE", "exchange": "NFO", "quantity": -65, "sell_price": 100.0},
+            {"tradingsymbol": "NIFTY26NOV24600CE", "exchange": "NFO", "quantity": 65, "buy_price": 35.0},
+        ]
+    }
+
+    desk.reconcile_with_broker(mock_kite, state, expiry_date=date(2026, 11, 26))
+    assert state["current_trade"] is not None
+    assert state["current_trade"]["type"] == "IRON_CONDOR"
+    assert len(state["current_trade"]["legs"]) == 4
+    loaded = desk.load_state()
+    assert loaded["current_trade"] is not None
+    assert loaded["current_trade"]["type"] == "IRON_CONDOR"
+
+
+
 
 
 
