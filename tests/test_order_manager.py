@@ -197,3 +197,24 @@ def test_order_manager_live_get_order_status_and_cancel():
     mock_kite.cancel_order.side_effect = Exception("Order already executed")
     err_cancel = om.cancel_order("ORD_LIVE_1")
     assert err_cancel is False
+
+
+def test_order_manager_product_parameter():
+    mock_kite = MagicMock()
+    mock_kite.place_order.return_value = "ORDER_NRML_1"
+    mock_kite.PRODUCT_NRML = "NRML"
+
+    om = OrderManager(mode="LIVE", kite=mock_kite, product="NRML")
+    assert om.product == "NRML"
+
+    om.sell("NIFTY26NOV24000CE", 65, 50.0)
+    assert mock_kite.place_order.call_args[1]["product"] == "NRML"
+
+    om.buy_to_cover("NIFTY26NOV24000CE", 65, 50.0)
+    assert mock_kite.place_order.call_args[1]["product"] == "NRML"
+
+
+def test_order_manager_invalid_product():
+    with pytest.raises(ValueError, match="Invalid product type"):
+        OrderManager(mode="PAPER", product="INVALID")
+

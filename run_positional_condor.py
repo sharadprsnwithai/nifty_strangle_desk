@@ -80,7 +80,7 @@ def run_positional_cli(args=None) -> int:
         return 0
 
     notifier = TelegramNotifier(bot_token=config.telegram_bot_token, chat_id=config.telegram_chat_id)
-    om = OrderManager(mode=mode, kite=kite if mode == "LIVE" else None)
+    om = OrderManager(mode=mode, kite=kite if mode == "LIVE" else None, product="NRML")
     desk = PositionalDesk(
         order_manager=om,
         notifier=notifier,

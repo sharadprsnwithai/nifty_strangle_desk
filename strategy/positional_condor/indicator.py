@@ -58,12 +58,16 @@ def fetch_daily_nifty_rsi(
     from_date = to_date - timedelta(days=days + 40)
 
     logger.info("Fetching %d days of daily NIFTY candles for RSI calculation...", days)
-    candles = kite.historical_data(
-        instrument_token=token,
-        from_date=from_date.strftime("%Y-%m-%d"),
-        to_date=to_date.strftime("%Y-%m-%d"),
-        interval="day"
-    )
+    try:
+        candles = kite.historical_data(
+            instrument_token=token,
+            from_date=from_date.strftime("%Y-%m-%d"),
+            to_date=to_date.strftime("%Y-%m-%d"),
+            interval="day"
+        )
+    except Exception as e:
+        logger.error("Failed to fetch historical data from Kite for token %s: %s", token, e)
+        raise RuntimeError(f"Kite historical_data API failed for token {token}: {e}") from e
 
     if not candles:
         raise ValueError(f"No daily historical data returned from Kite for token {token}")
@@ -73,7 +77,11 @@ def fetch_daily_nifty_rsi(
     df = df.sort_values("date").reset_index(drop=True)
 
     df["rsi"] = compute_rsi(df["close"], period=14)
-    latest_rsi = float(df["rsi"].dropna().iloc[-1])
+    valid_rsi = df["rsi"].dropna()
+    if valid_rsi.empty:
+        raise ValueError(f"Insufficient historical data ({len(df)} bars) to compute RSI(14). Need at least 15 bars.")
+
+    latest_rsi = float(valid_rsi.iloc[-1])
     regime = classify_regime(latest_rsi)
 
     logger.info(

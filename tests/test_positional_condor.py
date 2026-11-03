@@ -595,6 +595,82 @@ def test_positional_desk_regime_transition_exit_and_deploy(tmp_path):
     assert any("Regime Transition" in t for t in sent_texts)
 
 
+def test_positional_desk_close_current_trade_handles_partial_failure(tmp_path):
+    from strategy.positional_condor.condor_desk import PositionalDesk
+
+    state_file = tmp_path / "condor_state.json"
+    om = MagicMock()
+    om.mode = "LIVE"
+    # First leg (BUY) succeeds with sell, second leg (SELL) fails with buy_to_cover, third leg (BUY) succeeds with sell
+    om.sell.side_effect = [{"order_id": "SELL1"}, {"order_id": "SELL3"}]
+    om.buy_to_cover.side_effect = [RuntimeError("Kite connection dropped")]
+    mock_notifier = MagicMock()
+    desk = PositionalDesk(order_manager=om, state_file=state_file, notifier=mock_notifier)
+
+    state = {
+        "month": "2026-11",
+        "status": "ACTIVE",
+        "monthly_realized_pnl": 0.0,
+        "current_trade": {
+            "type": "DIRECTIONAL_RATIO",
+            "legs": [
+                {"symbol": "LEG1", "action": "BUY", "qty": 65, "entry_price": 100.0},
+                {"symbol": "LEG2", "action": "SELL", "qty": 130, "entry_price": 50.0},
+                {"symbol": "LEG3", "action": "BUY", "qty": 65, "entry_price": 40.0},
+            ]
+        }
+    }
+    desk.save_state(state)
+
+    mock_kite = MagicMock()
+    mock_kite.ltp.return_value = {
+        "NFO:LEG1": {"last_price": 110.0},
+        "NFO:LEG2": {"last_price": 45.0},
+        "NFO:LEG3": {"last_price": 35.0},
+    }
+
+    # Should not throw exception, should keep failed leg in state, and alert Telegram
+    trade_pnl = desk.close_current_trade(mock_kite, reason="EXIT_TEST")
+    saved = desk.load_state()
+    assert saved["current_trade"] is not None
+    assert len(saved["current_trade"]["legs"]) == 1
+    assert saved["current_trade"]["legs"][0]["symbol"] == "LEG2"
+    mock_notifier.send_message.assert_called_once()
+    assert "Positional Trade Exit Warning" in mock_notifier.send_message.call_args[0][0]
+
+
+def test_positional_desk_deploy_iron_condor_rollback_on_failure(tmp_path):
+    from strategy.positional_condor.condor_desk import PositionalDesk
+
+    state_file = tmp_path / "condor_state.json"
+    om = MagicMock()
+    om.mode = "LIVE"
+    # Wings succeed, selling body leg 1 fails
+    om.buy_to_cover.return_value = {"order_id": "WING"}
+    om.sell.side_effect = RuntimeError("Margin limit exceeded")
+    desk = PositionalDesk(order_manager=om, state_file=state_file)
+
+    condor_setup = {
+        "total_quantity": 65,
+        "expiry": "2026-11-26",
+        "net_credit": 100.0,
+        "max_loss": 100.0,
+        "lower_breakeven": 23000,
+        "upper_breakeven": 25000,
+        "pe_buy": {"tradingsymbol": "PE_WING", "strike": 23500, "ltp": 10.0},
+        "pe_sell": {"tradingsymbol": "PE_BODY", "strike": 23800, "ltp": 30.0},
+        "ce_sell": {"tradingsymbol": "CE_BODY", "strike": 24200, "ltp": 30.0},
+        "ce_buy": {"tradingsymbol": "CE_WING", "strike": 24500, "ltp": 10.0},
+    }
+
+    with pytest.raises(RuntimeError, match="Margin limit exceeded"):
+        desk.deploy_iron_condor(condor_setup)
+
+    # Rollback should sell the bought wings back
+    assert om.sell.call_count >= 2  # Attempted sell + rollbacks
+
+
+
 
 
 

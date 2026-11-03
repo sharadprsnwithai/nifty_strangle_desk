@@ -66,7 +66,12 @@ def find_strangle_strikes(
     """
     Discovers 1 CE and 1 PE with LTP >= target_price (closest to target_price from above).
     """
-    instruments = kite.instruments("NFO")
+    try:
+        instruments = kite.instruments("NFO")
+    except Exception as e:
+        logger.error("Failed to fetch NFO instruments from Kite: %s", e)
+        raise RuntimeError(f"Failed to fetch NFO instruments from Kite: {e}") from e
+
     target_expiry = resolve_target_expiry(instruments, today_date=target_date, underlying=underlying)
 
     # Filter contracts matching underlying and expiry
@@ -89,9 +94,16 @@ def find_strangle_strikes(
     lot_size = int(ce_contracts[0].get("lot_size") or 65)
     total_quantity = lots * lot_size
 
-    # Batch query prices
+    # Batch query prices in chunks of 100 to avoid payload / URL length limits
     symbols_to_query = [f"NFO:{c['tradingsymbol']}" for c in ce_contracts + pe_contracts]
-    quotes = kite.ltp(symbols_to_query)
+    quotes: Dict[str, Any] = {}
+    for i in range(0, len(symbols_to_query), 100):
+        batch = symbols_to_query[i:i + 100]
+        try:
+            batch_quotes = kite.ltp(batch)
+            quotes.update(batch_quotes)
+        except Exception as e:
+            logger.error("Failed to query batch LTP quotes for %d instruments: %s", len(batch), e)
 
     # Find CE >= target_price with lowest LTP
     valid_ce = []

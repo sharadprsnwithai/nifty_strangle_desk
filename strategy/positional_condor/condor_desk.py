@@ -160,6 +160,8 @@ class PositionalDesk:
 
         trade_pnl = 0.0
         mode = getattr(self.order_manager, "mode", "PAPER")
+        remaining_legs = []
+        failed_legs = []
 
         for leg in legs:
             sym = leg["symbol"]
@@ -168,34 +170,50 @@ class PositionalDesk:
             entry_price = float(leg.get("entry_price", 0.0))
             exit_price = quotes_map.get(sym, entry_price)
 
-            if action == "BUY":
-                # Sell to exit long leg
-                self.order_manager.sell(sym, qty, exit_price, order_type="LIMIT", buffer_pct=0.05)
-                leg_pnl = (exit_price - entry_price) * qty
-            else:
-                # Buy to cover short leg
-                self.order_manager.buy_to_cover(sym, qty, exit_price, reason=reason, order_type="LIMIT", buffer_pct=0.05)
-                leg_pnl = (entry_price - exit_price) * qty
+            try:
+                if action == "BUY":
+                    # Sell to exit long leg
+                    self.order_manager.sell(sym, qty, exit_price, order_type="LIMIT", buffer_pct=0.05)
+                    leg_pnl = (exit_price - entry_price) * qty
+                else:
+                    # Buy to cover short leg
+                    self.order_manager.buy_to_cover(sym, qty, exit_price, reason=reason, order_type="LIMIT", buffer_pct=0.05)
+                    leg_pnl = (entry_price - exit_price) * qty
 
-            trade_pnl += leg_pnl
-            logger.info("[%s] Exited %s %s x %d @ Rs %.2f (P&L: Rs %.2f, Reason: %s)",
-                        mode, action, sym, qty, exit_price, leg_pnl, reason)
+                trade_pnl += leg_pnl
+                logger.info("[%s] Exited %s %s x %d @ Rs %.2f (P&L: Rs %.2f, Reason: %s)",
+                            mode, action, sym, qty, exit_price, leg_pnl, reason)
+            except Exception as e:
+                logger.error("[%s] Failed to exit leg %s (%s x %d): %s", mode, sym, action, qty, e)
+                remaining_legs.append(leg)
+                failed_legs.append({"symbol": sym, "action": action, "qty": qty, "error": str(e)})
 
         self.state["monthly_realized_pnl"] = float(self.state.get("monthly_realized_pnl", 0.0)) + trade_pnl
-        self.state["current_trade"] = None
-        self.save_state(self.state)
-        logger.info("Closed %s trade. Realized Trade P&L: Rs %.2f. Cumulative Month P&L: Rs %.2f",
-                    trade.get("type"), trade_pnl, self.state["monthly_realized_pnl"])
+        if failed_legs:
+            logger.warning("Trade exit was partial: %d legs failed. Remaining open legs tracked in state.", len(failed_legs))
+            self.state["current_trade"]["legs"] = remaining_legs
+            self.save_state(self.state)
+            if self.notifier:
+                self.notifier.send_message(
+                    f"⚠️ <b>Positional Trade Exit Warning [{mode}]</b>\n"
+                    f"Failed to exit {len(failed_legs)} leg(s) during {reason}:\n" +
+                    "\n".join([f"• {f['action']} {f['symbol']}: {f['error']}" for f in failed_legs])
+                )
+        else:
+            self.state["current_trade"] = None
+            self.save_state(self.state)
+            logger.info("Closed %s trade. Realized Trade P&L: Rs %.2f. Cumulative Month P&L: Rs %.2f",
+                        trade.get("type"), trade_pnl, self.state["monthly_realized_pnl"])
 
-        if self.notifier:
-            pnl_icon = "🟢" if trade_pnl >= 0 else "🔴"
-            self.notifier.send_message(
-                f"📤 <b>NIFTY Positional Trade Exited [{mode}]</b>\n"
-                f"Strategy: <b>{trade.get('type')}</b> ({trade.get('regime', 'UNKNOWN')})\n"
-                f"Reason: <code>{reason}</code>\n"
-                f"Trade Realized P&L: <b>{pnl_icon} Rs {trade_pnl:,.2f}</b>\n"
-                f"Month Realized P&L: <b>Rs {self.state['monthly_realized_pnl']:,.2f}</b>"
-            )
+            if self.notifier:
+                pnl_icon = "🟢" if trade_pnl >= 0 else "🔴"
+                self.notifier.send_message(
+                    f"📤 <b>NIFTY Positional Trade Exited [{mode}]</b>\n"
+                    f"Strategy: <b>{trade.get('type')}</b> ({trade.get('regime', 'UNKNOWN')})\n"
+                    f"Reason: <code>{reason}</code>\n"
+                    f"Trade Realized P&L: <b>{pnl_icon} Rs {trade_pnl:,.2f}</b>\n"
+                    f"Month Realized P&L: <b>Rs {self.state['monthly_realized_pnl']:,.2f}</b>"
+                )
 
         return trade_pnl
 
@@ -216,12 +234,31 @@ class PositionalDesk:
         ce_buy = condor_setup["ce_buy"]
 
         # 1. Buy outer wings first (avoids margin penalty in live trading)
-        self.order_manager.buy_to_cover(pe_buy["tradingsymbol"], qty, pe_buy["ltp"], reason="CONDOR_WING")
-        self.order_manager.buy_to_cover(ce_buy["tradingsymbol"], qty, ce_buy["ltp"], reason="CONDOR_WING")
+        executed_legs = []
+        try:
+            self.order_manager.buy_to_cover(pe_buy["tradingsymbol"], qty, pe_buy["ltp"], reason="CONDOR_WING")
+            executed_legs.append(("BUY", pe_buy["tradingsymbol"], pe_buy["ltp"]))
 
-        # 2. Sell inner legs
-        self.order_manager.sell(pe_sell["tradingsymbol"], qty, pe_sell["ltp"])
-        self.order_manager.sell(ce_sell["tradingsymbol"], qty, ce_sell["ltp"])
+            self.order_manager.buy_to_cover(ce_buy["tradingsymbol"], qty, ce_buy["ltp"], reason="CONDOR_WING")
+            executed_legs.append(("BUY", ce_buy["tradingsymbol"], ce_buy["ltp"]))
+
+            # 2. Sell inner legs
+            self.order_manager.sell(pe_sell["tradingsymbol"], qty, pe_sell["ltp"])
+            executed_legs.append(("SELL", pe_sell["tradingsymbol"], pe_sell["ltp"]))
+
+            self.order_manager.sell(ce_sell["tradingsymbol"], qty, ce_sell["ltp"])
+            executed_legs.append(("SELL", ce_sell["tradingsymbol"], ce_sell["ltp"]))
+        except Exception as e:
+            logger.error("[%s] Failed to deploy 1:1 Iron Condor midway: %s. Rolling back %d executed legs...", mode, e, len(executed_legs))
+            for act, s, p in reversed(executed_legs):
+                try:
+                    if act == "BUY":
+                        self.order_manager.sell(s, qty, p, order_type="LIMIT", buffer_pct=0.05)
+                    else:
+                        self.order_manager.buy_to_cover(s, qty, p, reason="DEPLOY_ROLLBACK", order_type="LIMIT", buffer_pct=0.05)
+                except Exception as rb_err:
+                    logger.error("[%s] Rollback failed for leg %s (%s): %s", mode, s, act, rb_err)
+            raise
 
         trade_info = {
             "type": "IRON_CONDOR",
@@ -265,9 +302,27 @@ class PositionalDesk:
         leg2 = ratio_setup["buy_leg_2"]
 
         # Buy wings first to avoid margin spikes
-        self.order_manager.buy_to_cover(leg1["symbol"], leg1["quantity"], 0.0, reason="RATIO_WING_1")
-        self.order_manager.buy_to_cover(leg2["symbol"], leg2["quantity"], 0.0, reason="RATIO_WING_2")
-        self.order_manager.sell(body["symbol"], body["quantity"], 0.0)
+        executed_legs = []
+        try:
+            self.order_manager.buy_to_cover(leg1["symbol"], leg1["quantity"], 0.0, reason="RATIO_WING_1")
+            executed_legs.append(("BUY", leg1["symbol"], leg1["quantity"]))
+
+            self.order_manager.buy_to_cover(leg2["symbol"], leg2["quantity"], 0.0, reason="RATIO_WING_2")
+            executed_legs.append(("BUY", leg2["symbol"], leg2["quantity"]))
+
+            self.order_manager.sell(body["symbol"], body["quantity"], 0.0)
+            executed_legs.append(("SELL", body["symbol"], body["quantity"]))
+        except Exception as e:
+            logger.error("[%s] Failed to deploy Directional Ratio midway: %s. Rolling back %d executed legs...", mode, e, len(executed_legs))
+            for act, s, q in reversed(executed_legs):
+                try:
+                    if act == "BUY":
+                        self.order_manager.sell(s, q, 0.0, order_type="MARKET")
+                    else:
+                        self.order_manager.buy_to_cover(s, q, 0.0, reason="DEPLOY_ROLLBACK", order_type="MARKET")
+                except Exception as rb_err:
+                    logger.error("[%s] Rollback failed for leg %s (%s): %s", mode, s, act, rb_err)
+            raise
 
         trade_info = {
             "type": "DIRECTIONAL_RATIO",
@@ -368,6 +423,20 @@ class PositionalDesk:
                 logger.info("Exchange is closed today (%s). Skipping daily evaluation.", reason)
                 return {"status": "HOLIDAY", "reason": reason}
 
+        # Market Hours Validation (prevent placing regular orders outside NSE trading hours in LIVE mode)
+        mode = getattr(self.order_manager, "mode", "PAPER")
+        now_time = datetime.now().time()
+        if mode == "LIVE" and not dry_run and not ignore_holidays:
+            if now_time < dt_time(9, 15) or now_time > dt_time(15, 30):
+                err_msg = (
+                    f"Cannot execute LIVE positional orders: NSE market is closed. "
+                    f"Current time: {now_time.strftime('%H:%M:%S')} IST. Regular trading hours are 09:15 - 15:30 IST."
+                )
+                logger.warning(err_msg)
+                if self.notifier:
+                    self.notifier.send_message(f"⚠️ <b>Positional Desk Warning</b>: {err_msg}")
+                return {"status": "MARKET_CLOSED", "reason": err_msg}
+
         state = self.load_state()
         if state is None or state.get("month") != month_str:
             instruments = kite.instruments(exchange="NFO")
@@ -432,10 +501,18 @@ class PositionalDesk:
 
         # Fetch Daily RSI(14) and spot price
         latest_rsi, regime, df = fetch_daily_nifty_rsi(kite)
-        spot_quote = kite.ltp(["NSE:NIFTY 50"])
+        spot_quote = {}
+        try:
+            spot_quote = kite.ltp(["NSE:NIFTY 50"])
+        except Exception as e:
+            logger.warning("Failed to fetch spot quote from Kite: %s", e)
+
         spot_price = float(spot_quote.get("NSE:NIFTY 50", {}).get("last_price", 0.0))
         if spot_price <= 0:
             spot_price = float(spot_quote.get("NIFTY 50", {}).get("last_price", 0.0))
+        if spot_price <= 0 and not df.empty and "close" in df.columns:
+            spot_price = float(df["close"].iloc[-1])
+            logger.info("Spot price defaulted to latest historical close: Rs %.2f", spot_price)
 
         # Extract previous day's RSI
         valid_rsi = df["rsi"].dropna() if ("rsi" in df.columns and not df.empty) else pd.Series()
@@ -459,7 +536,11 @@ class PositionalDesk:
             "Daily Evaluation at 15:20 IST | Spot: %.2f | Prev RSI: %.2f (%s) | Today RSI: %.2f (%s)",
             spot_price, last_recorded_rsi, last_recorded_regime, latest_rsi, regime
         )
-        instruments = kite.instruments(exchange="NFO")
+        try:
+            instruments = kite.instruments(exchange="NFO")
+        except Exception as e:
+            logger.error("Failed to fetch NFO instruments from Kite: %s", e)
+            raise RuntimeError(f"Kite instruments API failed: {e}") from e
 
         if not trade:
             # Deploy initial position

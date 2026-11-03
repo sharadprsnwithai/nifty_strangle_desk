@@ -13,13 +13,16 @@ def _round_to_nse_tick(price: float, tick: float = 0.05) -> float:
 class OrderManager:
     """Manages order execution for both PAPER simulation and LIVE trading."""
 
-    def __init__(self, mode: str = "PAPER", kite: Optional[KiteConnect] = None):
+    def __init__(self, mode: str = "PAPER", kite: Optional[KiteConnect] = None, product: str = "MIS"):
         self.mode = mode.upper()
         if self.mode not in ("PAPER", "LIVE"):
             raise ValueError(f"Invalid mode: {self.mode}")
         self.kite = kite
         if self.mode == "LIVE" and not self.kite:
             raise ValueError("KiteConnect instance required for LIVE mode.")
+        self.product = product.upper()
+        if self.product not in ("MIS", "NRML", "CNC"):
+            raise ValueError(f"Invalid product type: {self.product}. Must be MIS, NRML, or CNC.")
         self._paper_orders: Dict[str, Dict[str, Any]] = {}
 
     def sell(
@@ -66,13 +69,14 @@ class OrderManager:
             return order
         
         # LIVE Mode
+        prod_val = getattr(self.kite, f"PRODUCT_{self.product}", self.product)
         params: Dict[str, Any] = {
             "variety": self.kite.VARIETY_REGULAR,
             "exchange": self.kite.EXCHANGE_NFO,
             "tradingsymbol": symbol,
             "transaction_type": self.kite.TRANSACTION_TYPE_SELL,
             "quantity": quantity,
-            "product": self.kite.PRODUCT_MIS,
+            "product": prod_val,
         }
 
         if order_type_norm == "LIMIT":
@@ -146,13 +150,14 @@ class OrderManager:
             self._paper_orders[order["order_id"]] = order.copy()
             return order
 
+        prod_val = getattr(self.kite, f"PRODUCT_{self.product}", self.product)
         params: Dict[str, Any] = {
             "variety": self.kite.VARIETY_REGULAR,
             "exchange": self.kite.EXCHANGE_NFO,
             "tradingsymbol": symbol,
             "transaction_type": self.kite.TRANSACTION_TYPE_BUY,
             "quantity": quantity,
-            "product": self.kite.PRODUCT_MIS,
+            "product": prod_val,
         }
 
         if order_type_norm == "LIMIT":
