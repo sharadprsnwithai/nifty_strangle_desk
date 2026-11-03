@@ -92,6 +92,54 @@ uv run python run_strategy.py --paper --once
 uv run python run_strategy.py --live --lots 1 --order-type LIMIT --max-loss 1000
 ```
 
+### 4. Docker & Cloud VPS Deployment
+
+The desk is fully containerized with Indian Standard Time (`Asia/Kolkata`) pre-configured and state volume mounts.
+
+#### Using Docker Compose (Recommended)
+
+1. **Configure Execution Mode in `docker-compose.yml`**:
+   Choose your command in `docker-compose.yml`:
+   ```yaml
+   # 1-Lot Live Incubation (Recommended for week 1):
+   command: ["--live", "--lots", "1", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "1000"]
+
+   # 10-Lot Full Production Execution:
+   # command: ["--live", "--lots", "10", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "10000"]
+   ```
+
+2. **Start the Container**:
+   ```bash
+   docker compose up -d --build
+   ```
+
+3. **Stream Real-Time Strategy Logs**:
+   ```bash
+   docker compose logs -f
+   ```
+
+4. **Stop or Restart**:
+   ```bash
+   docker compose restart
+   docker compose down
+   ```
+
+#### Using Standalone Docker Run
+
+- **Dry Run Verification**:
+  ```bash
+  docker run --rm --env-file .env -v "${PWD}/data:/app/data" nifty-strangle-desk:test --paper --dry-run
+  ```
+
+- **Live Production Trading**:
+  ```bash
+  docker run -d --name nifty_desk --restart unless-stopped \
+    --env-file .env \
+    -v "${PWD}/data:/app/data" \
+    nifty-strangle-desk:test \
+    --live --lots 1 --order-type LIMIT --limit-buffer-pct 0.05 --max-loss 1000
+  ```
+
 ## Running Tests
 ```bash
 uv run pytest -v
