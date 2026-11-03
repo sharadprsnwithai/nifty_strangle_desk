@@ -23,7 +23,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 # Copy application source code
-COPY config.py main.py run_strategy.py run_backtest.py ./
+COPY config.py main.py run_strategy.py run_backtest.py run_positional_condor.py ./
 COPY kite/ ./kite/
 COPY strategy/ ./strategy/
 COPY notifications/ ./notifications/

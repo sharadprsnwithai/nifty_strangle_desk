@@ -93,33 +93,72 @@ uv run python run_strategy.py --paper --once
 uv run python run_strategy.py --live --lots 1 --order-type LIMIT --max-loss 1000
 ```
 
-### 4. Docker & Cloud VPS Deployment
+### 4. Run NIFTY Positional Evergreen Condor Desk
+A monthly positional option selling desk based on daily Wilder's RSI(14) regime classification:
+- **Sideways ($40 \le \text{RSI} \le 60$)**: Deploys a **1:1 Risk-to-Reward Iron Condor** using monthly expiry strikes.
+  - Automatically checks break-even boundaries daily at 15:20 IST. If spot breaches either boundary, rolls the breached spread inward to the new ATM level.
+- **Bearish ($\text{RSI} < 40$)**: Deploys a **1:2:1 Put Ratio Spread**:
+  - Buy $\text{ATM} - 50$ Put (1 lot)
+  - Sell $\text{ATM} - 250$ Put (2 lots)
+  - Buy $\text{ATM} - 300$ Put (1 lot)
+- **Bullish ($\text{RSI} > 60$)**: Deploys a **1:2:1 Call Ratio Spread**:
+  - Buy $\text{ATM} + 50$ Call (1 lot)
+  - Sell $\text{ATM} + 250$ Call (2 lots)
+  - Buy $\text{ATM} + 300$ Call (1 lot)
+- **Monthly Risk Management & Circuit Breakers**:
+  - **+4.0% Monthly Profit Target**: Automatically squares off all positions and locks realized profit until next monthly expiry.
+  - **-3.0% Monthly Stop Loss**: Hard stop-loss cuts all exposure at -₹3,000 per ₹1,00,000 margin allocation, preserving capital through sharp 2,000+ pt market trends.
+- **Continuous 15:20 IST Automated Daemon**: Runs continuously in the background, waking up at 15:20 IST every trading day, skipping NSE holidays, evaluating spot & RSI, managing rolls/exits, and persisting state to `data/positional_condor_state.json`.
+
+```bash
+# Run 1-year historical monthly backtest with 3% stop loss
+uv run python run_positional_condor.py --backtest --monthly-stop-loss 0.03
+
+# Single dry-run inspection of today's regime and strike plan
+uv run python run_positional_condor.py --paper --dry-run
+
+# Run automated daily daemon in Paper mode (runs continuously at 15:20 IST)
+uv run python run_positional_condor.py --paper --lots 1 --schedule-time 15:20
+
+# Run automated daily daemon in Live mode with 3% stop loss and 4% target
+uv run python run_positional_condor.py --live --lots 1 --monthly-stop-loss 0.03 --monthly-target 0.04
+```
+
+### 5. Docker & Cloud VPS Deployment
 
 The desk is fully containerized with Indian Standard Time (`Asia/Kolkata`) pre-configured, state volume mounts, and host event log streaming.
 
 #### Using Docker Compose (Recommended)
 
 1. **Configure Execution Mode in `docker-compose.yml`**:
-   Choose your command in `docker-compose.yml`:
+   Choose your command for either the Intraday Strangle desk or the Positional Condor daemon:
    ```yaml
-   # 1-Lot Live Incubation (Recommended for week 1):
+   # strangle-desk (Intraday 10:00 AM Short Strangle):
    command: ["--live", "--lots", "1", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "1000"]
 
-   # 10-Lot Full Production Execution:
-   # command: ["--live", "--lots", "10", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "10000"]
+   # positional-condor-desk (Positional Evergreen Condor 15:20 IST Daily Daemon):
+   command: ["--live", "--lots", "1", "--monthly-stop-loss", "0.03", "--monthly-target", "0.04", "--schedule-time", "15:20"]
    ```
 
-2. **Start the Container**:
+2. **Start the Containers**:
    ```bash
+   # Start Positional Condor Desk daemon in background
+   docker compose up positional-condor-desk -d --build
+
+   # Or start Intraday Strangle Desk
+   docker compose up strangle-desk -d --build
+
+   # Or run both simultaneously
    docker compose up -d --build
    ```
 
 3. **Stream Real-Time Strategy Logs**:
    ```bash
    # From container stdout
-   docker compose logs -f
+   docker compose logs -f positional-condor-desk
 
    # Or inspect persisted log file on host machine directly
+   tail -f logs/positional_condor.log
    tail -f logs/strangle_desk.log
    ```
 

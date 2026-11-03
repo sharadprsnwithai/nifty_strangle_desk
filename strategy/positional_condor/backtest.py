@@ -16,7 +16,7 @@ def run_positional_monthly_backtest(
     initial_capital: float = 100000.0,
     lots: int = 1,
     target_pct: float = 0.04,
-    stop_pct: float = 0.04,
+    stop_pct: float = 0.03,
     slippage_per_share: float = 0.50
 ) -> Dict[str, Any]:
     """
@@ -26,7 +26,7 @@ def run_positional_monthly_backtest(
     - RSI < 40: 1:2:1 Bearish Put Ratio
     - RSI > 60: 1:2:1 Bullish Call Ratio
     - Monthly target exit: +3.5% to +4.0%
-    - Monthly max loss stop: -4.0%
+    - Monthly max loss stop: -3.0%
     """
     df = df_daily.copy()
     df["date"] = pd.to_datetime(df["date"])

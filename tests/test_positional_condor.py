@@ -219,18 +219,24 @@ def test_positional_desk_stop_loss_circuit_breaker(tmp_path):
     state_file = tmp_path / "condor_state.json"
     om = OrderManager(mode="PAPER", kite=None)
     mock_notifier = MagicMock()
+    # Default monthly_stop_pct is 0.03 (3.0% = Rs 3,000 on 100k capital)
     desk = PositionalDesk(order_manager=om, state_file=state_file, notifier=mock_notifier, capital_per_lot=100000.0)
 
-    # Active state with -4,100 Rs loss (-4.1% on 100k capital)
+    # Active state with -2,500 Rs loss (-2.5% on 100k capital) -> should remain ACTIVE (no circuit breaker)
     state = {
         "month": "2026-11",
         "status": "ACTIVE",
         "regime": "SIDEWAYS",
-        "monthly_realized_pnl": -4100.0,
+        "monthly_realized_pnl": -2500.0,
         "current_trade": None
     }
     desk.save_state(state)
+    assert desk.check_circuit_breakers(unrealized_pnl=0.0) is None
+    assert desk.state["status"] == "ACTIVE"
 
+    # Active state with -3,100 Rs loss (-3.1% on 100k capital) -> should trigger STOPPED_OUT
+    state["monthly_realized_pnl"] = -3100.0
+    desk.save_state(state)
     res = desk.check_circuit_breakers(unrealized_pnl=0.0)
     assert res == "STOPPED_OUT"
     assert desk.state["status"] == "STOPPED_OUT"
@@ -337,10 +343,59 @@ def test_run_positional_cli_flags():
         assert exit_code == 0
         mock_desk.evaluate_daily_close.assert_called_once_with(
             kite=mock_kite,
-            execute_once=False,
+            execute_once=True,
             dry_run=True,
             ignore_holidays=False
         )
+
+
+def test_run_positional_cli_daemon_mode():
+    from unittest.mock import patch
+    from run_positional_condor import run_positional_cli
+
+    with patch("run_positional_condor.load_config"), \
+         patch("run_positional_condor.get_kite_client") as mock_kite_fn, \
+         patch("run_positional_condor.PositionalDesk") as mock_desk_cls:
+
+        mock_kite = MagicMock()
+        mock_kite_fn.return_value = mock_kite
+        mock_desk = MagicMock()
+        mock_desk_cls.return_value = mock_desk
+
+        # Default mode (no --dry-run and no --once) should call run_scheduler
+        exit_code = run_positional_cli(["--paper", "--lots", "1", "--schedule-time", "15:20"])
+        assert exit_code == 0
+        mock_desk.run_scheduler.assert_called_once_with(
+            kite=mock_kite,
+            schedule_time="15:20",
+            ignore_holidays=False
+        )
+
+
+def test_positional_desk_run_scheduler(tmp_path):
+    from unittest.mock import patch, MagicMock
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+
+    state_file = tmp_path / "condor_state.json"
+    om = OrderManager(mode="PAPER", kite=None)
+    mock_notifier = MagicMock()
+    desk = PositionalDesk(order_manager=om, state_file=state_file, notifier=mock_notifier)
+
+    mock_kite = MagicMock()
+
+    # Mock datetime so current time is 15:22 on a weekday (Monday)
+    fake_now = datetime(2026, 11, 2, 15, 22, 0)
+    with patch("strategy.positional_condor.condor_desk.datetime") as mock_dt, \
+         patch.object(desk, "evaluate_daily_close") as mock_eval, \
+         patch("strategy.positional_condor.condor_desk.time.sleep") as mock_sleep:
+
+        mock_dt.now.return_value = fake_now
+        desk.run_scheduler(kite=mock_kite, schedule_time="15:20", poll_interval=1, max_iterations=1)
+
+        mock_eval.assert_called_once_with(kite=mock_kite, ignore_holidays=False)
+        mock_sleep.assert_called_once_with(1)
+
 
 
 

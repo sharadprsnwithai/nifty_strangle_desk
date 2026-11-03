@@ -1,6 +1,7 @@
 import json
 import logging
-from datetime import date, datetime, timedelta
+import time
+from datetime import date, datetime, timedelta, time as dt_time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from kiteconnect import KiteConnect
@@ -25,7 +26,7 @@ class PositionalDesk:
     """
     Manages the Positional Evergreen NIFTY Condor & 1:2:1 Ratio strategy.
     Evaluates market regime at 15:20 IST daily, manages break-even rolls,
-    and enforces monthly circuit breakers (+4% target lock / -4% stop loss).
+    and enforces monthly circuit breakers (+4% target lock / -3% stop loss).
     """
 
     def __init__(
@@ -36,7 +37,7 @@ class PositionalDesk:
         lots: int = 1,
         capital_per_lot: float = 100000.0,
         monthly_target_pct: float = 0.04,
-        monthly_stop_pct: float = 0.04
+        monthly_stop_pct: float = 0.03
     ):
         self.order_manager = order_manager
         self.state_file = state_file or DEFAULT_STATE_FILE
@@ -388,7 +389,14 @@ class PositionalDesk:
                 condor_setup = solve_1_to_1_iron_condor(spot_price, expiry_date, instruments, chain_quotes, lots=self.lots)
                 if dry_run:
                     logger.info("[DRY-RUN] Planned 1:1 Iron Condor: %s", condor_setup)
-                    return {"status": "DRY_RUN", "setup": condor_setup}
+                    return {
+                        "status": "DRY_RUN",
+                        "regime": "SIDEWAYS",
+                        "month": month_str,
+                        "expiry": str(expiry_date),
+                        "setup": condor_setup,
+                        "monthly_realized_pnl": state.get("monthly_realized_pnl", 0.0)
+                    }
                 new_trade = self.deploy_iron_condor(condor_setup)
                 state["current_trade"] = new_trade
                 state["regime"] = "SIDEWAYS"
@@ -398,7 +406,14 @@ class PositionalDesk:
                 ratio_setup = get_directional_ratio_strikes(spot_price, regime, expiry_date, instruments, lots=self.lots)
                 if dry_run:
                     logger.info("[DRY-RUN] Planned 1:2:1 %s Ratio: %s", regime, ratio_setup)
-                    return {"status": "DRY_RUN", "setup": ratio_setup}
+                    return {
+                        "status": "DRY_RUN",
+                        "regime": regime,
+                        "month": month_str,
+                        "expiry": str(expiry_date),
+                        "setup": ratio_setup,
+                        "monthly_realized_pnl": state.get("monthly_realized_pnl", 0.0)
+                    }
                 new_trade = self.deploy_directional_ratio(ratio_setup)
                 state["current_trade"] = new_trade
                 state["regime"] = regime
@@ -428,3 +443,73 @@ class PositionalDesk:
 
         logger.info("Holding active %s trade. Regime: %s. Unrealized P&L: Rs %.2f", trade.get("type"), regime, unrealized_pnl)
         return state
+
+    def run_scheduler(
+        self,
+        kite: KiteConnect,
+        schedule_time: str = "15:20",
+        poll_interval: int = 15,
+        max_iterations: Optional[int] = None,
+        ignore_holidays: bool = False
+    ) -> None:
+        """
+        Runs automated daily evaluation daemon:
+        Wakes up every weekday at schedule_time (default: 15:20 IST),
+        verifies holiday calendar, executes daily evaluation, and persists state.
+        """
+        logger.info(
+            "Starting Positional Condor Automated Daemon (Schedule: %s IST, Capital: Rs %s, Stop: %.1f%%, Target: %.1f%%)...",
+            schedule_time, f"{self.total_capital:,.0f}", self.monthly_stop_pct * 100, self.monthly_target_pct * 100
+        )
+        if self.notifier:
+            mode = getattr(self.order_manager, "mode", "PAPER")
+            self.notifier.send_message(
+                f"🤖 <b>NIFTY Positional Desk Automated Daemon Started [{mode}]</b>\n"
+                f"Schedule: <b>Daily at {schedule_time} IST</b>\n"
+                f"Lots: {self.lots} | Capital: Rs {self.total_capital:,.0f}\n"
+                f"Risk Bounds: Stop -{self.monthly_stop_pct*100:.1f}% | Target +{self.monthly_target_pct*100:.1f}%"
+            )
+
+        target_h, target_m = map(int, schedule_time.split(":"))
+        last_evaluated_date: Optional[date] = None
+        last_heartbeat_hour: int = -1
+        iteration = 0
+
+        while True:
+            if max_iterations is not None and iteration >= max_iterations:
+                logger.info("Reached max iterations (%d). Stopping scheduler.", max_iterations)
+                break
+            iteration += 1
+
+            now = datetime.now()
+            today_d = now.date()
+            current_t = now.time()
+
+            # Heartbeat once per hour
+            if now.hour != last_heartbeat_hour:
+                last_heartbeat_hour = now.hour
+                state = self.load_state() or {}
+                logger.info("Scheduler heartbeat [%s] | Active Month: %s | Status: %s | Realized P&L: Rs %.2f",
+                            now.strftime("%Y-%m-%d %H:%M:%S"),
+                            state.get("month", "NONE"),
+                            state.get("status", "IDLE"),
+                            float(state.get("monthly_realized_pnl", 0.0)))
+
+            # Check if execution window reached (e.g. 15:20 - 15:28 IST)
+            if (
+                now.weekday() < 5
+                and current_t >= dt_time(target_h, target_m)
+                and current_t <= dt_time(target_h, target_m + 8)
+                and last_evaluated_date != today_d
+            ):
+                logger.info("Triggering scheduled 15:20 IST evaluation for %s...", today_d)
+                try:
+                    self.evaluate_daily_close(kite=kite, ignore_holidays=ignore_holidays)
+                    last_evaluated_date = today_d
+                    logger.info("Evaluation complete for %s. Sleeping until next session.", today_d)
+                except Exception as e:
+                    logger.exception("Error during scheduled evaluation on %s: %s", today_d, e)
+                    if self.notifier:
+                        self.notifier.send_message(f"⚠️ <b>Positional Desk Error</b>: Scheduled evaluation failed on {today_d}: {e}")
+
+            time.sleep(poll_interval)
