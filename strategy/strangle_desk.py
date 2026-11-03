@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from datetime import datetime, time as dt_time
+from datetime import date, datetime, time as dt_time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from kiteconnect import KiteConnect
@@ -144,7 +144,8 @@ class StrangleDesk:
         order_type: str = "LIMIT",
         limit_buffer_pct: float = 0.05,
         ignore_holidays: bool = False,
-        order_timeout: int = 300
+        order_timeout: int = 300,
+        check_market_hours: bool = False
     ) -> Optional[Dict[str, Any]]:
         """
         Executes and monitors the 10:00 AM Short Strangle intraday session.
@@ -158,6 +159,20 @@ class StrangleDesk:
                 if self.notifier:
                     self.notifier.send_message(f"⏸ <b>Strangle Desk</b>: Exchange closed today ({reason}). Skipping session.")
                 return {"status": "HOLIDAY", "reason": reason}
+
+        # Market Hours Validation (prevent placing regular orders outside NSE trading hours)
+        mode = getattr(self.order_manager, "mode", "PAPER")
+        now_time = datetime.now().time()
+        if mode == "LIVE" and not dry_run and not ignore_holidays and check_market_hours:
+            if now_time < dt_time(9, 15) or now_time > dt_time(15, 30):
+                err_msg = (
+                    f"Cannot execute LIVE strangle orders: NSE market is closed. "
+                    f"Current time: {now_time.strftime('%H:%M:%S')} IST. Regular trading hours are 09:15 - 15:30 IST."
+                )
+                logger.warning(err_msg)
+                if self.notifier:
+                    self.notifier.send_message(f"⚠️ <b>Strangle Desk Warning</b>: {err_msg}")
+                return {"status": "MARKET_CLOSED", "reason": err_msg}
 
         state = self.load_state()
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -537,3 +552,137 @@ class StrangleDesk:
             time.sleep(poll_seconds)
 
         return state
+
+    def run_scheduler(
+        self,
+        underlying: str = "NIFTY",
+        lots: int = 10,
+        poll_seconds: int = 5,
+        kite: Optional[KiteConnect] = None,
+        max_loss_per_leg: float = 10000.0,
+        order_type: str = "LIMIT",
+        limit_buffer_pct: float = 0.05,
+        ignore_holidays: bool = False,
+        order_timeout: int = 300,
+        entry_time_str: str = "10:00",
+        exit_time_str: str = "15:00",
+        idle_sleep_seconds: int = 15,
+        max_iterations: Optional[int] = None
+    ) -> None:
+        """
+        Runs the automated daily daemon scheduler for the 10:00 AM Short Strangle Desk.
+        - Continuously runs in background (ideal for Docker Compose and Cloud VPS)
+        - Logs hourly heartbeat with market status
+        - Skips weekends and official NSE trading holidays
+        - If active trade exists for today: resumes monitoring until completion
+        - At 10:00 AM IST: executes option chain scan, places dual-leg entry, and starts monitoring loop
+        - At 15:00 PM IST: closes any remaining open positions
+        - Outside market hours (e.g. evening 18:33 IST): sleeps peacefully and never submits orders
+        """
+        mode = getattr(self.order_manager, "mode", "PAPER")
+        logger.info(
+            "Starting 10:00 AM Strangle Desk Daemon [%s] (Lots: %d, Entry: %s IST, Cutoff: %s IST)...",
+            mode, lots, entry_time_str, exit_time_str
+        )
+        if self.notifier:
+            self.notifier.send_message(
+                f"🤖 <b>10:00 AM Strangle Desk Daemon Started [{mode}]</b>\n"
+                f"Schedule: <b>Daily Entry at {entry_time_str} IST</b> | Exit at {exit_time_str} IST\n"
+                f"Lots: {lots} | Max Loss Per Leg: Rs {max_loss_per_leg:,.0f}\n"
+                f"Status: Waiting for market session..."
+            )
+
+        entry_h, entry_m = map(int, entry_time_str.split(":"))
+        last_heartbeat_hour: int = -1
+        last_holiday_date: Optional[date] = None
+        iteration = 0
+
+        while True:
+            if max_iterations is not None and iteration >= max_iterations:
+                logger.info("Reached max iterations (%d). Stopping scheduler.", max_iterations)
+                break
+            iteration += 1
+
+            now = datetime.now()
+            today_d = now.date()
+            current_t = now.time()
+
+            # Heartbeat once per hour
+            if now.hour != last_heartbeat_hour:
+                last_heartbeat_hour = now.hour
+                state = self.load_state() or {}
+                market_status = "OPEN" if dt_time(9, 15) <= current_t <= dt_time(15, 30) and now.weekday() < 5 else "CLOSED"
+                logger.info(
+                    "Strangle scheduler heartbeat [%s] | Market: %s | Today State: %s | Realized P&L: Rs %.2f",
+                    now.strftime("%Y-%m-%d %H:%M:%S"),
+                    market_status,
+                    state.get("status", "IDLE"),
+                    float(state.get("realized_pnl", 0.0))
+                )
+
+            # Check weekends and holidays
+            if not ignore_holidays:
+                is_holiday, reason = is_trading_holiday(check_date=today_d)
+                if is_holiday:
+                    if last_holiday_date != today_d:
+                        logger.info("Exchange is closed today (%s: %s). Scheduler waiting for next trading day.", today_d, reason)
+                        last_holiday_date = today_d
+                    time.sleep(idle_sleep_seconds)
+                    continue
+
+            # Check today's state
+            state = self.load_state()
+            today_str = today_d.strftime("%Y-%m-%d")
+
+            # 1. If an active trade already exists for today, resume monitoring it!
+            if state is not None and state.get("date") == today_str and state.get("status") == "OPEN":
+                logger.info("Resuming active session from today (%s)...", today_str)
+                try:
+                    self.run_session(
+                        underlying=underlying,
+                        lots=lots,
+                        poll_seconds=poll_seconds,
+                        kite=kite,
+                        max_loss_per_leg=max_loss_per_leg,
+                        order_type=order_type,
+                        limit_buffer_pct=limit_buffer_pct,
+                        ignore_holidays=ignore_holidays,
+                        order_timeout=order_timeout
+                    )
+                except Exception as e:
+                    logger.exception("Error during active strangle session: %s", e)
+                continue
+
+            # 2. If today's session is already completed or aborted, wait for next trading day
+            if state is not None and state.get("date") == today_str and state.get("status") in ("COMPLETED", "ABORTED"):
+                time.sleep(idle_sleep_seconds)
+                continue
+
+            # 3. If before 10:00 AM (e.g. pre-market or 09:15-09:59), wait for entry time
+            if current_t < dt_time(entry_h, entry_m):
+                time.sleep(idle_sleep_seconds)
+                continue
+
+            # 4. If at 10:00 AM (entry window: 10:00 - 10:05 IST on trading days):
+            if dt_time(entry_h, entry_m) <= current_t <= dt_time(entry_h, entry_m + 5):
+                logger.info("Triggering 10:00 AM Strangle entry for %s...", today_str)
+                try:
+                    self.run_session(
+                        underlying=underlying,
+                        lots=lots,
+                        poll_seconds=poll_seconds,
+                        kite=kite,
+                        max_loss_per_leg=max_loss_per_leg,
+                        order_type=order_type,
+                        limit_buffer_pct=limit_buffer_pct,
+                        ignore_holidays=ignore_holidays,
+                        order_timeout=order_timeout
+                    )
+                except Exception as e:
+                    logger.exception("Error during 10:00 AM strangle session: %s", e)
+                    if self.notifier:
+                        self.notifier.send_message(f"⚠️ <b>Strangle Desk Error</b>: Session failed on {today_str}: {e}")
+                continue
+
+            # 5. Outside entry window & market closed (e.g. evening 18:33 IST): sleep
+            time.sleep(idle_sleep_seconds)

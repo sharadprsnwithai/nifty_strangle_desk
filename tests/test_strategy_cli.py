@@ -96,6 +96,7 @@ def test_run_strategy_cli_execution_armed():
 
         exit_code = run_strategy_cli(["--paper", "--poll", "10"])
         assert exit_code == 0
+        mock_desk.run_scheduler.assert_called_once()
 
 
 def test_order_manager_mode_validation():
@@ -501,3 +502,50 @@ def test_strangle_desk_run_session_partial_fill_aborts_and_squares_off(tmp_path)
         "NIFTY26NOV23700PE", 130, 30.5, reason="ABORT_PARTIAL_FILL", order_type="LIMIT", buffer_pct=0.05
     )
     assert state_file.exists()
+
+
+def test_strangle_desk_run_session_market_closed(tmp_path):
+    from datetime import datetime
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    om.mode = "LIVE"
+    mock_notifier = MagicMock()
+    desk = StrangleDesk(order_manager=om, state_file=state_file, notifier=mock_notifier)
+
+    mock_kite = MagicMock()
+    # Mock datetime to 18:33 (market closed) on a weekday
+    fake_now = datetime(2026, 11, 2, 18, 33, 0)
+    with patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        res = desk.run_session(lots=1, kite=mock_kite, check_market_hours=True)
+
+    assert res["status"] == "MARKET_CLOSED"
+    assert "market is closed" in res["reason"]
+    # Verify no orders were placed to Kite Connect
+    om.sell.assert_not_called()
+    mock_notifier.send_message.assert_called_once()
+    assert "market is closed" in mock_notifier.send_message.call_args[0][0]
+
+
+def test_strangle_desk_run_scheduler_loop(tmp_path):
+    from datetime import datetime
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    om.mode = "LIVE"
+    mock_notifier = MagicMock()
+    desk = StrangleDesk(order_manager=om, state_file=state_file, notifier=mock_notifier)
+
+    mock_kite = MagicMock()
+    # Mock datetime to 10:02 AM (entry window) on a Monday
+    fake_now = datetime(2026, 11, 2, 10, 2, 0)
+    with patch("strategy.strangle_desk.datetime") as mock_dt, \
+         patch.object(desk, "run_session") as mock_session, \
+         patch("strategy.strangle_desk.time.sleep") as mock_sleep:
+
+        mock_dt.now.return_value = fake_now
+        desk.run_scheduler(lots=1, kite=mock_kite, entry_time_str="10:00", idle_sleep_seconds=1, max_iterations=1)
+
+        mock_session.assert_called_once()
+        mock_notifier.send_message.assert_called_once()
+        assert "Daemon Started" in mock_notifier.send_message.call_args[0][0]
+

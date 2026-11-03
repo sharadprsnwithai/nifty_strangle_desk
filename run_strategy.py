@@ -38,10 +38,11 @@ def run_strategy_cli(args=None) -> int:
     parser.add_argument("--limit-buffer-pct", type=float, default=0.05, help="Marketable limit price buffer percentage (default: 0.05 / 5%)")
     parser.add_argument("--ignore-holidays", action="store_true", help="Ignore NSE holiday and weekend checks")
     parser.add_argument("--order-timeout", type=int, default=300, help="Order fill timeout in seconds before cancellation (default: 300)")
+    parser.add_argument("--entry-time", type=str, default="10:00", help="Daily execution entry time in IST (default: 10:00)")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default=os.getenv("LOG_LEVEL", "INFO"), help="Logging verbosity level (default: INFO)")
     parser.add_argument("--log-dir", type=str, default=os.getenv("LOG_DIR", "logs"), help="Directory for host log files (default: logs)")
     parser.add_argument("--dry-run", action="store_true", help="Perform single strike lookup and print plan without waiting")
-    parser.add_argument("--once", action="store_true", help="Run single monitoring iteration and exit")
+    parser.add_argument("--once", action="store_true", help="Run single monitoring iteration and exit (default runs automated daemon)")
 
     parsed = parser.parse_args(args)
     setup_logging(log_dir=parsed.log_dir, log_level=parsed.log_level)
@@ -56,20 +57,35 @@ def run_strategy_cli(args=None) -> int:
     desk = StrangleDesk(order_manager=om, notifier=notifier)
 
     try:
-        desk.run_session(
-            underlying="NIFTY",
-            lots=parsed.lots,
-            poll_seconds=parsed.poll,
-            dry_run=parsed.dry_run,
-            execute_once=parsed.once,
-            kite=kite,
-            max_loss_per_leg=parsed.max_loss,
-            order_type=parsed.order_type,
-            limit_buffer_pct=parsed.limit_buffer_pct,
-            ignore_holidays=parsed.ignore_holidays,
-            order_timeout=parsed.order_timeout
-        )
-        return 0
+        if parsed.dry_run or parsed.once:
+            desk.run_session(
+                underlying="NIFTY",
+                lots=parsed.lots,
+                poll_seconds=parsed.poll,
+                dry_run=parsed.dry_run,
+                execute_once=parsed.once,
+                kite=kite,
+                max_loss_per_leg=parsed.max_loss,
+                order_type=parsed.order_type,
+                limit_buffer_pct=parsed.limit_buffer_pct,
+                ignore_holidays=parsed.ignore_holidays,
+                order_timeout=parsed.order_timeout
+            )
+            return 0
+        else:
+            desk.run_scheduler(
+                underlying="NIFTY",
+                lots=parsed.lots,
+                poll_seconds=parsed.poll,
+                kite=kite,
+                max_loss_per_leg=parsed.max_loss,
+                order_type=parsed.order_type,
+                limit_buffer_pct=parsed.limit_buffer_pct,
+                ignore_holidays=parsed.ignore_holidays,
+                order_timeout=parsed.order_timeout,
+                entry_time_str=parsed.entry_time
+            )
+            return 0
     except Exception as e:
         logger.error("Strategy session failed: %s", e, exc_info=True)
         return 1
