@@ -100,3 +100,11 @@ def test_empty_positions():
     assert summary["totals"]["total_pnl"] == 0.0
     table_text = format_positions_table(summary, view="net", open_only=False)
     assert "No positions found" in table_text
+
+def test_format_positions_table_day_view(sample_positions_payload):
+    summary = summarize_positions(sample_positions_payload)
+    table_text = format_positions_table(summary, view="day", open_only=False)
+    
+    assert "DAY POSITIONS (Intraday)" in table_text
+    assert "Day Qty" in table_text
+    assert "BANKNIFTY26NOV52000PE" in table_text

@@ -61,32 +61,37 @@ def run_cli(args: Optional[List[str]] = None) -> int:
     parser = build_parser()
     parsed_args = parser.parse_args(args)
 
+    prev_level = logging.getLogger().level
     if parsed_args.json:
         # Silence standard info logs in JSON mode so stdout remains clean JSON
         logging.getLogger().setLevel(logging.ERROR)
 
     try:
-        config = load_config()
-    except Exception as e:
-        logger.error(f"Configuration error: {e}")
-        return 1
+        try:
+            config = load_config()
+        except Exception as e:
+            logger.error("Configuration error: %s", e)
+            return 1
 
-    try:
-        kite = get_kite_client(config=config, force_login=parsed_args.force_login)
-        raw_positions = fetch_positions(kite)
-        summary = summarize_positions(raw_positions)
+        try:
+            kite = get_kite_client(config=config, force_login=parsed_args.force_login)
+            raw_positions = fetch_positions(kite)
+            summary = summarize_positions(raw_positions)
 
+            if parsed_args.json:
+                print(json.dumps(summary, indent=2))
+            else:
+                view = "day" if parsed_args.day else "net"
+                table_str = format_positions_table(summary, view=view, open_only=parsed_args.open_only)
+                print(table_str)
+
+            return 0
+        except Exception as e:
+            logger.error("Error fetching Kite positions: %s", e, exc_info=True)
+            return 1
+    finally:
         if parsed_args.json:
-            print(json.dumps(summary, indent=2))
-        else:
-            view = "day" if parsed_args.day else "net"
-            table_str = format_positions_table(summary, view=view, open_only=parsed_args.open_only)
-            print(table_str)
-
-        return 0
-    except Exception as e:
-        logger.error(f"Error fetching Kite positions: {e}", exc_info=True)
-        return 1
+            logging.getLogger().setLevel(prev_level)
 
 if __name__ == "__main__":
     sys.exit(run_cli())

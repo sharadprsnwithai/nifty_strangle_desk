@@ -112,7 +112,8 @@ def format_positions_table(summary: Dict[str, Any], view: str = "net", open_only
                 pnl_str
             ])
 
-        headers = ["Symbol", "Exch", "Product", "Net Qty", "Buy Avg", "Sell Avg", "LTP", "P&L (₹)"]
+        qty_col = "Day Qty" if view == "day" else "Net Qty"
+        headers = ["Symbol", "Exch", "Product", qty_col, "Buy Avg", "Sell Avg", "LTP", "P&L (INR)"]
         lines.append(tabulate(table_rows, headers=headers, tablefmt="grid"))
 
     # Summary section

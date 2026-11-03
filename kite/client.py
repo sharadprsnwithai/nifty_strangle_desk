@@ -28,7 +28,7 @@ def get_kite_client(config: Optional[KiteConfig] = None, force_login: bool = Fal
         except TokenException:
             logger.warning("Cached access token has expired or is invalid. Initiating fresh TOTP login...")
         except Exception as e:
-            logger.warning(f"Validation failed ({e}). Proceeding to re-authenticate...")
+            logger.warning("Validation failed (%s). Proceeding to re-authenticate...", e)
 
     logger.info("Logging in with TOTP 2FA...")
     new_token = login_with_totp(cfg)

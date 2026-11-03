@@ -53,96 +53,96 @@ def login_with_totp(config: KiteConfig, env_path: Optional[Union[str, Path]] = N
     4. Exchanges request_token with KiteConnect for fresh access_token.
     5. Saves new access_token to .env.
     """
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "X-Kite-Version": "3"
-    })
-
     try:
-        # Step 1: Login with User ID and Password
-        logger.info("Submitting login credentials to Zerodha Kite...")
-        login_resp = session.post(
-            "https://kite.zerodha.com/api/login",
-            data={"user_id": config.user_id, "password": config.password},
-            timeout=15
-        )
-        login_json = login_resp.json()
-        if login_json.get("status") != "success":
-            logger.error(f"Login Step 1 failed: {login_json.get('message', 'Unknown login error')}")
-            return None
+        with requests.Session() as session:
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "X-Kite-Version": "3"
+            })
 
-        request_id = login_json["data"]["request_id"]
+            # Step 1: Login with User ID and Password
+            logger.info("Submitting login credentials to Zerodha Kite...")
+            login_resp = session.post(
+                "https://kite.zerodha.com/api/login",
+                data={"user_id": config.user_id, "password": config.password},
+                timeout=15
+            )
+            login_json = login_resp.json()
+            if login_json.get("status") != "success":
+                logger.error("Login Step 1 failed: %s", login_json.get("message", "Unknown login error"))
+                return None
 
-        # Step 2: Generate TOTP code and submit TwoFA
-        logger.info("Generating live TOTP code via pyotp...")
-        totp_code = generate_totp_code(config.totp_key)
+            request_id = login_json["data"]["request_id"]
 
-        twofa_resp = session.post(
-            "https://kite.zerodha.com/api/twofa",
-            data={
-                "user_id": config.user_id,
-                "request_id": request_id,
-                "twofa_value": totp_code,
-                "twofa_type": "totp"
-            },
-            timeout=15
-        )
-        twofa_json = twofa_resp.json()
-        if twofa_json.get("status") != "success":
-            logger.error(f"TOTP 2FA failed: {twofa_json.get('message', 'Invalid TOTP')}")
-            return None
+            # Step 2: Generate TOTP code and submit TwoFA
+            logger.info("Generating live TOTP code via pyotp...")
+            totp_code = generate_totp_code(config.totp_key)
 
-        logger.info("2FA TOTP verification successful!")
+            twofa_resp = session.post(
+                "https://kite.zerodha.com/api/twofa",
+                data={
+                    "user_id": config.user_id,
+                    "request_id": request_id,
+                    "twofa_value": totp_code,
+                    "twofa_type": "totp"
+                },
+                timeout=15
+            )
+            twofa_json = twofa_resp.json()
+            if twofa_json.get("status") != "success":
+                logger.error("TOTP 2FA failed: %s", twofa_json.get("message", "Invalid TOTP"))
+                return None
 
-        # Step 3: OAuth redirect to extract request_token
-        oauth_url = f"https://kite.zerodha.com/connect/login?api_key={config.api_key}&v=3"
-        r_hop1 = session.get(oauth_url, allow_redirects=False, timeout=15)
-        loc1 = r_hop1.headers.get("Location") or r_hop1.headers.get("location", "")
+            logger.info("2FA TOTP verification successful!")
 
-        request_token = None
-        if "request_token=" in loc1:
-            match = re.search(r"request_token=([a-zA-Z0-9]+)", loc1)
-            if match:
-                request_token = match.group(1)
-        elif loc1:
-            if loc1.startswith("/"):
-                loc1 = "https://kite.zerodha.com" + loc1
-            r_hop2 = session.get(loc1, allow_redirects=False, timeout=15)
-            loc2 = r_hop2.headers.get("Location") or r_hop2.headers.get("location", "")
-            match = re.search(r"request_token=([a-zA-Z0-9]+)", loc2)
-            if match:
-                request_token = match.group(1)
+            # Step 3: OAuth redirect to extract request_token
+            oauth_url = f"https://kite.zerodha.com/connect/login?api_key={config.api_key}&v=3"
+            r_hop1 = session.get(oauth_url, allow_redirects=False, timeout=15)
+            loc1 = r_hop1.headers.get("Location") or r_hop1.headers.get("location", "")
 
-        if not request_token:
-            try:
-                r_full = session.get(oauth_url, allow_redirects=True, timeout=15)
-                match = re.search(r"request_token=([a-zA-Z0-9]+)", r_full.url)
+            request_token = None
+            if "request_token=" in loc1:
+                match = re.search(r"request_token=([a-zA-Z0-9]+)", loc1)
                 if match:
                     request_token = match.group(1)
-            except requests.exceptions.ConnectionError as ce:
-                match = re.search(r"request_token=([a-zA-Z0-9]+)", str(ce))
+            elif loc1:
+                if loc1.startswith("/"):
+                    loc1 = "https://kite.zerodha.com" + loc1
+                r_hop2 = session.get(loc1, allow_redirects=False, timeout=15)
+                loc2 = r_hop2.headers.get("Location") or r_hop2.headers.get("location", "")
+                match = re.search(r"request_token=([a-zA-Z0-9]+)", loc2)
                 if match:
                     request_token = match.group(1)
 
-        if not request_token:
-            logger.error("Could not extract request_token from OAuth redirect hops.")
-            return None
+            if not request_token:
+                try:
+                    r_full = session.get(oauth_url, allow_redirects=True, timeout=15)
+                    match = re.search(r"request_token=([a-zA-Z0-9]+)", r_full.url)
+                    if match:
+                        request_token = match.group(1)
+                except requests.exceptions.ConnectionError as ce:
+                    match = re.search(r"request_token=([a-zA-Z0-9]+)", str(ce))
+                    if match:
+                        request_token = match.group(1)
 
-        logger.info("Extracted OAuth request_token successfully.")
+            if not request_token:
+                logger.error("Could not extract request_token from OAuth redirect hops.")
+                return None
 
-        # Step 4: Exchange request_token for access_token
-        kc = KiteConnect(api_key=config.api_key)
-        session_data = kc.generate_session(request_token, api_secret=config.api_secret)
-        access_token = session_data.get("access_token")
+            logger.info("Extracted OAuth request_token successfully.")
 
-        if access_token:
-            save_access_token_to_env(access_token, env_path=env_path)
-            logger.info("Fresh Kite access token obtained and saved to .env!")
-            return access_token
+            # Step 4: Exchange request_token for access_token
+            kc = KiteConnect(api_key=config.api_key)
+            session_data = kc.generate_session(request_token, api_secret=config.api_secret)
+            access_token = session_data.get("access_token")
+
+            if access_token:
+                save_access_token_to_env(access_token, env_path=env_path)
+                logger.info("Fresh Kite access token obtained and saved to .env!")
+                return access_token
 
     except Exception as e:
-        logger.error(f"Automated TOTP login encountered error: {e}", exc_info=True)
+        logger.error("Automated TOTP login encountered error: %s", e, exc_info=True)
         return None
 
     return None

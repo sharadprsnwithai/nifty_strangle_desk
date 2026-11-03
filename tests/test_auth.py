@@ -1,6 +1,5 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-import pyotp
 import pytest
 from kite.auth import generate_totp_code, save_access_token_to_env, login_with_totp
 from config import KiteConfig
@@ -49,6 +48,7 @@ def test_login_with_totp_mocked_success(tmp_path):
         
         session = MagicMock()
         MockSession.return_value = session
+        session.__enter__.return_value = session
 
         # Mock login response
         login_resp = MagicMock()
@@ -73,3 +73,85 @@ def test_login_with_totp_mocked_success(tmp_path):
         token = login_with_totp(config, env_path=env_file)
         assert token == "generated_access_token_999"
         assert "KITE_ACCESS_TOKEN=generated_access_token_999" in env_file.read_text()
+
+
+def test_login_with_totp_step1_failure(tmp_path):
+    env_file = tmp_path / ".env"
+    config = KiteConfig(
+        api_key="mock_api_key",
+        api_secret="mock_secret",
+        user_id="mock_user",
+        password="wrong_password",
+        totp_key="JBSWY3DPEHPK3PXP"
+    )
+
+    with patch("requests.Session") as MockSession:
+        session = MagicMock()
+        MockSession.return_value = session
+        session.__enter__.return_value = session
+
+        login_resp = MagicMock()
+        login_resp.json.return_value = {"status": "error", "message": "Invalid credentials"}
+        session.post.return_value = login_resp
+
+        token = login_with_totp(config, env_path=env_file)
+        assert token is None
+
+
+def test_login_with_totp_twofa_failure(tmp_path):
+    env_file = tmp_path / ".env"
+    config = KiteConfig(
+        api_key="mock_api_key",
+        api_secret="mock_secret",
+        user_id="mock_user",
+        password="mock_pass",
+        totp_key="JBSWY3DPEHPK3PXP"
+    )
+
+    with patch("requests.Session") as MockSession:
+        session = MagicMock()
+        MockSession.return_value = session
+        session.__enter__.return_value = session
+
+        login_resp = MagicMock()
+        login_resp.json.return_value = {"status": "success", "data": {"request_id": "req_123"}}
+
+        twofa_resp = MagicMock()
+        twofa_resp.json.return_value = {"status": "error", "message": "Invalid TOTP"}
+
+        session.post.side_effect = [login_resp, twofa_resp]
+
+        token = login_with_totp(config, env_path=env_file)
+        assert token is None
+
+
+def test_login_with_totp_missing_request_token(tmp_path):
+    env_file = tmp_path / ".env"
+    config = KiteConfig(
+        api_key="mock_api_key",
+        api_secret="mock_secret",
+        user_id="mock_user",
+        password="mock_pass",
+        totp_key="JBSWY3DPEHPK3PXP"
+    )
+
+    with patch("requests.Session") as MockSession:
+        session = MagicMock()
+        MockSession.return_value = session
+        session.__enter__.return_value = session
+
+        login_resp = MagicMock()
+        login_resp.json.return_value = {"status": "success", "data": {"request_id": "req_123"}}
+
+        twofa_resp = MagicMock()
+        twofa_resp.json.return_value = {"status": "success"}
+
+        session.post.side_effect = [login_resp, twofa_resp]
+
+        hop_resp = MagicMock()
+        hop_resp.headers = {"Location": "https://kite.zerodha.com/connect/login"}
+        hop_resp.url = "https://kite.zerodha.com/connect/login"
+        session.get.return_value = hop_resp
+
+        token = login_with_totp(config, env_path=env_file)
+        assert token is None
