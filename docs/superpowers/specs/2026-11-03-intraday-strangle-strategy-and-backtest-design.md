@@ -22,8 +22,9 @@ This document specifies the architecture, math model, execution pipeline, and re
   - Select 1 CE strike with LTP strictly $\ge ₹30.0$ and closest to ₹30 from above.
   - Select 1 PE strike with LTP strictly $\ge ₹30.0$ and closest to ₹30 from above.
 - **Risk Management & Exits:**
-  - **Stop-Loss (SL):** $+50\%$ above entry price (`entry_price * 1.50`), tracked independently per leg.
-  - **Profit Target:** $80\%$ decay of entry premium (`entry_price * 0.20`), tracked independently per leg.
+  - **Portfolio Max Loss (Primary Risk Cap):** ₹10,000 maximum combined strategy loss across all active & closed legs of the day, evaluated at every 5-minute check. If total loss $\ge ₹10,000$, exits all open legs immediately (`STRATEGY_MAX_LOSS_10K`).
+  - **Stop-Loss (SL):** $+50\%$ above entry price (`entry_price * 1.50`), tracked per leg.
+  - **Profit Target:** $80\%$ decay of entry premium (`entry_price * 0.20`), tracked per leg.
   - **Time Exit:** 3:00 PM IST (15:00) mandatory square-off for any remaining active leg.
 - **Dual Execution Modes:**
   - **PAPER (Default):** Realistic simulated fills with bid-ask slippage and cost accounting.
@@ -143,12 +144,13 @@ For each option leg traded:
      - Calculates independent SL (`entry * 1.50`) and Target (`entry * 0.20`).
      - Serializes state to `data/trades_today.json`.
   3. `MONITORING`:
-     - Polls `kite.ltp()` every 5 seconds.
-     - For CE leg:
-       - If $\text{LTP} \ge \text{SL}$: Triggers Buy Market Exit with reason `STOP_LOSS`.
-       - Else if $\text{LTP} \le \text{Target}$: Triggers Buy Market Exit with reason `DECAY_TARGET`.
-     - For PE leg:
-       - Evaluated independently using identical logic.
+     - Polls `kite.ltp()` every 5 seconds (with 5-minute periodic portfolio loss evaluation).
+     - **Portfolio Risk Check**:
+       - Calculates total strategy MTM: $\text{Total P\&L} = \text{Realized P\&L (closed legs)} + \text{Unrealized P\&L (active legs)}$.
+       - If cumulative loss $\ge \text{strategy\_max\_loss}$ (₹10,000 for 10 lots), immediately exits all open legs with reason `STRATEGY_MAX_LOSS_10K` and marks session complete.
+     - **Leg-Level Exits**:
+       - For CE leg: If $\text{LTP} \ge \text{SL}$, triggers Buy Market Exit with reason `STOP_LOSS`. Else if $\text{LTP} \le \text{Target}$, triggers `DECAY_TARGET`.
+       - For PE leg: Evaluated using identical logic.
      - Updates `data/trades_today.json`.
   4. `SQUARE_OFF_3PM`:
      - At 15:00:00 IST, closes any remaining active leg with reason `TIME_EXIT`.

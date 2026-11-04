@@ -397,6 +397,20 @@ class PositionalDesk:
         except Exception as e:
             logger.warning("Broker position reconciliation failed: %s", e)
 
+    def _ensure_kite_session(self, kite: Optional[Any] = None) -> Any:
+        """Ensures that the KiteConnect client has a valid session, reloading from .env or re-authenticating."""
+        if kite is not None:
+            try:
+                kite.profile()
+                return kite
+            except Exception as e:
+                logger.warning("PositionalDesk detected invalid Kite session (%s). Reloading token...", e)
+        from kite.client import get_kite_client
+        new_kite = get_kite_client(force_login=False)
+        if hasattr(self.order_manager, "kite") and self.order_manager.kite is not None:
+            self.order_manager.kite = new_kite
+        return new_kite
+
     def evaluate_daily_close(
         self,
         kite: KiteConnect,
@@ -414,6 +428,7 @@ class PositionalDesk:
         5. Computes Daily RSI(14) to determine regime (SIDEWAYS, BEARISH, BULLISH)
         6. Manages trade deployment, regime transitions, and Iron Condor break-even rolls
         """
+        kite = self._ensure_kite_session(kite)
         today_date = force_date or date.today()
         month_str = today_date.strftime("%Y-%m")
 
@@ -756,6 +771,7 @@ class PositionalDesk:
             ):
                 logger.info("Triggering scheduled 15:20 IST evaluation for %s...", today_d)
                 try:
+                    kite = self._ensure_kite_session(kite)
                     self.evaluate_daily_close(kite=kite, ignore_holidays=ignore_holidays)
                     last_evaluated_date = today_d
                     logger.info("Evaluation complete for %s. Sleeping until next session.", today_d)

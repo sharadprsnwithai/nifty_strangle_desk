@@ -5,7 +5,7 @@ A modular algorithmic trading desk connected to Zerodha Kite Connect API using a
 ## Features
 - **Headless TOTP 2FA**: Automated daily login via `pyotp` RFC 6238 without manual browser interaction.
 - **Smart Token Caching**: Caches and validates daily `access_token` in `.env` to avoid unnecessary logins.
-- **10:00 AM NIFTY Short Strangle Strategy**: Automated strike discovery ($\ge ₹30.0$), 0 DTE $\to$ next week shift, independent $+50\%$ SL, $80\%$ decay target, 3:00 PM time exit, and dual Paper/Live execution.
+- **10:00 AM NIFTY Short Strangle Strategy**: Automated strike discovery ($\ge ₹30.0$), 0 DTE $\to$ next week shift, 5-minute portfolio stop-loss exit (₹10,000 max strategy loss across all legs), independent $+50\%$ SL, $80\%$ decay target, 3:00 PM time exit, and dual Paper/Live execution.
 - **Crash-Resilient State Machine**: Persists active legs and trade state to handle restarts gracefully.
 - **Realistic Backtesting Engine**: Day-by-day continuous fractional-DTE option simulation accounting for exact NSE transaction taxes, STT, SEBI fees, GST, brokerage, and execution slippage.
 - **Comprehensive Positions Viewer**: Displays both Net and Day positions with quantity, entry averages, LTP, MTM, and P&L metrics.
@@ -58,11 +58,11 @@ uv run python main.py --force-login
 Simulates the 10:00 AM Short Strangle across historical 5-minute NIFTY candles with continuous fractional DTE option pricing, exact NSE statutory taxes & charges, and execution slippage:
 
 ```bash
-# Standard 180-day backtest with 10 lots
-uv run python run_backtest.py --days 180 --lots 10
+# Standard 180-day backtest with 10 lots (default: Rs 10,000 portfolio max loss)
+uv run python run_backtest.py --days 180 --lots 10 --strategy-max-loss 10000
 
-# Custom slippage and output CSV file
-uv run python run_backtest.py --days 90 --slippage 0.75 --lots 5 --output data/custom_log.csv
+# Custom slippage, portfolio stop-loss, and output CSV file
+uv run python run_backtest.py --days 90 --slippage 0.75 --lots 5 --strategy-max-loss 5000 --output data/custom_log.csv
 ```
 
 > **Data Caching**: Historical bars can be loaded from `HISTORICAL_CACHE_PATH` (if set), `data/nifty_5m_cache.parquet`, or fetched via Kite Connect in 60-day slices.
@@ -72,7 +72,11 @@ Executes or simulates the 10:00 AM Short Strangle desk:
 - **0 DTE Rule**: When today is Tuesday (weekly expiry), automatically selects next week's expiry.
 - **Contract Specifications**: NIFTY lot size is 65 (10 lots = 650 shares).
 - **Strike Selection**: Lowest OTM strikes with LTP $\ge ₹30.0$.
-- **Risk Management**: Independent $+50\%$ Stop Loss per leg, independent $80\%$ decay profit target per leg, hard ₹10,000 per-leg max loss exit, and mandatory 3:00 PM square-off.
+- **Risk Management**: 
+  - **Portfolio Max Loss Exit**: ₹10,000 maximum daily loss across all open legs evaluated at every 5-minute check (closes all legs immediately on breach with reason `STRATEGY_MAX_LOSS_10K`, eliminating whipsaw losses and cutting max drawdown by 45.4%).
+  - **Stop Loss & Target**: Independent $+50\%$ Stop Loss per leg (`entry * 1.50`) and independent $80\%$ decay profit target per leg (`entry * 0.20`).
+  - **Time Exit**: Mandatory 3:00 PM (15:00 IST) market square-off for any remaining positions.
+- **Automated 08:00 AM IST Daily TOTP Login Renewal**: Proactively renews the Zerodha Kite access token via headless TOTP authentication every morning at 08:00 AM IST on trading days. Persists the token to `.env` and notifies Telegram, ensuring all subsequent daily activities (10:00 AM strike scan, order entries, live polling) use a freshly minted, validated credential.
 - **Order Execution Verification & Timeout**: Monitors entry order status for up to 5 minutes (`--order-timeout 300`). If unfilled, pending orders are automatically cancelled. If partially filled, pending portions are cancelled and filled shares are immediately squared off (`buy_to_cover`) to prevent unhedged or unmatched exposure.
 - **Market Protection**: Uses marketable `LIMIT` orders with customizable price buffer (default: 5% off LTP) rounded to NSE ₹0.05 ticks to prevent Zerodha RMS freak-trade order rejections.
 - **NSE Holiday Protection**: Automatically checks weekend and official NSE trading holiday calendars and skips non-trading sessions.
@@ -80,6 +84,9 @@ Executes or simulates the 10:00 AM Short Strangle desk:
 - **State Recovery & Host Event Logging**: Crash-resilient tracking persisted to `data/trades_today.json`, and rotating detailed event logs persisted directly to `logs/strangle_desk.log` on the host machine.
 
 ```bash
+# Execute on-demand morning TOTP login renewal immediately (and notify Telegram)
+uv run python run_strategy.py --morning-login
+
 # Dry-run strike lookup and strategy plan (without placing orders)
 uv run python run_strategy.py --paper --dry-run
 
@@ -89,8 +96,8 @@ uv run python run_strategy.py --paper --lots 10 --order-type LIMIT --limit-buffe
 # Single evaluation pass (for tests or one-shot automation)
 uv run python run_strategy.py --paper --once
 
-# Execute Live Trading via Kite Connect with marketable limit orders
-uv run python run_strategy.py --live --lots 1 --order-type LIMIT --max-loss 1000
+# Execute Live Trading via Kite Connect with marketable limit orders & portfolio stop loss
+uv run python run_strategy.py --live --lots 1 --order-type LIMIT --strategy-max-loss 1000
 ```
 
 ### 4. Run NIFTY Positional Evergreen Condor Desk

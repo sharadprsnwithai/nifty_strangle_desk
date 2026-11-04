@@ -81,9 +81,9 @@ def test_run_backtest_simulation_structure(sample_5min_bars):
     assert summary["total_days_traded"] == 2
     assert len(results["trades"]) == 2
 
-    # Check Day 2 CE triggered max loss or stop loss due to sharp rally
+    # Check Day 2 CE triggered portfolio max loss or stop loss due to sharp rally
     day2_trade = results["trades"][1]
-    assert day2_trade["ce_reason"] in ("MAX_LOSS_10K", "STOP_LOSS")
+    assert day2_trade["ce_reason"] in ("STRATEGY_MAX_LOSS_10K", "STOP_LOSS")
 
 def test_run_backtest_simulation_empty_df():
     empty_df = pd.DataFrame(columns=["timestamps", "open", "high", "low", "close"])
@@ -120,21 +120,50 @@ def test_run_backtest_simulation_tuesday_0dte():
     assert trade["expiry"] == "2026-11-10"
 
 
-def test_run_backtest_simulation_max_loss_10k_exit():
-    # Construct a trading day where spot rises moderately enough to trigger 10k loss before 50% SL
+def test_run_backtest_simulation_strategy_max_loss_default():
+    # Verify default strategy_max_loss=10000.0 is applied without passing explicit argument
     rows = []
     base_time = datetime(2026, 11, 2, 9, 15)
     for i in range(75):
         t = base_time + timedelta(minutes=i * 5)
-        # 10:00 AM (i=9) spot is 24000. Later in day spot rises to 24200
         spot = 24000.0 if i < 15 else 24000.0 + ((i - 15) * 8.0)
         rows.append({"timestamps": t, "open": spot, "high": spot + 5.0, "low": spot - 5.0, "close": spot})
     df = pd.DataFrame(rows)
 
-    results = run_backtest_simulation(bars_df=df, lots=10, lot_size=65, max_loss_per_leg=10000.0)
+    results = run_backtest_simulation(bars_df=df, lots=10, lot_size=65)
     assert results["summary"]["total_days_traded"] == 1
     trade = results["trades"][0]
-    # Check that either MAX_LOSS_10K or STOP_LOSS was recorded, and loss did not exceed 10k (+ reasonable slippage)
-    assert trade["ce_reason"] in ("MAX_LOSS_10K", "STOP_LOSS")
-    if trade["ce_reason"] == "MAX_LOSS_10K":
-        assert trade["ce_pnl"] >= -11000.0  # Approx 10k loss + slippage/taxes
+    assert trade["ce_reason"] in ("STRATEGY_MAX_LOSS_10K", "STOP_LOSS")
+
+
+def test_run_backtest_simulation_strategy_max_loss_exit():
+    # Construct a trading day with whipsaw where CE stops out, and then as spot declines
+    # the total strategy loss hits 10,000, triggering an immediate portfolio exit on PE.
+    rows = []
+    base_time = datetime(2026, 11, 2, 9, 15)
+    for i in range(75):
+        t = base_time + timedelta(minutes=i * 5)
+        if i < 15:
+            spot = 24000.0
+        elif i < 25:
+            spot = 24000.0 + (i - 14) * 10.0  # Rallies to 24100 (stops out CE)
+        else:
+            spot = 24100.0 - (i - 24) * 10.0  # Declines gradually, eating away PE gains
+        rows.append({"timestamps": t, "open": spot, "high": spot + 1.0, "low": spot - 1.0, "close": spot})
+    df = pd.DataFrame(rows)
+
+    results = run_backtest_simulation(
+        bars_df=df,
+        lots=10,
+        lot_size=65,
+        strategy_max_loss=10000.0
+    )
+    assert results["summary"]["total_days_traded"] == 1
+    trade = results["trades"][0]
+
+    # Active PE leg should have exited with STRATEGY_MAX_LOSS_10K
+    assert trade["pe_reason"] == "STRATEGY_MAX_LOSS_10K"
+    # Gross loss should be capped near -10,000 (within 5-minute candle granularity)
+    assert trade["gross_pnl"] <= -10000.0
+    assert trade["gross_pnl"] >= -12500.0
+

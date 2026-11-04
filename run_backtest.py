@@ -25,27 +25,41 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("backtest.cli")
 
 
-def load_historical_nifty_data(days: int = 180) -> pd.DataFrame:
-    """Fetches historical NIFTY 5m bars from local/sibling cache or Kite Connect, filtered to requested days."""
+def load_historical_nifty_data(days: int = 180, force_fetch: bool = False) -> pd.DataFrame:
+    """Fetches historical NIFTY 5m bars from local cache or Kite Connect, filtered to requested days."""
     env_cache = os.getenv("HISTORICAL_CACHE_PATH")
     cache_path = Path(__file__).resolve().parent / "data" / "nifty_5m_cache.parquet"
     sibling_cache = Path("D:/code/Sharads_monthly_option_selling_desk/data_cache/NSEI_5m_historical.parquet")
 
-    if env_cache and Path(env_cache).exists():
-        logger.info("Loading NIFTY 5m bars from HISTORICAL_CACHE_PATH: %s", env_cache)
-        df = pd.read_parquet(Path(env_cache))
-    elif cache_path.exists():
-        logger.info("Loading cached NIFTY 5-minute bars from %s", cache_path)
-        df = pd.read_parquet(cache_path)
-    elif sibling_cache.exists():
-        logger.info("Loading NIFTY 5m bars from sibling desk cache: %s", sibling_cache)
-        df = pd.read_parquet(sibling_cache)
-    else:
+    df = pd.DataFrame()
+    from_env = False
+    if not force_fetch:
+        if env_cache and Path(env_cache).exists():
+            logger.info("Loading NIFTY 5m bars from HISTORICAL_CACHE_PATH: %s", env_cache)
+            df = pd.read_parquet(Path(env_cache))
+            from_env = True
+        elif cache_path.exists():
+            logger.info("Loading cached NIFTY 5-minute bars from %s", cache_path)
+            df = pd.read_parquet(cache_path)
+        elif sibling_cache.exists():
+            logger.info("Loading NIFTY 5m bars from sibling desk cache: %s", sibling_cache)
+            df = pd.read_parquet(sibling_cache)
+
+    needs_fetch = force_fetch or df.empty
+    if not from_env and not needs_fetch and days > 0 and not df.empty:
+        ts_col = "timestamps" if "timestamps" in df.columns else ("date" if "date" in df.columns else df.columns[0])
+        dt_series = pd.to_datetime(df[ts_col])
+        span_days = (dt_series.max() - dt_series.min()).days
+        if span_days < (days * 0.8):
+            logger.info("Local cache covers %d days, but %d days were requested. Fetching full range from Kite...", span_days, days)
+            needs_fetch = True
+
+    if needs_fetch:
         logger.info("Fetching %d days of NIFTY 5m bars via Kite Connect API (in 60-day chunks)...", days)
         kite = get_kite_client()
         end_dt = datetime.now()
         start_dt = end_dt - timedelta(days=days)
-        
+
         chunks = []
         cur_start = start_dt
         while cur_start < end_dt:
@@ -74,15 +88,16 @@ def run_backtest_cli(args=None) -> int:
     parser.add_argument("--slippage", type=float, default=0.50, help="Slippage in Rs per share (default: 0.50)")
     parser.add_argument("--lots", type=int, default=10, help="Number of lots (default: 10)")
     parser.add_argument("--lot-size", type=int, default=65, help="Lot size (default: 65)")
-    parser.add_argument("--max-loss", type=float, default=10000.0, help="Per-leg maximum loss exit in Rs (default: 10000.0)")
+    parser.add_argument("--strategy-max-loss", "--max-loss", type=float, default=10000.0, dest="strategy_max_loss", help="Strategy total loss exit in Rs across all legs (default: 10000.0)")
     parser.add_argument("--expiry-weekday", type=int, default=1, help="Expiry weekday (0=Mon, 1=Tue, ..., 3=Thu. Default: 1 for Tuesday)")
     parser.add_argument("--iv", type=float, default=0.13, help="Option IV (default: 0.13)")
     parser.add_argument("--output", type=str, default="data/backtest_trade_log.csv", help="CSV trade log path")
-    
+    parser.add_argument("--force-fetch", action="store_true", help="Force fresh fetch from Kite Connect API, bypassing local cache")
+
     parsed = parser.parse_args(args)
 
     try:
-        bars_df = load_historical_nifty_data(days=parsed.days)
+        bars_df = load_historical_nifty_data(days=parsed.days, force_fetch=parsed.force_fetch)
         logger.info("Running simulation across %d bars...", len(bars_df))
 
         results = run_backtest_simulation(
@@ -92,7 +107,7 @@ def run_backtest_cli(args=None) -> int:
             lot_size=parsed.lot_size,
             iv=parsed.iv,
             expiry_weekday=parsed.expiry_weekday,
-            max_loss_per_leg=parsed.max_loss
+            strategy_max_loss=parsed.strategy_max_loss
         )
 
         summary = results["summary"]

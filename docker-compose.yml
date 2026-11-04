@@ -17,12 +17,14 @@ services:
       - ./data:/app/data
       # Mount logs directory so detailed event logs persist directly on the host machine
       - ./logs:/app/logs
+      # Mount .env so generated Kite access tokens stay synchronized between host and container
+      - ./.env:/app/.env
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Live Incubation (1 Lot, Rs 1k Max Loss per leg, Marketable Limit Orders):
+    # 1. Live Incubation (1 Lot, Rs 1k Portfolio Max Loss, Marketable Limit Orders):
     command: ["--live", "--lots", "1", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "1000"]
     #
-    # 2. Live Production (10 Lots, Rs 10k Max Loss per leg):
+    # 2. Live Production (10 Lots, Rs 10k Portfolio Max Loss):
     # command: ["--live", "--lots", "10", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "10000"]
     #
     # 3. Paper Trading (Simulation):
@@ -46,6 +48,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./.env:/app/.env
     # -----------------------------------------------------------------------------------
     # Positional Condor Automated Daemon (Runs continuous 15:20 IST daily scheduler):
     # Paper Simulation:

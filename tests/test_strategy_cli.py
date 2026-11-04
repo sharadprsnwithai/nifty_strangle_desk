@@ -24,6 +24,18 @@ def test_run_backtest_cli(tmp_path):
         assert output_csv.exists()
 
 
+def test_run_backtest_cli_force_fetch_flag(tmp_path):
+    output_csv = tmp_path / "trade_log.csv"
+    with patch("run_backtest.load_historical_nifty_data") as mock_data:
+        mock_data.return_value = pd.DataFrame([
+            {"timestamps": datetime(2026, 11, 2, 10, 0), "open": 24000.0, "high": 24010.0, "low": 23990.0, "close": 24000.0},
+            {"timestamps": datetime(2026, 11, 2, 15, 0), "open": 24000.0, "high": 24010.0, "low": 23990.0, "close": 24000.0}
+        ])
+        exit_code = run_backtest_cli(["--days", "120", "--force-fetch", "--output", str(output_csv)])
+        assert exit_code == 0
+        mock_data.assert_called_once_with(days=120, force_fetch=True)
+
+
 def test_run_backtest_cli_handles_error():
     with patch("run_backtest.load_historical_nifty_data", side_effect=RuntimeError("Data load error")):
         exit_code = run_backtest_cli(["--days", "5"])
@@ -163,7 +175,7 @@ def test_run_strategy_cli_once_flag():
             dry_run=False,
             execute_once=True,
             kite=mock_kite,
-            max_loss_per_leg=10000.0,
+            strategy_max_loss=10000.0,
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
@@ -283,17 +295,19 @@ def test_load_historical_nifty_data_chunked_kite_fetch(monkeypatch):
         assert not df.empty
 
 
-def test_strangle_desk_run_session_max_loss_10k_exit(tmp_path):
+def test_strangle_desk_run_session_strategy_max_loss_exit(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
         {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
         {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
     ]
-    # CE Entry: 35.0 (SL is 52.50). 10 lots = 650 qty.
-    # At LTP 50.40, loss is (50.40 - 35.0) * 650 = 10,010 >= 10,000 (breaches max loss BEFORE 50% SL of 52.50)
+    # CE Entry: 35.0, PE Entry: 35.0. Total qty = 650.
+    # At tick 2: CE LTP 52.0 (loss = (52 - 35) * 650 = 11,050).
+    # PE LTP 34.0 (gain = (35 - 34) * 650 = 650).
+    # Total strategy loss = 11,050 - 650 = 10,400 >= 10,000 strategy limit.
     mock_kite.ltp.side_effect = [
-        {"NFO:NIFTY26NOV24200CE": {"last_price": 35.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}},
-        {"NFO:NIFTY26NOV24200CE": {"last_price": 50.40}, "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}}
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 35.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 35.0}},
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 52.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 34.0}}
     ]
     state_file = tmp_path / "trades_today.json"
     om = OrderManager(mode="PAPER", kite=mock_kite)
@@ -301,14 +315,23 @@ def test_strangle_desk_run_session_max_loss_10k_exit(tmp_path):
 
     with patch("strategy.strangle_desk.datetime") as mock_dt:
         mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
-        state = desk.run_session(lots=10, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite, max_loss_per_leg=10000.0)
+        state = desk.run_session(
+            lots=10,
+            poll_seconds=0,
+            dry_run=False,
+            execute_once=True,
+            kite=mock_kite,
+            strategy_max_loss=10000.0
+        )
 
     assert state is not None
+    # BOTH legs must be closed immediately
     assert state["ce"]["status"] == "CLOSED"
-    assert state["ce"]["exit_reason"] == "MAX_LOSS_10K"
-    assert state["ce"]["exit_price"] == 50.40
-    # PE remained OPEN since it didn't trigger SL or 10k loss
-    assert state["pe"]["status"] == "OPEN"
+    assert state["pe"]["status"] == "CLOSED"
+    assert state["ce"]["exit_reason"] == "STRATEGY_MAX_LOSS_10K"
+    assert state["pe"]["exit_reason"] == "STRATEGY_MAX_LOSS_10K"
+    assert state["status"] == "COMPLETED"
+
 
 
 def test_run_strategy_cli_max_loss_flag():
@@ -330,12 +353,40 @@ def test_run_strategy_cli_max_loss_flag():
             dry_run=False,
             execute_once=True,
             kite=mock_kite,
-            max_loss_per_leg=8000.0,
+            strategy_max_loss=8000.0,
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
             order_timeout=300
         )
+
+
+def test_run_strategy_cli_strategy_max_loss_flag():
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client") as mock_kite_fn, \
+         patch("run_strategy.StrangleDesk") as mock_desk_cls:
+        
+        mock_kite = MagicMock()
+        mock_kite_fn.return_value = mock_kite
+        mock_desk = MagicMock()
+        mock_desk_cls.return_value = mock_desk
+
+        exit_code = run_strategy_cli(["--paper", "--strategy-max-loss", "10000.0", "--once"])
+        assert exit_code == 0
+        mock_desk.run_session.assert_called_once_with(
+            underlying="NIFTY",
+            lots=10,
+            poll_seconds=5,
+            dry_run=False,
+            execute_once=True,
+            kite=mock_kite,
+            strategy_max_loss=10000.0,
+            order_type="LIMIT",
+            limit_buffer_pct=0.05,
+            ignore_holidays=False,
+            order_timeout=300
+        )
+
 
 
 def test_strangle_desk_run_session_skips_on_holiday(tmp_path):
@@ -369,7 +420,7 @@ def test_run_strategy_cli_order_type_and_holiday_flags():
             dry_run=False,
             execute_once=True,
             kite=mock_kite,
-            max_loss_per_leg=10000.0,
+            strategy_max_loss=10000.0,
             order_type="MARKET",
             limit_buffer_pct=0.08,
             ignore_holidays=True,
@@ -396,7 +447,7 @@ def test_run_strategy_cli_order_timeout_flag():
             dry_run=False,
             execute_once=True,
             kite=mock_kite,
-            max_loss_per_leg=10000.0,
+            strategy_max_loss=10000.0,
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
@@ -540,14 +591,51 @@ def test_strangle_desk_run_scheduler_loop(tmp_path):
     fake_now = datetime(2026, 11, 2, 10, 2, 0)
     with patch("strategy.strangle_desk.datetime") as mock_dt, \
          patch.object(desk, "run_session") as mock_session, \
+         patch.object(desk, "perform_daily_morning_login", return_value=mock_kite) as mock_login, \
          patch("strategy.strangle_desk.time.sleep") as mock_sleep:
 
         mock_dt.now.return_value = fake_now
         desk.run_scheduler(lots=1, kite=mock_kite, entry_time_str="10:00", idle_sleep_seconds=1, max_iterations=1)
 
+        mock_login.assert_called_once_with(mock_kite)
         mock_session.assert_called_once()
         mock_notifier.send_message.assert_called_once()
         assert "Daemon Started" in mock_notifier.send_message.call_args[0][0]
+
+
+def test_strangle_desk_perform_daily_morning_login():
+    om = MagicMock()
+    mock_notifier = MagicMock()
+    desk = StrangleDesk(order_manager=om, notifier=mock_notifier)
+
+    mock_fresh_kite = MagicMock()
+    mock_fresh_kite.profile.return_value = {"user_name": "Taruna Sehgal", "user_id": "TC4648"}
+
+    with patch("kite.client.get_kite_client", return_value=mock_fresh_kite) as mock_get_client:
+        res = desk.perform_daily_morning_login()
+        assert res == mock_fresh_kite
+        mock_get_client.assert_called_once_with(force_login=True)
+        assert om.kite == mock_fresh_kite
+        mock_notifier.send_message.assert_called_once()
+        assert "Morning TOTP Login Successful" in mock_notifier.send_message.call_args[0][0]
+        assert "TC4648" in mock_notifier.send_message.call_args[0][0]
+
+
+def test_run_strategy_cli_morning_login_flag():
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client") as mock_kite_fn, \
+         patch("run_strategy.StrangleDesk") as mock_desk_cls:
+
+        mock_kite = MagicMock()
+        mock_kite_fn.return_value = mock_kite
+        mock_desk = MagicMock()
+        mock_desk_cls.return_value = mock_desk
+
+        exit_code = run_strategy_cli(["--morning-login"])
+        assert exit_code == 0
+        mock_desk.perform_daily_morning_login.assert_called_once_with(kite=mock_kite)
+        mock_desk.run_session.assert_not_called()
+        mock_desk.run_scheduler.assert_not_called()
 
 
 def test_strangle_desk_run_session_ce_entry_exception(tmp_path):
@@ -606,5 +694,54 @@ def test_strangle_desk_run_session_pe_entry_exception_cleans_up_ce(tmp_path):
     assert om.buy_to_cover.call_args[1]["symbol"] == "NIFTY26N0924300CE"
     assert om.buy_to_cover.call_args[1]["quantity"] == 65
     mock_notifier.send_message.assert_called_once()
+
+
+def test_ensure_kite_session_valid():
+    om = MagicMock()
+    desk = StrangleDesk(order_manager=om)
+    mock_kite = MagicMock()
+    mock_kite.profile.return_value = {"user_id": "TC4648"}
+    res = desk._ensure_kite_session(mock_kite)
+    assert res == mock_kite
+    mock_kite.profile.assert_called_once()
+
+
+def test_ensure_kite_session_reauthenticates_on_expired_token():
+    om = MagicMock()
+    desk = StrangleDesk(order_manager=om)
+    mock_kite = MagicMock()
+    mock_kite.profile.side_effect = Exception("Incorrect `api_key` or `access_token`.")
+    new_mock_kite = MagicMock()
+
+    with patch("kite.client.get_kite_client", return_value=new_mock_kite) as mock_get_client:
+        res = desk._ensure_kite_session(mock_kite)
+        assert res == new_mock_kite
+        mock_get_client.assert_called_once_with(force_login=True)
+        assert om.kite == new_mock_kite
+
+
+def test_run_session_reauthenticates_on_token_error(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    mock_kite_expired = MagicMock()
+    mock_kite_expired.profile.side_effect = Exception("Incorrect `api_key` or `access_token`.")
+    mock_kite_fresh = MagicMock()
+    mock_kite_fresh.profile.return_value = {"user_id": "TC4648"}
+
+    with patch("kite.client.get_kite_client", return_value=mock_kite_fresh), \
+         patch("strategy.strangle_desk.find_strangle_strikes") as mock_find:
+        mock_find.return_value = {
+            "expiry": "2026-11-09",
+            "total_lots": 1,
+            "total_quantity": 65,
+            "ce": {"symbol": "NIFTY26N0924300CE", "ltp": 30.5, "sl_price": 45.75, "target_price": 6.1},
+            "pe": {"symbol": "NIFTY26N0923800PE", "ltp": 31.0, "sl_price": 46.5, "target_price": 6.2},
+        }
+        res = desk.run_session(lots=1, kite=mock_kite_expired, dry_run=True)
+        assert res["status"] == "DRY_RUN"
+        mock_find.assert_called_once_with(mock_kite_fresh, underlying="NIFTY", target_price=30.0, lots=1)
+
 
 

@@ -103,6 +103,10 @@ def find_strangle_strikes(
             batch_quotes = kite.ltp(batch)
             quotes.update(batch_quotes)
         except Exception as e:
+            err_msg = str(e).lower()
+            if "token" in err_msg or "api_key" in err_msg or "access_token" in err_msg or "tokenexception" in type(e).__name__.lower():
+                logger.error("Authentication failed querying batch LTP quotes for %d instruments: %s", len(batch), e)
+                raise
             logger.error("Failed to query batch LTP quotes for %d instruments: %s", len(batch), e)
 
     # Find CE >= target_price with lowest LTP

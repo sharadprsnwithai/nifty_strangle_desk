@@ -164,6 +164,59 @@ class StrangleDesk:
         )
         return res.get(order_id, {})
 
+    def _ensure_kite_session(self, kite: Optional[Any] = None, force_login: bool = False) -> Any:
+        """
+        Validates that the provided KiteConnect client has a live, valid session.
+        If the access token has expired or is invalidated, triggers automated TOTP re-authentication.
+        """
+        if kite is None:
+            kite = getattr(self.order_manager, "kite", None)
+
+        if not force_login and kite is not None:
+            try:
+                kite.profile()
+                return kite
+            except Exception as e:
+                err_str = str(e).lower()
+                if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+                    logger.warning("Kite session token is expired or invalidated (%s). Initiating TOTP re-authentication...", e)
+                else:
+                    logger.warning("Kite profile check encountered unexpected error (%s). Proceeding to re-authenticate...", e)
+
+        logger.info("Refreshing Kite session via automated TOTP login...")
+        from kite.client import get_kite_client
+        new_kite = get_kite_client(force_login=True)
+        if hasattr(self.order_manager, "kite") and self.order_manager.kite is not None:
+            self.order_manager.kite = new_kite
+        return new_kite
+
+    def perform_daily_morning_login(self, kite: Optional[Any] = None) -> Any:
+        """
+        Executes an automated headless TOTP login to obtain a fresh daily Zerodha Kite access token.
+        Saves the token to .env, updates the OrderManager client, and notifies via Telegram.
+        """
+        logger.info("Executing daily morning TOTP login (08:00 AM IST schedule)...")
+        from kite.client import get_kite_client
+        new_kite = get_kite_client(force_login=True)
+        if hasattr(self.order_manager, "kite"):
+            self.order_manager.kite = new_kite
+
+        user_desc = "Zerodha Account"
+        try:
+            profile = new_kite.profile()
+            user_desc = f"{profile.get('user_name', 'Trader')} ({profile.get('user_id')})"
+            logger.info("Daily morning TOTP login successful for %s.", user_desc)
+        except Exception as e:
+            logger.warning("Could not fetch profile after morning login: %s", e)
+
+        if self.notifier:
+            self.notifier.send_message(
+                f"🔐 <b>Morning TOTP Login Successful</b>\n"
+                f"Fresh Kite access token acquired for <b>{user_desc}</b> at {datetime.now().strftime('%H:%M:%S')} IST.\n"
+                f"Credentials refreshed and ready for today's trading activity."
+            )
+        return new_kite
+
     def run_session(
         self,
         underlying: str = "NIFTY",
@@ -172,7 +225,7 @@ class StrangleDesk:
         dry_run: bool = False,
         execute_once: bool = False,
         kite: Optional[KiteConnect] = None,
-        max_loss_per_leg: float = 10000.0,
+        strategy_max_loss: Optional[float] = 10000.0,
         order_type: str = "LIMIT",
         limit_buffer_pct: float = 0.05,
         ignore_holidays: bool = False,
@@ -225,8 +278,20 @@ class StrangleDesk:
             if kite is None:
                 raise ValueError("KiteConnect instance required to discover strikes and fetch live quotes.")
 
+            kite = self._ensure_kite_session(kite)
+
             logger.info("Scanning option chain for strikes with LTP >= Rs 30 (0 DTE -> Next Week)...")
-            strikes = find_strangle_strikes(kite, underlying=underlying, target_price=30.0, lots=lots)
+            try:
+                strikes = find_strangle_strikes(kite, underlying=underlying, target_price=30.0, lots=lots)
+            except Exception as e:
+                err_str = str(e).lower()
+                if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+                    logger.warning("Token error during strike discovery (%s). Refreshing token and retrying...", e)
+                    kite = self._ensure_kite_session(kite, force_login=True)
+                    strikes = find_strangle_strikes(kite, underlying=underlying, target_price=30.0, lots=lots)
+                else:
+                    raise
+
             mode = getattr(self.order_manager, "mode", "PAPER")
             self._print_plan(strikes, mode=mode)
 
@@ -392,6 +457,7 @@ class StrangleDesk:
             pe_tgt = round(pe_exec_price * 0.20, 2)
 
             if self.notifier:
+                risk_cap_str = f"Max Rs {strategy_max_loss:,.0f} portfolio loss" if strategy_max_loss is not None else "None"
                 entry_msg = (
                     f"🚀 <b>NIFTY 10:00 AM Strangle Opened [{mode}]</b>\n"
                     f"Expiry: <code>{strikes['expiry']}</code> | Qty: {total_qty} ({strikes['total_lots']} lots)\n"
@@ -400,7 +466,7 @@ class StrangleDesk:
                     f"  SL: Rs {ce_sl:.2f} | Target: Rs {ce_tgt:.2f}\n"
                     f"• <b>PUT</b>: <code>{pe_info['symbol']}</code> @ Rs {pe_exec_price:.2f}\n"
                     f"  SL: Rs {pe_sl:.2f} | Target: Rs {pe_tgt:.2f}\n"
-                    f"• Risk Cap: Max Rs {max_loss_per_leg:,.0f} loss per leg"
+                    f"• Risk Cap: {risk_cap_str}"
                 )
                 self.notifier.send_message(entry_msg)
 
@@ -483,11 +549,24 @@ class StrangleDesk:
                                     f"NFO:{pe_sym}" if ":" not in pe_sym else pe_sym]
                 quotes = kite.ltp(symbols_to_query)
             except Exception as e:
-                logger.error("Failed to fetch live quotes: %s", e)
-                if execute_once:
-                    break
-                time.sleep(poll_seconds)
-                continue
+                err_str = str(e).lower()
+                if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+                    logger.warning("Token error during live quote polling (%s). Refreshing session...", e)
+                    try:
+                        kite = self._ensure_kite_session(kite, force_login=True)
+                        quotes = kite.ltp(symbols_to_query)
+                    except Exception as retry_err:
+                        logger.error("Failed to fetch live quotes after re-authentication: %s", retry_err)
+                        if execute_once:
+                            break
+                        time.sleep(poll_seconds)
+                        continue
+                else:
+                    logger.error("Failed to fetch live quotes: %s", e)
+                    if execute_once:
+                        break
+                    time.sleep(poll_seconds)
+                    continue
 
             ce_ltp = self._extract_ltp(quotes, ce_sym, default=state["ce"]["entry_price"])
             pe_ltp = self._extract_ltp(quotes, pe_sym, default=state["pe"]["entry_price"])
@@ -498,26 +577,36 @@ class StrangleDesk:
             pe_entry = float(state["pe"]["entry_price"])
             ce_pnl = (ce_entry - ce_ltp) * qty if ce_status == "OPEN" else (ce_entry - float(state["ce"].get("exit_price") or ce_ltp)) * qty
             pe_pnl = (pe_entry - pe_ltp) * qty if pe_status == "OPEN" else (pe_entry - float(state["pe"].get("exit_price") or pe_ltp)) * qty
+            total_strategy_pnl = ce_pnl + pe_pnl
             logger.debug(
                 "Tick | CE (%s): LTP=%.2f, P&L=Rs %.2f [%s] | PE (%s): LTP=%.2f, P&L=Rs %.2f [%s] | Total P&L=Rs %.2f",
                 ce_sym, ce_ltp, ce_pnl, ce_status,
                 pe_sym, pe_ltp, pe_pnl, pe_status,
-                ce_pnl + pe_pnl
+                total_strategy_pnl
             )
+
+            # Evaluate strategy-level portfolio stop loss
+            if strategy_max_loss is not None and total_strategy_pnl <= -strategy_max_loss:
+                logger.warning(
+                    "Total strategy loss Rs %.2f >= limit Rs %.2f. Triggering immediate portfolio exit for all open legs.",
+                    abs(total_strategy_pnl), strategy_max_loss
+                )
+                if state["ce"].get("status") == "OPEN":
+                    self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state)
+                if state["pe"].get("status") == "OPEN":
+                    self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state)
+                if self.notifier:
+                    self.notifier.send_message(
+                        f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss Rs {abs(total_strategy_pnl):,.2f} >= Rs {strategy_max_loss:,.2f}. Exited all open legs!"
+                    )
+
 
             # Evaluate CE leg
             if state["ce"].get("status") == "OPEN":
                 ce_sl = state["ce"]["sl_price"]
                 ce_target = state["ce"]["target_price"]
-                ce_entry = state["ce"]["entry_price"]
-                ce_loss = (ce_ltp - ce_entry) * qty
 
-                if ce_loss >= max_loss_per_leg:
-                    logger.warning("CE leg loss Rs %.2f >= max loss limit Rs %.2f. Triggering immediate exit.", ce_loss, max_loss_per_leg)
-                    if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "MAX_LOSS_10K", order_type, limit_buffer_pct, state):
-                        if self.notifier:
-                            self.notifier.send_message(f"⚠️ <b>MAX LOSS HIT</b>: CE <code>{ce_sym}</code> exited @ Rs {ce_ltp:.2f} (Loss: Rs {ce_loss:,.2f})")
-                elif ce_ltp >= ce_sl:
+                if ce_ltp >= ce_sl:
                     logger.warning("CE Stop-Loss hit! LTP: %.2f >= SL: %.2f", ce_ltp, ce_sl)
                     if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state):
                         if self.notifier:
@@ -532,18 +621,17 @@ class StrangleDesk:
             if state["pe"].get("status") == "OPEN":
                 pe_sl = state["pe"]["sl_price"]
                 pe_target = state["pe"]["target_price"]
-                pe_entry = state["pe"]["entry_price"]
-                pe_loss = (pe_ltp - pe_entry) * qty
 
-                if pe_loss >= max_loss_per_leg:
-                    logger.warning("PE leg loss Rs %.2f >= max loss limit Rs %.2f. Triggering immediate exit.", pe_loss, max_loss_per_leg)
-                    if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "MAX_LOSS_10K", order_type, limit_buffer_pct, state):
-                        if self.notifier:
-                            self.notifier.send_message(f"⚠️ <b>MAX LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (Loss: Rs {pe_loss:,.2f})")
-                elif pe_ltp >= pe_sl:
+                if pe_ltp >= pe_sl:
                     logger.warning("PE Stop-Loss hit! LTP: %.2f >= SL: %.2f", pe_ltp, pe_sl)
                     if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state):
                         if self.notifier:
+                            self.notifier.send_message(f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (SL: Rs {pe_sl:.2f})")
+                elif pe_ltp <= pe_target:
+                    logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f", pe_ltp, pe_target)
+                    if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state):
+                        if self.notifier:
+                            self.notifier.send_message(f"🎯 <b>DECAY TARGET REACHED</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (Target: Rs {pe_target:.2f})")
                             self.notifier.send_message(f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (SL: Rs {pe_sl:.2f})")
                 elif pe_ltp <= pe_target:
                     logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f", pe_ltp, pe_target)
@@ -586,7 +674,7 @@ class StrangleDesk:
         lots: int = 10,
         poll_seconds: int = 5,
         kite: Optional[KiteConnect] = None,
-        max_loss_per_leg: float = 10000.0,
+        strategy_max_loss: Optional[float] = 10000.0,
         order_type: str = "LIMIT",
         limit_buffer_pct: float = 0.05,
         ignore_holidays: bool = False,
@@ -612,16 +700,18 @@ class StrangleDesk:
             mode, lots, entry_time_str, exit_time_str
         )
         if self.notifier:
+            risk_desc = f"Portfolio Max Loss: Rs {strategy_max_loss:,.0f}" if strategy_max_loss is not None else "None"
             self.notifier.send_message(
                 f"🤖 <b>10:00 AM Strangle Desk Daemon Started [{mode}]</b>\n"
                 f"Schedule: <b>Daily Entry at {entry_time_str} IST</b> | Exit at {exit_time_str} IST\n"
-                f"Lots: {lots} | Max Loss Per Leg: Rs {max_loss_per_leg:,.0f}\n"
+                f"Lots: {lots} | {risk_desc}\n"
                 f"Status: Waiting for market session..."
             )
 
         entry_h, entry_m = map(int, entry_time_str.split(":"))
         last_heartbeat_hour: int = -1
         last_holiday_date: Optional[date] = None
+        last_totp_login_date: Optional[date] = None
         iteration = 0
 
         while True:
@@ -657,6 +747,18 @@ class StrangleDesk:
                     time.sleep(idle_sleep_seconds)
                     continue
 
+            # Morning 08:00 AM IST TOTP Login Renewal:
+            # Renew Zerodha access token once per day at or after 08:00 AM IST on trading days.
+            # Ensures all daily activities (10:00 AM entry, order fills, quotes) use freshly minted credentials.
+            if current_t >= dt_time(8, 0) and last_totp_login_date != today_d:
+                try:
+                    kite = self.perform_daily_morning_login(kite)
+                    last_totp_login_date = today_d
+                except Exception as e:
+                    logger.error("Failed daily 08:00 AM morning TOTP login: %s", e, exc_info=True)
+                    if self.notifier:
+                        self.notifier.send_message(f"⚠️ <b>Morning TOTP Login Failed (08:00 IST)</b>: {e}")
+
             # Check today's state
             state = self.load_state()
             today_str = today_d.strftime("%Y-%m-%d")
@@ -670,7 +772,7 @@ class StrangleDesk:
                         lots=lots,
                         poll_seconds=poll_seconds,
                         kite=kite,
-                        max_loss_per_leg=max_loss_per_leg,
+                        strategy_max_loss=strategy_max_loss,
                         order_type=order_type,
                         limit_buffer_pct=limit_buffer_pct,
                         ignore_holidays=ignore_holidays,
@@ -694,12 +796,13 @@ class StrangleDesk:
             if dt_time(entry_h, entry_m) <= current_t <= dt_time(entry_h, entry_m + 5):
                 logger.info("Triggering 10:00 AM Strangle entry for %s...", today_str)
                 try:
+                    kite = self._ensure_kite_session(kite)
                     self.run_session(
                         underlying=underlying,
                         lots=lots,
                         poll_seconds=poll_seconds,
                         kite=kite,
-                        max_loss_per_leg=max_loss_per_leg,
+                        strategy_max_loss=strategy_max_loss,
                         order_type=order_type,
                         limit_buffer_pct=limit_buffer_pct,
                         ignore_holidays=ignore_holidays,

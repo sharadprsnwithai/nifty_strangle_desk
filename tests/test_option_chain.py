@@ -99,3 +99,14 @@ def test_find_strangle_strikes_no_strike_above_target_price():
     }
     with pytest.raises(ValueError, match="No CE strike found with LTP >= 30.0"):
         find_strangle_strikes(mock_kite, target_date=date(2026, 11, 2))
+
+
+def test_find_strangle_strikes_auth_failure_raises():
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "strike": 24200.0, "expiry": date(2026, 11, 3), "tradingsymbol": "NIFTY26NOV24200CE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23700.0, "expiry": date(2026, 11, 3), "tradingsymbol": "NIFTY26NOV23700PE", "lot_size": 65},
+    ]
+    mock_kite.ltp.side_effect = Exception("Incorrect `api_key` or `access_token`.")
+    with pytest.raises(Exception, match="Incorrect `api_key` or `access_token`"):
+        find_strangle_strikes(mock_kite, target_date=date(2026, 11, 2))
