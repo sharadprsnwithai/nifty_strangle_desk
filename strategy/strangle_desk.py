@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 from kiteconnect import KiteConnect
 from strategy.order_manager import OrderManager
-from strategy.option_chain import find_strangle_strikes
+from strategy.option_chain import find_strangle_strikes, resolve_target_expiry, _normalize_date
 from strategy.holidays import is_trading_holiday
 from notifications.telegram import TelegramNotifier
 
@@ -92,8 +92,14 @@ class StrangleDesk:
         Catches broker exceptions, logs errors, alerts Telegram, and prevents loop crashes.
         """
         try:
+            leg_product = (
+                state.get(leg_name, {}).get("product")
+                or state.get("product")
+                or getattr(self.order_manager, "product", "MIS")
+            )
             self.order_manager.buy_to_cover(
-                symbol, qty, exit_price, reason=reason, order_type=order_type, buffer_pct=limit_buffer_pct
+                symbol, qty, exit_price, reason=reason, order_type=order_type, buffer_pct=limit_buffer_pct,
+                product=leg_product
             )
             state[leg_name]["status"] = "CLOSED"
             state[leg_name]["exit_price"] = exit_price
@@ -217,6 +223,184 @@ class StrangleDesk:
             )
         return new_kite
 
+    def reconcile_with_broker(
+        self,
+        kite: Optional[KiteConnect] = None,
+        state: Optional[Dict[str, Any]] = None,
+        target_expiry: Optional[date] = None,
+        underlying: str = "NIFTY"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Reconciles local trade state with actual open net positions on Zerodha Kite.
+        - If state records an active strangle but both legs are closed on Kite,
+          marks the session COMPLETED locally.
+        - If state has an active strangle and one leg is closed, updates that leg to CLOSED.
+        - If state is None (or IDLE) but open short NIFTY CE & PE options matching target weekly expiry
+          exist on Kite, reconstructs and adopts them into state (including exact entry prices, product,
+          +50% SL, and 80% decay targets).
+        """
+        if kite is None:
+            kite = getattr(self.order_manager, "kite", None)
+        if kite is None:
+            return state
+
+        if state is None:
+            state = self.load_state()
+
+        try:
+            raw_pos = kite.positions()
+            net_positions = raw_pos.get("net", []) if isinstance(raw_pos, dict) else []
+            net_map = {
+                p.get("tradingsymbol", ""): p
+                for p in net_positions
+                if p.get("exchange") == "NFO"
+            }
+
+            today_str = datetime.now().strftime("%Y-%m-%d")
+
+            # 1. Existing open trade: check if broker has closed legs
+            if state is not None and state.get("date") == today_str and state.get("status") == "OPEN":
+                ce_sym = state.get("ce", {}).get("symbol")
+                pe_sym = state.get("pe", {}).get("symbol")
+                ce_qty = net_map.get(ce_sym, {}).get("quantity", 0)
+                pe_qty = net_map.get(pe_sym, {}).get("quantity", 0)
+
+                ce_closed = (ce_qty == 0)
+                pe_closed = (pe_qty == 0)
+
+                changed = False
+                if ce_closed and state.get("ce", {}).get("status") == "OPEN":
+                    state["ce"]["status"] = "CLOSED"
+                    state["ce"]["exit_reason"] = "BROKER_RECONCILED"
+                    changed = True
+                    logger.info("Reconciliation: CE leg %s is flat on Kite. Marked CLOSED.", ce_sym)
+
+                if pe_closed and state.get("pe", {}).get("status") == "OPEN":
+                    state["pe"]["status"] = "CLOSED"
+                    state["pe"]["exit_reason"] = "BROKER_RECONCILED"
+                    changed = True
+                    logger.info("Reconciliation: PE leg %s is flat on Kite. Marked CLOSED.", pe_sym)
+
+                if ce_closed and pe_closed:
+                    state["status"] = "COMPLETED"
+                    changed = True
+                    logger.warning("Reconciliation: Both strangle legs are closed on Kite. Synchronizing local state to COMPLETED.")
+
+                if changed:
+                    self.save_state(state)
+                return state
+
+            # 2. No active trade locally: check if broker has open short strangle positions
+            if state is None or state.get("status") not in ("OPEN", "COMPLETED", "ABORTED"):
+                # Fetch instruments to identify target expiry
+                instruments = kite.instruments("NFO")
+                if target_expiry is None:
+                    target_expiry = resolve_target_expiry(instruments, underlying=underlying)
+
+                # Filter contracts matching underlying and target weekly expiry
+                inst_map = {
+                    i["tradingsymbol"]: i
+                    for i in instruments
+                    if i.get("name") == underlying
+                    and _normalize_date(i.get("expiry")) == target_expiry
+                }
+
+                open_ce = []
+                open_pe = []
+
+                for p in net_positions:
+                    sym = p.get("tradingsymbol", "")
+                    qty = p.get("quantity", 0)
+                    if p.get("exchange") == "NFO" and sym in inst_map and qty < 0:
+                        inst = inst_map[sym]
+                        itype = inst.get("instrument_type")
+                        leg_info = {
+                            "symbol": sym,
+                            "strike": float(inst.get("strike", 0.0)),
+                            "quantity": abs(qty),
+                            "product": p.get("product", "MIS"),
+                            "entry_price": float(p.get("average_price") or p.get("sell_price") or 0.0),
+                            "lot_size": int(inst.get("lot_size", 65))
+                        }
+                        if itype == "CE":
+                            open_ce.append(leg_info)
+                        elif itype == "PE":
+                            open_pe.append(leg_info)
+
+                if open_ce and open_pe:
+                    ce_leg = open_ce[0]
+                    pe_leg = open_pe[0]
+                    qty = min(ce_leg["quantity"], pe_leg["quantity"])
+                    lot_size = ce_leg["lot_size"]
+                    total_lots = qty // lot_size
+
+                    ce_entry = ce_leg["entry_price"]
+                    pe_entry = pe_leg["entry_price"]
+
+                    ce_sl = round(ce_entry * 1.50, 2)
+                    ce_tgt = round(ce_entry * 0.20, 2)
+                    pe_sl = round(pe_entry * 1.50, 2)
+                    pe_tgt = round(pe_entry * 0.20, 2)
+
+                    logger.info(
+                        "Reconciliation: Found open broker strangle positions on Kite: "
+                        "CE %s x %d @ Rs %.2f [%s] (SL: %.2f, Tgt: %.2f), "
+                        "PE %s x %d @ Rs %.2f [%s] (SL: %.2f, Tgt: %.2f). Adopting into active state.",
+                        ce_leg["symbol"], qty, ce_entry, ce_leg["product"], ce_sl, ce_tgt,
+                        pe_leg["symbol"], qty, pe_entry, pe_leg["product"], pe_sl, pe_tgt
+                    )
+
+                    state = {
+                        "status": "OPEN",
+                        "date": today_str,
+                        "underlying": underlying,
+                        "expiry": str(target_expiry),
+                        "lots": total_lots,
+                        "quantity": qty,
+                        "product": ce_leg["product"],
+                        "ce": {
+                            "symbol": ce_leg["symbol"],
+                            "strike": ce_leg["strike"],
+                            "entry_price": ce_entry,
+                            "sl_price": ce_sl,
+                            "target_price": ce_tgt,
+                            "status": "OPEN",
+                            "product": ce_leg["product"],
+                            "order_id": None,
+                            "exit_price": None,
+                            "exit_reason": None
+                        },
+                        "pe": {
+                            "symbol": pe_leg["symbol"],
+                            "strike": pe_leg["strike"],
+                            "entry_price": pe_entry,
+                            "sl_price": pe_sl,
+                            "target_price": pe_tgt,
+                            "status": "OPEN",
+                            "product": pe_leg["product"],
+                            "order_id": None,
+                            "exit_price": None,
+                            "exit_reason": None
+                        }
+                    }
+                    self.save_state(state)
+
+                    if self.notifier:
+                        self.notifier.send_message(
+                            f"🔄 <b>Broker Position Reconciled</b>\n"
+                            f"Adopted active NIFTY Strangle from Zerodha Kite:\n"
+                            f"• <b>CALL</b>: <code>{ce_leg['symbol']}</code> x {qty} @ Rs {ce_entry:.2f} [{ce_leg['product']}]\n"
+                            f"  SL: Rs {ce_sl:.2f} | Target: Rs {ce_tgt:.2f}\n"
+                            f"• <b>PUT</b>: <code>{pe_leg['symbol']}</code> x {qty} @ Rs {pe_entry:.2f} [{pe_leg['product']}]\n"
+                            f"  SL: Rs {pe_sl:.2f} | Target: Rs {pe_tgt:.2f}\n"
+                            f"Actively monitoring stop loss, decay target, and 15:00 square-off."
+                        )
+
+            return state
+        except Exception as e:
+            logger.warning("Broker position reconciliation failed: %s", e)
+            return state
+
     def run_session(
         self,
         underlying: str = "NIFTY",
@@ -273,6 +457,10 @@ class StrangleDesk:
 
         if kite is None:
             kite = getattr(self.order_manager, "kite", None)
+
+        if not dry_run and kite is not None:
+            kite = self._ensure_kite_session(kite)
+            state = self.reconcile_with_broker(kite, state, underlying=underlying)
 
         if state is None:
             if kite is None:
@@ -578,8 +766,8 @@ class StrangleDesk:
             ce_pnl = (ce_entry - ce_ltp) * qty if ce_status == "OPEN" else (ce_entry - float(state["ce"].get("exit_price") or ce_ltp)) * qty
             pe_pnl = (pe_entry - pe_ltp) * qty if pe_status == "OPEN" else (pe_entry - float(state["pe"].get("exit_price") or pe_ltp)) * qty
             total_strategy_pnl = ce_pnl + pe_pnl
-            logger.debug(
-                "Tick | CE (%s): LTP=%.2f, P&L=Rs %.2f [%s] | PE (%s): LTP=%.2f, P&L=Rs %.2f [%s] | Total P&L=Rs %.2f",
+            logger.info(
+                "Tick | CE (%s): LTP=%.2f, P&L=Rs %.2f [%s] | PE (%s): LTP=%.2f, P&L=Rs %.2f [%s] | Total Strangle P&L=Rs %.2f",
                 ce_sym, ce_ltp, ce_pnl, ce_status,
                 pe_sym, pe_ltp, pe_pnl, pe_status,
                 total_strategy_pnl
@@ -626,12 +814,6 @@ class StrangleDesk:
                     logger.warning("PE Stop-Loss hit! LTP: %.2f >= SL: %.2f", pe_ltp, pe_sl)
                     if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state):
                         if self.notifier:
-                            self.notifier.send_message(f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (SL: Rs {pe_sl:.2f})")
-                elif pe_ltp <= pe_target:
-                    logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f", pe_ltp, pe_target)
-                    if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state):
-                        if self.notifier:
-                            self.notifier.send_message(f"🎯 <b>DECAY TARGET REACHED</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (Target: Rs {pe_target:.2f})")
                             self.notifier.send_message(f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (SL: Rs {pe_sl:.2f})")
                 elif pe_ltp <= pe_target:
                     logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f", pe_ltp, pe_target)
@@ -759,9 +941,14 @@ class StrangleDesk:
                     if self.notifier:
                         self.notifier.send_message(f"⚠️ <b>Morning TOTP Login Failed (08:00 IST)</b>: {e}")
 
-            # Check today's state
+            # Check today's state & reconcile with broker positions
             state = self.load_state()
             today_str = today_d.strftime("%Y-%m-%d")
+
+            mode = getattr(self.order_manager, "mode", "PAPER")
+            if mode == "LIVE" and kite is not None:
+                kite = self._ensure_kite_session(kite)
+                state = self.reconcile_with_broker(kite, state, underlying=underlying)
 
             # 1. If an active trade already exists for today, resume monitoring it!
             if state is not None and state.get("date") == today_str and state.get("status") == "OPEN":

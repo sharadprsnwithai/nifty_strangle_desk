@@ -39,6 +39,7 @@ def run_strategy_cli(args=None) -> int:
     parser.add_argument("--ignore-holidays", action="store_true", help="Ignore NSE holiday and weekend checks")
     parser.add_argument("--order-timeout", type=int, default=300, help="Order fill timeout in seconds before cancellation (default: 300)")
     parser.add_argument("--entry-time", type=str, default="10:00", help="Daily execution entry time in IST (default: 10:00)")
+    parser.add_argument("--product", choices=["MIS", "NRML"], default="MIS", help="Order product type (MIS for intraday, NRML for normal carry/margin, default: MIS)")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default=os.getenv("LOG_LEVEL", "INFO"), help="Logging verbosity level (default: INFO)")
     parser.add_argument("--log-dir", type=str, default=os.getenv("LOG_DIR", "logs"), help="Directory for host log files (default: logs)")
     parser.add_argument("--dry-run", action="store_true", help="Perform single strike lookup and print plan without waiting")
@@ -54,7 +55,7 @@ def run_strategy_cli(args=None) -> int:
     kite = get_kite_client(config=config)
 
     notifier = TelegramNotifier(bot_token=config.telegram_bot_token, chat_id=config.telegram_chat_id)
-    om = OrderManager(mode=mode, kite=kite if mode == "LIVE" else None)
+    om = OrderManager(mode=mode, kite=kite if mode == "LIVE" else None, product=parsed.product)
     desk = StrangleDesk(order_manager=om, notifier=notifier)
 
     if parsed.morning_login:

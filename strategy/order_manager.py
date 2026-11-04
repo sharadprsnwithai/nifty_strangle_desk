@@ -31,7 +31,8 @@ class OrderManager:
         quantity: int,
         price: float,
         order_type: str = "LIMIT",
-        buffer_pct: float = 0.05
+        buffer_pct: float = 0.05,
+        product: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Sells an option leg (entry).
@@ -63,13 +64,16 @@ class OrderManager:
                 "fill_price": price,
                 "filled_quantity": quantity,
                 "pending_quantity": 0,
+                "product": product or self.product,
                 "status": "COMPLETE"
             }
             self._paper_orders[order["order_id"]] = order.copy()
             return order
         
         # LIVE Mode
-        prod_val = getattr(self.kite, f"PRODUCT_{self.product}", self.product)
+        prod = (product or self.product).upper()
+        prod_val = getattr(self.kite, f"PRODUCT_{prod}", prod)
+        validity_val = getattr(self.kite, "VALIDITY_DAY", "DAY")
         params: Dict[str, Any] = {
             "variety": self.kite.VARIETY_REGULAR,
             "exchange": self.kite.EXCHANGE_NFO,
@@ -77,6 +81,7 @@ class OrderManager:
             "transaction_type": self.kite.TRANSACTION_TYPE_SELL,
             "quantity": quantity,
             "product": prod_val,
+            "validity": validity_val,
         }
 
         if order_type_norm == "LIMIT":
@@ -111,7 +116,8 @@ class OrderManager:
         price: float,
         reason: str = "EXIT",
         order_type: str = "LIMIT",
-        buffer_pct: float = 0.05
+        buffer_pct: float = 0.05,
+        product: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Buys back an open short option leg (exit on SL, target, or 3PM).
@@ -145,12 +151,15 @@ class OrderManager:
                 "filled_quantity": quantity,
                 "pending_quantity": 0,
                 "reason": reason,
+                "product": product or self.product,
                 "status": "COMPLETE"
             }
             self._paper_orders[order["order_id"]] = order.copy()
             return order
 
-        prod_val = getattr(self.kite, f"PRODUCT_{self.product}", self.product)
+        prod = (product or self.product).upper()
+        prod_val = getattr(self.kite, f"PRODUCT_{prod}", prod)
+        validity_val = getattr(self.kite, "VALIDITY_DAY", "DAY")
         params: Dict[str, Any] = {
             "variety": self.kite.VARIETY_REGULAR,
             "exchange": self.kite.EXCHANGE_NFO,
@@ -158,6 +167,7 @@ class OrderManager:
             "transaction_type": self.kite.TRANSACTION_TYPE_BUY,
             "quantity": quantity,
             "product": prod_val,
+            "validity": validity_val,
         }
 
         if order_type_norm == "LIMIT":

@@ -720,6 +720,137 @@ def test_ensure_kite_session_reauthenticates_on_expired_token():
         assert om.kite == new_mock_kite
 
 
+def test_reconcile_with_broker_adopts_open_positions(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    om.mode = "LIVE"
+    mock_notifier = MagicMock()
+    desk = StrangleDesk(order_manager=om, state_file=state_file, notifier=mock_notifier)
+
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"tradingsymbol": "NIFTY26N0924400CE", "name": "NIFTY", "instrument_type": "CE", "expiry": date(2026, 11, 9), "strike": 24400.0, "lot_size": 65},
+        {"tradingsymbol": "NIFTY26N0923400PE", "name": "NIFTY", "instrument_type": "PE", "expiry": date(2026, 11, 9), "strike": 23400.0, "lot_size": 65},
+    ]
+    mock_kite.positions.return_value = {
+        "net": [
+            {"tradingsymbol": "NIFTY26N0924400CE", "exchange": "NFO", "product": "NRML", "quantity": -650, "average_price": 41.4},
+            {"tradingsymbol": "NIFTY26N0923400PE", "exchange": "NFO", "product": "NRML", "quantity": -650, "average_price": 39.8},
+            {"tradingsymbol": "RELIANCE26NOV1200PE", "exchange": "NFO", "product": "NRML", "quantity": -20000, "average_price": 10.0},
+        ]
+    }
+
+    state = desk.reconcile_with_broker(mock_kite, target_expiry=date(2026, 11, 9))
+    assert state is not None
+    assert state["status"] == "OPEN"
+    assert state["quantity"] == 650
+    assert state["lots"] == 10
+    assert state["product"] == "NRML"
+    assert state["ce"]["symbol"] == "NIFTY26N0924400CE"
+    assert state["ce"]["entry_price"] == 41.4
+    assert state["ce"]["sl_price"] == 62.10
+    assert state["ce"]["target_price"] == 8.28
+    assert state["pe"]["symbol"] == "NIFTY26N0923400PE"
+    assert state["pe"]["entry_price"] == 39.8
+    assert state["pe"]["sl_price"] == 59.70
+    assert state["pe"]["target_price"] == 7.96
+    assert state_file.exists()
+    mock_notifier.send_message.assert_called_once()
+
+
+def test_reconcile_with_broker_marks_closed_when_flat(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    initial_state = {
+        "status": "OPEN",
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "ce": {"symbol": "NIFTY26N0924400CE", "status": "OPEN"},
+        "pe": {"symbol": "NIFTY26N0923400PE", "status": "OPEN"}
+    }
+    desk.save_state(initial_state)
+
+    mock_kite = MagicMock()
+    mock_kite.positions.return_value = {
+        "net": [
+            {"tradingsymbol": "NIFTY26N0924400CE", "exchange": "NFO", "quantity": 0},
+            {"tradingsymbol": "NIFTY26N0923400PE", "exchange": "NFO", "quantity": 0},
+        ]
+    }
+
+    state = desk.reconcile_with_broker(mock_kite)
+    assert state["status"] == "COMPLETED"
+    assert state["ce"]["status"] == "CLOSED"
+    assert state["pe"]["status"] == "CLOSED"
+
+
+def test_reconcile_with_broker_partial_closed(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    initial_state = {
+        "status": "OPEN",
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "ce": {"symbol": "NIFTY26N0924400CE", "status": "OPEN"},
+        "pe": {"symbol": "NIFTY26N0923400PE", "status": "OPEN"}
+    }
+    desk.save_state(initial_state)
+
+    mock_kite = MagicMock()
+    mock_kite.positions.return_value = {
+        "net": [
+            {"tradingsymbol": "NIFTY26N0924400CE", "exchange": "NFO", "quantity": 0},
+            {"tradingsymbol": "NIFTY26N0923400PE", "exchange": "NFO", "quantity": -650},
+        ]
+    }
+
+    state = desk.reconcile_with_broker(mock_kite)
+    assert state["status"] == "OPEN"
+    assert state["ce"]["status"] == "CLOSED"
+    assert state["pe"]["status"] == "OPEN"
+
+
+def test_safe_exit_leg_uses_position_product(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    om.product = "MIS"
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    state = {
+        "ce": {"symbol": "NIFTY26N0924400CE", "status": "OPEN", "product": "NRML"},
+        "pe": {"symbol": "NIFTY26N0923400PE", "status": "OPEN", "product": "NRML"}
+    }
+    desk.save_state(state)
+
+    success = desk._safe_exit_leg(
+        leg_name="ce",
+        symbol="NIFTY26N0924400CE",
+        qty=650,
+        exit_price=35.0,
+        reason="STOP_LOSS",
+        order_type="LIMIT",
+        limit_buffer_pct=0.05,
+        state=state
+    )
+    assert success is True
+    om.buy_to_cover.assert_called_once_with(
+        "NIFTY26N0924400CE", 650, 35.0, reason="STOP_LOSS", order_type="LIMIT", buffer_pct=0.05, product="NRML"
+    )
+
+
+def test_run_strategy_cli_product_flag():
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client"), \
+         patch("run_strategy.OrderManager") as mock_om_cls, \
+         patch("run_strategy.StrangleDesk"):
+
+        exit_code = run_strategy_cli(["--product", "NRML", "--dry-run"])
+        assert exit_code == 0
+        assert mock_om_cls.call_args[1]["product"] == "NRML"
+
+
 def test_run_session_reauthenticates_on_token_error(tmp_path):
     state_file = tmp_path / "trades_today.json"
     om = MagicMock()
@@ -742,6 +873,8 @@ def test_run_session_reauthenticates_on_token_error(tmp_path):
         res = desk.run_session(lots=1, kite=mock_kite_expired, dry_run=True)
         assert res["status"] == "DRY_RUN"
         mock_find.assert_called_once_with(mock_kite_fresh, underlying="NIFTY", target_price=30.0, lots=1)
+
+
 
 
 
