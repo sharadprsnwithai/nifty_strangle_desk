@@ -2,8 +2,10 @@
 .github
 .venv
 .env
-data
-logs
+data/*.parquet
+data/*.csv
+data/trades_today.json
+logs/*.log
 __pycache__
 *.pyc
 *.pyo
@@ -12,4 +14,3 @@ __pycache__
 tests
 .superpowers
 *.tmp
-data/*.parquet
