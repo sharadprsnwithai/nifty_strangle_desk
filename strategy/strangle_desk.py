@@ -337,6 +337,14 @@ class StrangleDesk:
 
             # 2. No active trade locally: check if broker has open short strangle positions
             if state is None or state.get("status") not in ("OPEN", "COMPLETED", "ABORTED"):
+                # Short-circuit: If broker has no short NFO positions at all, avoid fetching instruments
+                has_candidate_positions = any(
+                    p.get("exchange") == "NFO" and int(p.get("quantity", 0)) < 0
+                    for p in net_positions
+                )
+                if not has_candidate_positions:
+                    return state
+
                 # Fetch instruments to identify target expiry
                 instruments = kite.instruments("NFO")
                 if target_expiry is None:
@@ -986,14 +994,9 @@ class StrangleDesk:
                     if self.notifier:
                         self.notifier.send_message(f"⚠️ <b>Morning TOTP Login Failed (08:00 IST)</b>: {e}")
 
-            # Check today's state & reconcile with broker positions
+            # Check today's state
             state = self.load_state()
             today_str = today_d.strftime("%Y-%m-%d")
-
-            mode = getattr(self.order_manager, "mode", "PAPER")
-            if mode == "LIVE" and kite is not None:
-                kite = self._ensure_kite_session(kite)
-                state = self.reconcile_with_broker(kite, state, underlying=underlying)
 
             # 1. If an active trade already exists for today, resume monitoring it!
             if state is not None and state.get("date") == today_str and state.get("status") == "OPEN":
@@ -1019,12 +1022,26 @@ class StrangleDesk:
                 time.sleep(idle_sleep_seconds)
                 continue
 
-            # 3. If before 10:00 AM (e.g. pre-market or 09:15-09:59), wait for entry time
+            # 3. Market Hours Guard: Outside regular NSE trading hours (09:15 - 15:30 IST) or on weekends, sleep peacefully
+            is_market_hours = (dt_time(9, 15) <= current_t <= dt_time(15, 30)) and (now.weekday() < 5 or ignore_holidays)
+            if not is_market_hours:
+                time.sleep(idle_sleep_seconds)
+                continue
+
+            # 4. During Market Hours: Reconcile with broker positions in LIVE mode
+            mode = getattr(self.order_manager, "mode", "PAPER")
+            if mode == "LIVE" and kite is not None:
+                kite = self._ensure_kite_session(kite)
+                state = self.reconcile_with_broker(kite, state, underlying=underlying)
+                if state is not None and state.get("date") == today_str and state.get("status") == "OPEN":
+                    continue
+
+            # 5. If before 10:00 AM (e.g. 09:15-09:59 IST), wait for entry time
             if current_t < dt_time(entry_h, entry_m):
                 time.sleep(idle_sleep_seconds)
                 continue
 
-            # 4. If at 10:00 AM (entry window: 10:00 - 10:05 IST on trading days):
+            # 6. If at 10:00 AM (entry window: 10:00 - 10:05 IST on trading days):
             if dt_time(entry_h, entry_m) <= current_t <= dt_time(entry_h, entry_m + 5):
                 logger.info("Triggering 10:00 AM Strangle entry for %s...", today_str)
                 try:

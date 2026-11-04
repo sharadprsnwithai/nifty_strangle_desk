@@ -878,3 +878,42 @@ def test_run_session_reauthenticates_on_token_error(tmp_path):
 
 
 
+
+def test_reconcile_with_broker_skips_instrument_fetch_when_no_short_nfo_positions(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    om.mode = "LIVE"
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    mock_kite = MagicMock()
+    mock_kite.positions.return_value = {
+        "net": [
+            {"tradingsymbol": "INFY", "exchange": "NSE", "quantity": 100},
+            {"tradingsymbol": "NIFTY26N0924400CE", "exchange": "NFO", "quantity": 650},  # BUY/LONG position, not short
+        ]
+    }
+
+    state = desk.reconcile_with_broker(mock_kite)
+    assert state is None
+    # instruments("NFO") must NOT be called if there are no short NFO positions!
+    mock_kite.instruments.assert_not_called()
+
+
+def test_run_scheduler_skips_reconciliation_outside_market_hours(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    om = MagicMock()
+    om.mode = "LIVE"
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    mock_kite = MagicMock()
+
+    # Simulate 17:15 IST (off-market hours) on a weekday (Wednesday)
+    fixed_time = datetime(2026, 11, 4, 17, 15, 0)
+    with patch("strategy.strangle_desk.datetime") as mock_dt,          patch("strategy.strangle_desk.time.sleep") as mock_sleep:
+        mock_dt.now.return_value = fixed_time
+        desk.run_scheduler(kite=mock_kite, max_iterations=1, ignore_holidays=False)
+
+    # In off-market hours without an active trade, neither positions nor instruments should be polled!
+    mock_kite.positions.assert_not_called()
+    mock_kite.instruments.assert_not_called()
+    mock_sleep.assert_called_once_with(15)
