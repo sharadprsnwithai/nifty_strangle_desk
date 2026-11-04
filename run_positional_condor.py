@@ -3,6 +3,7 @@ import sys
 import argparse
 import logging
 from datetime import datetime, date
+from pathlib import Path
 from config import load_config
 from kite import get_kite_client
 from strategy.order_manager import OrderManager
@@ -43,6 +44,8 @@ def run_positional_cli(args=None) -> int:
     parser.add_argument("--backtest-days", type=int, default=365, help="Number of historical days for backtest (default: 365)")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default=os.getenv("LOG_LEVEL", "INFO"), help="Logging verbosity level (default: INFO)")
     parser.add_argument("--log-dir", type=str, default=os.getenv("LOG_DIR", "logs"), help="Directory for host log files (default: logs)")
+    parser.add_argument("--state-file", type=str, default=os.getenv("POSITIONAL_STATE_FILE"), help="Path to state JSON file")
+    parser.add_argument("--data-dir", type=str, default=os.getenv("DATA_DIR"), help="Directory for state data files (default: data)")
 
     parsed = parser.parse_args(args)
     setup_logging(log_dir=parsed.log_dir, log_level=parsed.log_level, log_filename="positional_condor.log")
@@ -81,14 +84,23 @@ def run_positional_cli(args=None) -> int:
 
     notifier = TelegramNotifier(bot_token=config.telegram_bot_token, chat_id=config.telegram_chat_id)
     om = OrderManager(mode=mode, kite=kite if mode == "LIVE" else None, product="NRML")
+    
+    state_file_path = None
+    if parsed.state_file:
+        state_file_path = Path(parsed.state_file)
+    elif parsed.data_dir:
+        state_file_path = Path(parsed.data_dir) / "positional_condor_state.json"
+
     desk = PositionalDesk(
         order_manager=om,
+        state_file=state_file_path,
         notifier=notifier,
         lots=parsed.lots,
         capital_per_lot=parsed.capital_per_lot,
         monthly_stop_pct=parsed.monthly_stop_loss,
         monthly_target_pct=parsed.monthly_target
     )
+    desk.ensure_state_file()
 
     try:
         if parsed.dry_run or parsed.once:

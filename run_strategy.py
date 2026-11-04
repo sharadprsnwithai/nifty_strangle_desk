@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+from pathlib import Path
 import logging
 from config import load_config
 from kite import get_kite_client
@@ -42,6 +43,8 @@ def run_strategy_cli(args=None) -> int:
     parser.add_argument("--product", choices=["MIS", "NRML"], default="MIS", help="Order product type (MIS for intraday, NRML for normal carry/margin, default: MIS)")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default=os.getenv("LOG_LEVEL", "INFO"), help="Logging verbosity level (default: INFO)")
     parser.add_argument("--log-dir", type=str, default=os.getenv("LOG_DIR", "logs"), help="Directory for host log files (default: logs)")
+    parser.add_argument("--state-file", type=str, default=os.getenv("STRANGLE_STATE_FILE"), help="Path to state JSON file")
+    parser.add_argument("--data-dir", type=str, default=os.getenv("DATA_DIR"), help="Directory for state data files (default: data)")
     parser.add_argument("--dry-run", action="store_true", help="Perform single strike lookup and print plan without waiting")
     parser.add_argument("--once", action="store_true", help="Run single monitoring iteration and exit (default runs automated daemon)")
     parser.add_argument("--morning-login", action="store_true", help="Execute 08:00 AM TOTP morning login to renew credentials, notify Telegram, and exit")
@@ -56,7 +59,14 @@ def run_strategy_cli(args=None) -> int:
 
     notifier = TelegramNotifier(bot_token=config.telegram_bot_token, chat_id=config.telegram_chat_id)
     om = OrderManager(mode=mode, kite=kite if mode == "LIVE" else None, product=parsed.product)
-    desk = StrangleDesk(order_manager=om, notifier=notifier)
+
+    state_file_path = None
+    if parsed.state_file:
+        state_file_path = Path(parsed.state_file)
+    elif parsed.data_dir:
+        state_file_path = Path(parsed.data_dir) / "trades_today.json"
+
+    desk = StrangleDesk(order_manager=om, state_file=state_file_path, notifier=notifier)
 
     if parsed.morning_login:
         logger.info("Executing on-demand morning TOTP login renewal...")

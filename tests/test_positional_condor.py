@@ -677,3 +677,159 @@ def test_positional_desk_deploy_iron_condor_rollback_on_failure(tmp_path):
 
 
 
+
+
+def test_positional_desk_save_state_fallback_on_os_error(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock, patch
+    from pathlib import Path
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+
+    # Simulating the exact error: [Errno 2] No such file or directory: '/app/data/positional_condor_state.tmp'
+    primary_state_file = Path('/app/data/positional_condor_state.json')
+    om = OrderManager(mode='PAPER', kite=None)
+    mock_notifier = MagicMock()
+    desk = PositionalDesk(order_manager=om, state_file=primary_state_file, notifier=mock_notifier)
+
+    # Custom temp dir for fallback isolation
+    custom_temp = tmp_path / 'custom_temp'
+    monkeypatch.setattr('tempfile.gettempdir', lambda: str(custom_temp))
+
+    test_state = {
+        'month': '2026-11',
+        'status': 'ACTIVE',
+        'regime': 'SIDEWAYS',
+        'monthly_realized_pnl': 500.0
+    }
+
+    original_open = open
+    def mock_open_fn(file, mode='r', *args, **kwargs):
+        s = str(file)
+        if 'positional_condor_state' in s and 'custom_temp' not in s:
+            raise FileNotFoundError(2, "No such file or directory: '/app/data/positional_condor_state.tmp'")
+        return original_open(file, mode, *args, **kwargs)
+
+    with patch('builtins.open', side_effect=mock_open_fn):
+        # Should not raise FileNotFoundError / OSError
+        desk.save_state(test_state)
+
+    # In-memory state is preserved
+    assert desk.state == test_state
+
+    # Fallback file exists in fallback location
+    fallback_file = custom_temp / 'trading_state' / 'positional_condor_state.json'
+    assert fallback_file.exists()
+
+    # Telegram warning was delivered
+    mock_notifier.send_message.assert_called_once()
+    assert "State Warning" in mock_notifier.send_message.call_args[0][0]
+
+    # load_state recovers state from fallback when primary is missing
+    desk_new = PositionalDesk(order_manager=om, state_file=primary_state_file)
+    loaded = desk_new.load_state()
+    assert loaded is not None
+    assert loaded['monthly_realized_pnl'] == 500.0
+
+
+def test_run_positional_cli_state_file_and_data_dir_args():
+    from unittest.mock import patch
+    from pathlib import Path
+    from run_positional_condor import run_positional_cli
+
+    with patch('run_positional_condor.load_config'), \
+         patch('run_positional_condor.get_kite_client'), \
+         patch('run_positional_condor.PositionalDesk') as mock_desk_cls:
+        instance = mock_desk_cls.return_value
+        instance.evaluate_daily_close.return_value = {'status': 'TEST'}
+
+        exit_code = run_positional_cli(['--paper', '--dry-run', '--state-file', '/custom/state.json'])
+        assert exit_code == 0
+        _, kwargs = mock_desk_cls.call_args
+        assert str(kwargs.get('state_file')) == str(Path('/custom/state.json'))
+
+
+def test_positional_desk_evaluate_daily_close_survives_state_save_error(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock, patch
+    from pathlib import Path
+    from datetime import date
+    import pandas as pd
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+
+    primary_state_file = Path('/app/data/positional_condor_state.json')
+    om = OrderManager(mode='PAPER', kite=None)
+    mock_notifier = MagicMock()
+    desk = PositionalDesk(order_manager=om, state_file=primary_state_file, notifier=mock_notifier)
+
+    custom_temp = tmp_path / 'custom_temp'
+    monkeypatch.setattr('tempfile.gettempdir', lambda: str(custom_temp))
+
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"tradingsymbol": "NIFTY26NOV24000CE", "name": "NIFTY", "expiry": "2026-11-26", "instrument_type": "CE", "strike": 24000},
+        {"tradingsymbol": "NIFTY26NOV24000PE", "name": "NIFTY", "expiry": "2026-11-26", "instrument_type": "PE", "strike": 24000},
+    ]
+
+    dates = pd.date_range(end="2026-11-04", periods=30)
+    df_daily = pd.DataFrame({"close": [24000.0] * 30, "rsi": [50.0] * 30}, index=dates)
+
+    original_open = open
+    def mock_open_fn(file, mode='r', *args, **kwargs):
+        s = str(file)
+        if "positional_condor_state" in s and "custom_temp" not in s:
+            raise FileNotFoundError(2, "No such file or directory: '/app/data/positional_condor_state.tmp'")
+        return original_open(file, mode, *args, **kwargs)
+
+    with patch('builtins.open', side_effect=mock_open_fn), \
+         patch('strategy.positional_condor.condor_desk.fetch_daily_nifty_rsi', return_value=(50.0, 'SIDEWAYS', df_daily)), \
+         patch('strategy.positional_condor.condor_desk.solve_1_to_1_iron_condor', return_value={
+             "total_quantity": 65, "expiry": "2026-11-26", "net_credit": 50.0, "max_loss": 50.0,
+             "pe_buy": {"tradingsymbol": "PE_BUY", "strike": 23500, "ltp": 10.0},
+             "pe_sell": {"tradingsymbol": "PE_SELL", "strike": 23800, "ltp": 30.0},
+             "ce_sell": {"tradingsymbol": "CE_SELL", "strike": 24200, "ltp": 30.0},
+             "ce_buy": {"tradingsymbol": "CE_BUY", "strike": 24500, "ltp": 10.0},
+         }):
+        res = desk.evaluate_daily_close(kite=mock_kite, force_date=date(2026, 11, 4), dry_run=True, ignore_holidays=True)
+        assert res.get("status") == "DRY_RUN"
+        assert desk.state is not None
+        assert desk.state.get("month") == "2026-11"
+
+
+def test_create_fresh_positional_state():
+    from strategy.positional_condor.condor_desk import create_fresh_positional_state
+    from datetime import date
+    import re
+
+    state = create_fresh_positional_state()
+    assert state["status"] == "IDLE"
+    assert state["regime"] == "UNKNOWN"
+    assert state["monthly_realized_pnl"] == 0.0
+    assert state["current_trade"] is None
+    assert state["history"] == []
+    assert re.match(r"^\d{4}-\d{2}$", state["month"])
+    assert re.match(r"^\d{4}-\d{2}-\d{2}$", state["expiry"])
+
+
+def test_positional_desk_creates_fresh_state_if_not_present(tmp_path):
+    from strategy.positional_condor.condor_desk import PositionalDesk
+    from strategy.order_manager import OrderManager
+
+    fresh_dir = tmp_path / "sub_data"
+    state_file = fresh_dir / "condor_state.json"
+    assert not state_file.exists()
+
+    om = OrderManager(mode="PAPER", kite=None)
+    desk = PositionalDesk(order_manager=om, state_file=state_file, auto_init_state=False)
+    assert not state_file.exists()
+
+    # Call ensure_state_file
+    state = desk.ensure_state_file()
+    assert state_file.exists()
+    assert state["status"] == "IDLE"
+    assert state["monthly_realized_pnl"] == 0.0
+
+    # Verify reloading from disk
+    loaded = desk.load_state()
+    assert loaded is not None
+    assert loaded["month"] == state["month"]
+    assert loaded["expiry"] == state["expiry"]

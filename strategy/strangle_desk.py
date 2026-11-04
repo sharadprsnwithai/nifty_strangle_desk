@@ -1,6 +1,8 @@
+import os
 import json
 import logging
 import time
+import tempfile
 from datetime import date, datetime, time as dt_time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -12,7 +14,18 @@ from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger("strategy.desk")
 
-DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "trades_today.json"
+
+def get_default_strangle_state_file() -> Path:
+    env_file = os.getenv("STRANGLE_STATE_FILE")
+    if env_file:
+        return Path(env_file).resolve()
+    data_dir = os.getenv("DATA_DIR")
+    if data_dir:
+        return Path(data_dir).resolve() / "trades_today.json"
+    return Path(__file__).resolve().parent.parent / "data" / "trades_today.json"
+
+
+DEFAULT_STATE_FILE = get_default_strangle_state_file()
 
 
 class StrangleDesk:
@@ -25,31 +38,63 @@ class StrangleDesk:
         notifier: Optional[TelegramNotifier] = None
     ):
         self.order_manager = order_manager
-        self.state_file = state_file or DEFAULT_STATE_FILE
+        self.state_file = Path(state_file).resolve() if state_file else get_default_strangle_state_file()
         self.notifier = notifier
         self.state: Optional[Dict[str, Any]] = None
 
+    def _get_fallback_file(self) -> Path:
+        fallback_dir = Path(tempfile.gettempdir()) / "trading_state"
+        return fallback_dir / self.state_file.name
+
     def save_state(self, state: Dict[str, Any]) -> None:
+        """Atomically saves strangle state to disk with fallback resilience against filesystem/mount errors."""
         self.state = state
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        temp_file = self.state_file.with_suffix(".tmp")
-        temp_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        temp_file.replace(self.state_file)
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_file = self.state_file.with_suffix(".tmp")
+            temp_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            temp_file.replace(self.state_file)
+        except Exception as e:
+            logger.error("Primary state save failed at %s (%s). Attempting fallback...", self.state_file, e)
+            try:
+                fallback_file = self._get_fallback_file()
+                fallback_file.parent.mkdir(parents=True, exist_ok=True)
+                temp_fallback = fallback_file.with_suffix(".tmp")
+                temp_fallback.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                temp_fallback.replace(fallback_file)
+                logger.warning("Strangle state saved to fallback path: %s", fallback_file)
+                if self.notifier:
+                    self.notifier.send_message(
+                        f"⚠️ <b>State Warning</b>: Primary state save failed at <code>{self.state_file}</code> ({e}). "
+                        f"State saved to fallback <code>{fallback_file}</code>."
+                    )
+            except Exception as fb_err:
+                logger.critical("All state save attempts failed: %s (Fallback error: %s). Preserving state in memory.", e, fb_err)
 
     def load_state(self) -> Optional[Dict[str, Any]]:
-        if not self.state_file.exists():
-            return None
+        target_file = self.state_file
+        if not target_file.exists():
+            fallback_file = self._get_fallback_file()
+            if fallback_file.exists():
+                logger.info("Primary state file not found; loading from fallback: %s", fallback_file)
+                target_file = fallback_file
+            else:
+                return None
         try:
-            content = self.state_file.read_text(encoding="utf-8")
+            content = target_file.read_text(encoding="utf-8")
             self.state = json.loads(content)
             return self.state
         except Exception as e:
-            logger.error("Failed to load state from %s: %s", self.state_file, e)
+            logger.error("Failed to load state from %s: %s", target_file, e)
             return None
 
     def clear_state(self) -> None:
-        if self.state_file.exists():
-            self.state_file.unlink()
+        for f in (self.state_file, self._get_fallback_file()):
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception as e:
+                    logger.warning("Could not delete state file %s: %s", f, e)
         self.state = None
 
     @staticmethod

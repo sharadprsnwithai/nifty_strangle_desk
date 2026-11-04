@@ -4,9 +4,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.log
-logs/
+logs/*.log
+!logs/.gitkeep
 .superpowers/
 data/*.json
+!data/positional_condor_state.json
 data/*.parquet
 data/*.csv
-
+!data/.gitkeep

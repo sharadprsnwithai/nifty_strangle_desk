@@ -1,6 +1,9 @@
+import calendar
+import os
 import json
 import logging
 import time
+import tempfile
 from datetime import date, datetime, timedelta, time as dt_time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -20,7 +23,53 @@ from strategy.positional_condor.strike_solver import (
 
 logger = logging.getLogger("condor.desk")
 
-DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "positional_condor_state.json"
+
+def get_default_positional_state_file() -> Path:
+    env_file = os.getenv("POSITIONAL_STATE_FILE")
+    if env_file:
+        return Path(env_file).resolve()
+    data_dir = os.getenv("DATA_DIR")
+    if data_dir:
+        return Path(data_dir).resolve() / "positional_condor_state.json"
+    return Path(__file__).resolve().parent.parent.parent / "data" / "positional_condor_state.json"
+
+
+DEFAULT_STATE_FILE = get_default_positional_state_file()
+
+
+def get_last_thursday(year: int, month: int) -> date:
+    """Calculates the last Thursday of a given year and month (NSE monthly derivative expiry)."""
+    last_day = calendar.monthrange(year, month)[1]
+    last_date = date(year, month, last_day)
+    offset = (last_date.weekday() - 3) % 7
+    return last_date - timedelta(days=offset)
+
+
+def create_fresh_positional_state(month_str: Optional[str] = None, expiry: Optional[str] = None) -> Dict[str, Any]:
+    """Generates a clean default initial state dictionary for PositionalDesk."""
+    today_d = date.today()
+    if not month_str:
+        month_str = today_d.strftime("%Y-%m")
+    if not expiry:
+        try:
+            y, m = map(int, month_str.split("-"))
+            expiry = str(get_last_thursday(y, m))
+        except Exception:
+            expiry = None
+    return {
+        "month": month_str,
+        "expiry": expiry,
+        "status": "IDLE",
+        "regime": "UNKNOWN",
+        "monthly_realized_pnl": 0.0,
+        "current_trade": None,
+        "last_rsi": None,
+        "last_regime": None,
+        "current_rsi": None,
+        "current_regime": None,
+        "last_evaluation_date": None,
+        "history": []
+    }
 
 
 class PositionalDesk:
@@ -38,10 +87,11 @@ class PositionalDesk:
         lots: int = 1,
         capital_per_lot: float = 100000.0,
         monthly_target_pct: float = 0.04,
-        monthly_stop_pct: float = 0.03
+        monthly_stop_pct: float = 0.03,
+        auto_init_state: bool = False
     ):
         self.order_manager = order_manager
-        self.state_file = state_file or DEFAULT_STATE_FILE
+        self.state_file = Path(state_file).resolve() if state_file else get_default_positional_state_file()
         self.notifier = notifier
         self.lots = lots
         self.capital_per_lot = capital_per_lot
@@ -49,40 +99,84 @@ class PositionalDesk:
         self.monthly_stop_pct = monthly_stop_pct
         self.total_capital = lots * capital_per_lot
         self.state: Optional[Dict[str, Any]] = None
+        if auto_init_state and not self.state_file.exists():
+            self.ensure_state_file()
+
+    def _get_fallback_file(self) -> Path:
+        fallback_dir = Path(tempfile.gettempdir()) / "trading_state"
+        return fallback_dir / self.state_file.name
+
+    def ensure_state_file(self) -> Dict[str, Any]:
+        """Ensures a valid positional condor state JSON file exists on disk, creating a fresh one if absent."""
+        state = self.load_state(create_if_missing=False)
+        if state is None:
+            state = create_fresh_positional_state()
+            logger.info("Positional state file absent at %s. Creating fresh state file.", self.state_file)
+            self.save_state(state)
+        return state
 
     def save_state(self, state: Dict[str, Any]) -> None:
-        """Atomically saves desk state to disk."""
+        """Atomically saves desk state to disk with fallback resilience against filesystem/mount errors."""
         self.state = state
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        temp_file = self.state_file.with_suffix(".tmp")
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, default=str)
-        temp_file.replace(self.state_file)
-        logger.info("Saved positional state to %s (Status: %s, Realized: Rs %.2f)",
-                    self.state_file, state.get("status"), state.get("monthly_realized_pnl", 0.0))
-
-    def load_state(self) -> Optional[Dict[str, Any]]:
-        """Loads state from disk if present and valid."""
-        if not self.state_file.exists():
-            self.state = None
-            return None
         try:
-            with open(self.state_file, "r", encoding="utf-8") as f:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_file = self.state_file.with_suffix(".tmp")
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, default=str)
+            temp_file.replace(self.state_file)
+            logger.info("Saved positional state to %s (Status: %s, Realized: Rs %.2f)",
+                        self.state_file, state.get("status"), state.get("monthly_realized_pnl", 0.0))
+        except Exception as e:
+            logger.error("Primary state save failed at %s (%s). Attempting fallback...", self.state_file, e)
+            try:
+                fallback_file = self._get_fallback_file()
+                fallback_file.parent.mkdir(parents=True, exist_ok=True)
+                temp_fallback = fallback_file.with_suffix(".tmp")
+                with open(temp_fallback, "w", encoding="utf-8") as f:
+                    json.dump(state, f, indent=2, default=str)
+                temp_fallback.replace(fallback_file)
+                logger.warning("Positional state saved to fallback path: %s", fallback_file)
+                if self.notifier:
+                    self.notifier.send_message(
+                        f"⚠️ <b>State Warning</b>: Primary state save failed at <code>{self.state_file}</code> ({e}). "
+                        f"State saved to fallback <code>{fallback_file}</code>."
+                    )
+            except Exception as fb_err:
+                logger.critical("All state save attempts failed: %s (Fallback error: %s). Preserving state in memory.", e, fb_err)
+
+    def load_state(self, create_if_missing: bool = False) -> Optional[Dict[str, Any]]:
+        """Loads state from disk if present and valid, checking fallback location if primary is missing."""
+        target_file = self.state_file
+        if not target_file.exists():
+            fallback_file = self._get_fallback_file()
+            if fallback_file.exists():
+                logger.info("Primary state file not found; loading from fallback: %s", fallback_file)
+                target_file = fallback_file
+            elif create_if_missing:
+                return self.ensure_state_file()
+            else:
+                self.state = None
+                return None
+        try:
+            with open(target_file, "r", encoding="utf-8") as f:
                 self.state = json.load(f)
             return self.state
         except Exception as e:
-            logger.error("Failed to load positional state file: %s", e)
+            logger.error("Failed to load positional state file %s: %s", target_file, e)
+            if create_if_missing:
+                return self.ensure_state_file()
             self.state = None
             return None
 
     def clear_state(self) -> None:
-        """Clears state from memory and removes file."""
+        """Clears state from memory and removes file(s)."""
         self.state = None
-        if self.state_file.exists():
-            try:
-                self.state_file.unlink()
-            except Exception as e:
-                logger.warning("Could not delete state file: %s", e)
+        for f in (self.state_file, self._get_fallback_file()):
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception as e:
+                    logger.warning("Could not delete state file %s: %s", f, e)
 
     def check_circuit_breakers(self, unrealized_pnl: float = 0.0) -> Optional[str]:
         """
@@ -453,17 +547,11 @@ class PositionalDesk:
                 return {"status": "MARKET_CLOSED", "reason": err_msg}
 
         state = self.load_state()
-        if state is None or state.get("month") != month_str:
+        if state is None or state.get("month") != month_str or not state.get("expiry"):
             instruments = kite.instruments(exchange="NFO")
             monthly_exp = get_monthly_expiry(instruments, current_date=today_date)
-            state = {
-                "month": month_str,
-                "expiry": str(monthly_exp),
-                "status": "ACTIVE",
-                "regime": "UNKNOWN",
-                "monthly_realized_pnl": 0.0,
-                "current_trade": None
-            }
+            state = create_fresh_positional_state(month_str=month_str, expiry=str(monthly_exp))
+            state["status"] = "ACTIVE"
             self.save_state(state)
 
         # Check circuit breakers from prior evaluations
@@ -535,11 +623,13 @@ class PositionalDesk:
             prev_day_rsi = float(valid_rsi.iloc[-2])
             prev_day_regime = classify_regime(prev_day_rsi)
         else:
-            prev_day_rsi = float(state.get("current_rsi", latest_rsi))
-            prev_day_regime = state.get("current_regime", regime)
+            raw_rsi = state.get("current_rsi")
+            prev_day_rsi = float(raw_rsi) if raw_rsi is not None else float(latest_rsi)
+            prev_day_regime = state.get("current_regime") or regime
 
-        last_recorded_rsi = float(state.get("current_rsi", prev_day_rsi))
-        last_recorded_regime = state.get("current_regime", prev_day_regime)
+        raw_last_rsi = state.get("current_rsi")
+        last_recorded_rsi = float(raw_last_rsi) if raw_last_rsi is not None else float(prev_day_rsi)
+        last_recorded_regime = state.get("current_regime") or prev_day_regime
 
         state["last_rsi"] = last_recorded_rsi
         state["last_regime"] = last_recorded_regime
