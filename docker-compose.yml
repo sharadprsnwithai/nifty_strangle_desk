@@ -19,10 +19,7 @@ services:
       - ./logs:/app/logs
       # Mount .env so generated Kite access tokens stay synchronized between host and container
       - ./.env:/app/.env
-      # Mount codebase so updates are immediately active in the container
-      - ./strategy:/app/strategy
-      - ./run_strategy.py:/app/run_strategy.py
-      - ./run_positional_condor.py:/app/run_positional_condor.py
+      # Code is baked into the image; rebuild to apply code changes: docker compose up -d --build
     # -----------------------------------------------------------------------------------
     # Command Options:
     # 1. Live Production (10 Lots, Rs 10k Portfolio Max Loss):

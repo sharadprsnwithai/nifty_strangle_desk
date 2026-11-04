@@ -1,6 +1,9 @@
 .git
 .github
 .venv
+.env
+data
+logs
 __pycache__
 *.pyc
 *.pyo

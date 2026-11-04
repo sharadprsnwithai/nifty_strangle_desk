@@ -22,11 +22,8 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
-# Copy application source code
-COPY config.py main.py run_strategy.py run_backtest.py run_positional_condor.py ./
-COPY kite/ ./kite/
-COPY strategy/ ./strategy/
-COPY notifications/ ./notifications/
+# Copy all project source code (secrets/state excluded via .dockerignore)
+COPY . .
 
 # Ensure virtual environment binaries are in PATH
 ENV PATH="/app/.venv/bin:$PATH"
