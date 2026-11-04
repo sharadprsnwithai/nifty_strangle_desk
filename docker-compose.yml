@@ -57,3 +57,29 @@ services:
     # Live Production:
     command: ["--live", "--lots", "1", "--monthly-stop-loss", "0.03", "--monthly-target", "0.04", "--schedule-time", "15:20"]
     # -----------------------------------------------------------------------------------
+
+  orb-desk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orb_breakout_desk
+    image: ${DOCKER_USER:-sharadprsn}/nifty_strangle_desk:latest
+    restart: unless-stopped
+    entrypoint: ["python", "run_orb.py"]
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Kolkata
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    # -----------------------------------------------------------------------------------
+    # Conservative B2 Setup (Paper simulation default):
+    command: ["--paper", "--risk", "2500", "--max-trades", "5", "--daily-loss", "10000", "--poll", "5"]
+    # Live Production:
+    # command: ["--live", "--risk", "2500", "--max-trades", "5", "--daily-loss", "10000", "--poll", "5"]
+    # -----------------------------------------------------------------------------------
+

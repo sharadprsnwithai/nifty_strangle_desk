@@ -131,7 +131,36 @@ uv run python run_positional_condor.py --paper --lots 1 --schedule-time 15:20
 uv run python run_positional_condor.py --live --lots 1 --monthly-stop-loss 0.03 --monthly-target 0.04
 ```
 
-### 5. Docker & Cloud VPS Deployment
+### 5. Run 15-Minute ORB Intraday Desk (Indrajit Shantharaj Strategy)
+An automated high-momentum breakout trading desk operating across **30 high-beta stocks**:
+- **Initial Balance (09:15 - 10:15)**: Forms high/low range from first 4 candles.
+- **20% Rejection Wick Filter**: Excludes candles where counter-wick exceeds 20% of range.
+- **Previous Day High/Low (PDH/PDL) Filter**: Longs must clear PDH; Shorts must break PDL.
+- **NIFTY Direction Filter**: Longs require NIFTY > Day Open; Shorts require NIFTY < Day Open.
+- **Risk-Parity Position Sizing**: Fixed Rs 2,500 risk per trade (Quantity = int(2500 / RiskPerShare)).
+- **Max 5 Trades / Day Cap**: Selects top 5 highest-conviction setups by cleanest wick %.
+- **Daily Portfolio Stop-Loss Circuit Breaker**: Hard halt and emergency square-off at -Rs 10,000 daily portfolio loss.
+- **Trade Lifecycle**:
+  - 1:1 R Target: Trail Stop-Loss to Breakeven (eliminate all risk).
+  - 1:2.5 R Target: Book 50% profit (+Rs 3,125 gain), trail remainder at Breakeven.
+  - 15:15 IST: Mandatory intraday square-off.
+- **Telegram Live Alerts**: Real-time notifications for setup discovery, entry orders, 1:1 BE trails, 1:2.5 profit booking, and daily session summaries.
+
+```bash
+# Single dry-run inspection of today's IB ranges, NIFTY open, and active positions
+uv run python run_orb.py --dry-run
+
+# Run single scan & monitor cycle
+uv run python run_orb.py --once
+
+# Run automated Paper trading daemon (default: Rs 2,500 risk, max 5 trades, Rs 10k daily SL)
+uv run python run_orb.py --paper --risk 2500 --max-trades 5 --daily-loss 10000
+
+# Run automated Live trading daemon via Kite Connect API
+uv run python run_orb.py --live --risk 2500 --max-trades 5 --daily-loss 10000
+```
+
+### 6. Docker & Cloud VPS Deployment
 
 The desk is fully containerized with Indian Standard Time (`Asia/Kolkata`) pre-configured, state volume mounts, and host event log streaming.
 

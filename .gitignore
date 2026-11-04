@@ -11,4 +11,5 @@ data/*.json
 !data/positional_condor_state.json
 data/*.parquet
 data/*.csv
+data/cache_15m/
 !data/.gitkeep
