@@ -40,6 +40,8 @@ def parse_args(args=None):
     parser.add_argument("--risk", type=float, default=2500.0, help="Fixed Rupee Risk per trade in FIXED_RISK mode (default: 2500.0)")
     parser.add_argument("--sizing-mode", choices=["FIXED_RISK", "LOTS"], default="FIXED_RISK", help="Position sizing mode (default: FIXED_RISK)")
     parser.add_argument("--lots", type=int, default=2, help="Number of futures lots to trade if sizing-mode is LOTS (default: 2)")
+    parser.add_argument("--order-type", choices=["LIMIT", "MARKET"], default="LIMIT", help="Order execution type (default: LIMIT)")
+    parser.add_argument("--limit-buffer-pct", type=float, default=0.002, help="Marketable limit price buffer percentage (default: 0.002 / 0.2%%)")
     parser.add_argument("--max-trades", type=int, default=5, help="Maximum trades per day (default: 5)")
     parser.add_argument("--daily-loss", type=float, default=10000.0, help="Daily Portfolio Circuit Breaker Loss limit (default: 10000.0)")
     parser.add_argument("--poll", type=int, default=5, help="Monitoring polling interval in seconds (default: 5)")
@@ -64,6 +66,7 @@ def main(args=None):
     logger.info("  Strategy: Option 3 Canonical ORB Desk (Armed Candle Confirmation Break)")
     logger.info("  Risk Guardrails: Fixed Rs %.0f Risk | Max %d Trades/Day | Rs %.0f Daily SL", parsed.risk, parsed.max_trades, parsed.daily_loss)
     logger.info("  Universe: %d Stocks | Sizing: Risk Parity Equity MIS", len(TARGET_STOCKS))
+    logger.info("  Execution: %s Orders (Buffer: %.2f%%) | Mode: %s", parsed.order_type, parsed.limit_buffer_pct * 100.0, mode)
     logger.info("=" * 75)
 
     config = load_config()
@@ -74,6 +77,8 @@ def main(args=None):
         fixed_risk_per_trade=parsed.risk,
         sizing_mode=parsed.sizing_mode,
         lots=parsed.lots,
+        order_type=parsed.order_type,
+        limit_buffer_pct=parsed.limit_buffer_pct,
         max_trades_per_day=parsed.max_trades,
         daily_stop_loss_limit=parsed.daily_loss,
         mode=mode,
@@ -90,7 +95,9 @@ def main(args=None):
         mode=mode,
         kite=kite if mode == "LIVE" else None,
         exchange=parsed.exchange,
-        product=parsed.product
+        product=parsed.product,
+        order_type=parsed.order_type,
+        limit_buffer_pct=parsed.limit_buffer_pct
     )
 
     desk = ORBDesk(

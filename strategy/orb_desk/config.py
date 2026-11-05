@@ -64,6 +64,8 @@ class ORBConfig:
 
     # Execution Parameters
     mode: str = "PAPER"                     # "PAPER" or "LIVE"
+    order_type: str = "LIMIT"               # "LIMIT" (marketable limit with buffer) or "MARKET"
+    limit_buffer_pct: float = 0.002         # 0.2% buffer for marketable limit execution
     product: str = "MIS"                    # "MIS" for intraday
     exchange: str = "NSE"                   # "NSE" for cash equity, "NFO" for futures
     poll_interval_seconds: int = 5          # Position monitoring interval in seconds

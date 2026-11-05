@@ -400,3 +400,81 @@ def test_dynamic_stock_selection_in_desk(tmp_path):
     assert desk.stock_stats["G1"]["ib_low"] == 99.0
 
 
+def test_orb_order_manager_limit_and_market_modes():
+    # 1. Test PAPER mode with default LIMIT order type
+    om_paper_limit = ORBOrderManager(mode="PAPER", order_type="LIMIT", limit_buffer_pct=0.002)
+    entry_res = om_paper_limit.place_entry(
+        symbol="RELIANCE",
+        direction="LONG",
+        quantity=250,
+        entry_price=2500.0,
+        initial_sl=2475.0,
+        target_2_5r=0.0
+    )
+    assert entry_res["order_type"] == "LIMIT"
+    # LONG entry limit price = 2500 * (1 + 0.002) = 2505.00
+    assert entry_res["limit_price"] == 2505.00
+
+    # Short entry limit price = 2500 * (1 - 0.002) = 2495.00
+    short_entry = om_paper_limit.place_entry(
+        symbol="TCS",
+        direction="SHORT",
+        quantity=175,
+        entry_price=3000.0,
+        initial_sl=3030.0,
+        target_2_5r=0.0
+    )
+    assert short_entry["limit_price"] == 2994.00
+
+    # Exit LONG (SELL) limit price = 2525 * (1 - 0.002) = 2519.95
+    exit_res = om_paper_limit.place_exit(
+        symbol="RELIANCE",
+        direction="LONG",
+        quantity=125,
+        exit_price=2525.0,
+        reason="TARGET_1R_BOOK_50%"
+    )
+    assert exit_res["order_type"] == "LIMIT"
+    assert exit_res["limit_price"] == 2519.95
+
+    # 2. Test LIVE mode with LIMIT order passing correct Kite params
+    kite_mock = MagicMock()
+    kite_mock.VARIETY_REGULAR = "regular"
+    kite_mock.ORDER_TYPE_LIMIT = "LIMIT"
+    kite_mock.ORDER_TYPE_MARKET = "MARKET"
+    kite_mock.TRANSACTION_TYPE_BUY = "BUY"
+    kite_mock.TRANSACTION_TYPE_SELL = "SELL"
+    kite_mock.PRODUCT_MIS = "MIS"
+    kite_mock.VALIDITY_DAY = "DAY"
+    kite_mock.place_order.return_value = "LIVE_ORDER_999"
+
+    om_live_limit = ORBOrderManager(mode="LIVE", kite=kite_mock, order_type="LIMIT", limit_buffer_pct=0.002)
+    live_entry = om_live_limit.place_entry(
+        symbol="INFY",
+        direction="LONG",
+        quantity=400,
+        entry_price=1500.0,
+        initial_sl=1485.0,
+        target_2_5r=0.0
+    )
+    assert live_entry["order_id"] == "LIVE_ORDER_999"
+    assert live_entry["limit_price"] == 1503.00
+    assert kite_mock.place_order.call_args[1]["order_type"] == "LIMIT"
+    assert kite_mock.place_order.call_args[1]["price"] == 1503.00
+    assert kite_mock.place_order.call_args[1]["tradingsymbol"] == "INFY"
+
+    # 3. Test MARKET mode fallback
+    om_paper_mkt = ORBOrderManager(mode="PAPER", order_type="MARKET")
+    mkt_res = om_paper_mkt.place_entry(
+        symbol="SBIN",
+        direction="LONG",
+        quantity=750,
+        entry_price=800.0,
+        initial_sl=790.0,
+        target_2_5r=0.0
+    )
+    assert mkt_res["order_type"] == "MARKET"
+    assert mkt_res["limit_price"] is None
+
+
+

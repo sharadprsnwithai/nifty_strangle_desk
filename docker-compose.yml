@@ -77,10 +77,10 @@ services:
       - ./logs:/app/logs
       - ./.env:/app/.env
     # -----------------------------------------------------------------------------------
-    # Option 3 Desk (Static 30 Stocks Universe, 2 Lots Sizing):
+    # Option 3 Desk (Static 30 Stocks Universe, 2 Lots Sizing, Marketable LIMIT Execution):
     # Paper Trading Mode (Simulated Execution with Live Market Feeds):
-    command: ["--paper", "--sizing-mode", "LOTS", "--lots", "2", "--max-trades", "5", "--daily-loss", "50000", "--poll", "5"]
+    command: ["--paper", "--sizing-mode", "LOTS", "--lots", "2", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--max-trades", "5", "--daily-loss", "50000", "--poll", "5"]
     #
     # Live Production Mode (Real Broker Order Execution):
-    # command: ["--live", "--sizing-mode", "LOTS", "--lots", "2", "--max-trades", "5", "--daily-loss", "50000", "--poll", "5"]
+    # command: ["--live", "--sizing-mode", "LOTS", "--lots", "2", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--max-trades", "5", "--daily-loss", "50000", "--poll", "5"]
     # -----------------------------------------------------------------------------------
