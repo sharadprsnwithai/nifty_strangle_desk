@@ -42,10 +42,12 @@ NIFTY_SYMBOL: str = "NSE:NIFTY 50"
 @dataclass
 class ORBConfig:
     """Configuration parameters for the ORB Desk."""
-    # Sizing & Risk Guardrails (Conservative B2 Setup)
+    # Sizing & Risk Guardrails (Option 3: Risk-Parity ₹2,500 Risk)
     fixed_risk_per_trade: float = 2500.0    # Fixed Rs Risk per trade
     max_trades_per_day: int = 5             # Maximum trades allowed in a single day
     daily_stop_loss_limit: float = 10000.0  # Daily Portfolio Stop-Loss Circuit Breaker
+    sizing_mode: str = "FIXED_RISK"         # "FIXED_RISK" (default Option 3) or "LOTS"
+    lots: int = 2                           # Number of lots (used if sizing_mode="LOTS")
 
     # Strategy Filters
     wick_max_pct: float = 0.20              # Max allowed rejection wick (20%)
@@ -53,10 +55,12 @@ class ORBConfig:
     use_pdh_pdl_filter: bool = True         # Require Long > PDH, Short < PDL
     use_nifty_filter: bool = True           # Require Long when NIFTY > Day Open, Short when NIFTY < Day Open
 
-    # Trade Lifecycle Rules
-    trail_1r_to_be: bool = True             # Move Stop-Loss to Breakeven at 1:1 R
-    book_target_2_5r_pct: float = 0.50      # Book 50% position size at 1:2.5 R
-    eod_squareoff_time: str = "15:15"       # Mandatory intraday square-off time (IST)
+    # Trade Lifecycle Rules (Option 3 Canonical Logic)
+    use_armed_candle_trigger: bool = True   # Require confirmation break of armed candle (high for long, low for short)
+    target_1_r: float = 1.0                 # Target 1 R-multiple (1.0 R)
+    book_target_1_pct: float = 0.50         # Book 50% position size at Target 1 (1.0 R)
+    trail_1r_to_be: bool = True             # Move Stop-Loss to Cost / Breakeven at 1:1 R
+    eod_squareoff_time: str = "15:00"       # Exit remaining 50% runner at 3:00 PM IST (15:00)
 
     # Execution Parameters
     mode: str = "PAPER"                     # "PAPER" or "LIVE"
@@ -64,3 +68,9 @@ class ORBConfig:
     exchange: str = "NSE"                   # "NSE" for cash equity, "NFO" for futures
     poll_interval_seconds: int = 5          # Position monitoring interval in seconds
     state_file: str = "data/orb_trades_today.json"
+
+    # Universe Selection (Static 30 High-Momentum F&O Stocks)
+    use_dynamic_stock_selection: bool = False  # Production standard: Static 30 Stocks Universe
+    top_gainers_n: int = 3                     # Optional dynamic screening parameter
+    top_losers_n: int = 3                      # Optional dynamic screening parameter
+    enable_coiling_filter: bool = True         # Optional dynamic screening parameter

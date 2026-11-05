@@ -10,6 +10,11 @@ from kiteconnect import KiteConnect
 
 from strategy.orb_desk.config import ORBConfig, TARGET_STOCKS, NIFTY_TOKEN, NIFTY_SYMBOL
 from strategy.orb_desk.order_manager import ORBOrderManager, _round_to_nse_tick
+from strategy.orb_desk.stock_selector import (
+    build_dynamic_watchlist,
+    screen_coiling_pattern_stocks,
+    get_fno_stock_metadata
+)
 from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger("orb.desk")
@@ -45,10 +50,16 @@ class ORBDesk:
         self.nifty_day_open: Optional[float] = None
         self.stock_stats: Dict[str, Dict[str, Any]] = {}  # {sym: {pdh, pdl, ib_high, ib_low, token}}
         self.active_positions: List[Dict[str, Any]] = []
+        self.armed_positions: List[Dict[str, Any]] = []
         self.closed_trades: List[Dict[str, Any]] = []
         self.traded_stocks_today: set = set()
         self.circuit_tripped: bool = False
         self.ib_formed: bool = False
+
+        # Dynamic stock selection state
+        self.target_stocks: List[Dict[str, Any]] = list(TARGET_STOCKS)
+        self.pre_scanned_coiling: List[Dict[str, Any]] = []
+        self.dynamic_stocks_selected: bool = False
 
         self._load_state()
 
@@ -63,8 +74,12 @@ class ORBDesk:
             "circuit_tripped": self.circuit_tripped,
             "traded_stocks_today": list(self.traded_stocks_today),
             "active_positions": self.active_positions,
+            "armed_positions": self.armed_positions,
             "closed_trades": self.closed_trades,
-            "stock_stats": self.stock_stats
+            "stock_stats": self.stock_stats,
+            "target_stocks": self.target_stocks,
+            "pre_scanned_coiling": self.pre_scanned_coiling,
+            "dynamic_stocks_selected": self.dynamic_stocks_selected
         }
         try:
             with open(self.state_file, "w") as f:
@@ -84,13 +99,18 @@ class ORBDesk:
                 self.circuit_tripped = data.get("circuit_tripped", False)
                 self.traded_stocks_today = set(data.get("traded_stocks_today", []))
                 self.active_positions = data.get("active_positions", [])
+                self.armed_positions = data.get("armed_positions", [])
                 self.closed_trades = data.get("closed_trades", [])
                 self.stock_stats = data.get("stock_stats", {})
+                self.target_stocks = data.get("target_stocks", list(TARGET_STOCKS))
+                self.pre_scanned_coiling = data.get("pre_scanned_coiling", [])
+                self.dynamic_stocks_selected = data.get("dynamic_stocks_selected", False)
                 logger.info(
-                    "Restored daily state for %s: %d active, %d closed trades.",
+                    "Restored daily state for %s: %d active, %d closed trades, %d target stocks.",
                     self.today,
                     len(self.active_positions),
-                    len(self.closed_trades)
+                    len(self.closed_trades),
+                    len(self.target_stocks)
                 )
         except Exception as e:
             logger.warning("Could not read previous ORB state file: %s", e)
@@ -98,12 +118,113 @@ class ORBDesk:
     # -------------------------------------------------------------------------
     # Morning Initialization & Previous Day Stats
     # -------------------------------------------------------------------------
+    def _ensure_pdh_pdl_for_target_stocks(self, force: bool = False):
+        """Fetches PDH and PDL for all stocks in self.target_stocks."""
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=10)
+
+        for item in self.target_stocks:
+            sym = item["symbol"]
+            token = item.get("token")
+            if not token:
+                continue
+            if sym in self.stock_stats and not force and self.stock_stats[sym].get("pdh") is not None:
+                continue
+
+            try:
+                hist = self.kite.historical_data(
+                    instrument_token=token,
+                    from_date=start_dt.date(),
+                    to_date=end_dt.date(),
+                    interval="day"
+                )
+                completed = [
+                    c for c in hist
+                    if (c["date"].date() if isinstance(c["date"], datetime) else c["date"]) < self.today
+                ]
+                if completed:
+                    prev_candle = completed[-1]
+                    pdh = float(prev_candle["high"])
+                    pdl = float(prev_candle["low"])
+                elif len(hist) >= 2:
+                    pdh = float(hist[-2]["high"])
+                    pdl = float(hist[-2]["low"])
+                elif len(hist) == 1:
+                    pdh = float(hist[0]["high"])
+                    pdl = float(hist[0]["low"])
+                else:
+                    pdh = None
+                    pdl = None
+
+                self.stock_stats[sym] = {
+                    "token": token,
+                    "lot": item.get("lot", 1),
+                    "pdh": pdh,
+                    "pdl": pdl,
+                    "ib_high": self.stock_stats.get(sym, {}).get("ib_high"),
+                    "ib_low": self.stock_stats.get(sym, {}).get("ib_low"),
+                    "reasons": item.get("reasons", [])
+                }
+                time.sleep(0.35)  # Respect Kite 3 req/sec rate limit
+            except Exception as e:
+                logger.warning("Failed to fetch daily history for %s: %s", sym, e)
+                if sym not in self.stock_stats:
+                    self.stock_stats[sym] = {
+                        "token": token,
+                        "lot": item.get("lot", 1),
+                        "pdh": None,
+                        "pdl": None,
+                        "ib_high": None,
+                        "ib_low": None,
+                        "reasons": item.get("reasons", [])
+                    }
+
+    def select_dynamic_stocks(self, force: bool = False) -> List[Dict[str, Any]]:
+        """
+        Dynamically screens F&O universe for:
+          - Top N Gainers
+          - Top N Losers
+          - 3-day Coiling Pattern stocks (H3>H2>H1 and L3<L2<L1)
+        Updates self.target_stocks and fetches PDH/PDL for selected stocks.
+        """
+        if self.dynamic_stocks_selected and not force:
+            logger.info("Dynamic stocks already selected today (%d stocks).", len(self.target_stocks))
+            return self.target_stocks
+
+        # Pre-screen coiling stocks if enabled and not already done
+        if self.config.enable_coiling_filter and not self.pre_scanned_coiling:
+            fno_meta = get_fno_stock_metadata(self.kite)
+            symbols_data = [
+                {"symbol": sym, "token": v.get("nfo_token") or v.get("token"), "lot": v.get("lot_size", 1)}
+                for sym, v in fno_meta.items()
+            ]
+            self.pre_scanned_coiling = screen_coiling_pattern_stocks(self.kite, symbols_data, today_date=self.today)
+
+        watchlist = build_dynamic_watchlist(
+            kite=self.kite,
+            pre_scanned_coiling=self.pre_scanned_coiling,
+            top_gainers_n=self.config.top_gainers_n,
+            top_losers_n=self.config.top_losers_n,
+            today_date=self.today
+        )
+
+        if watchlist:
+            self.target_stocks = watchlist
+            self.dynamic_stocks_selected = True
+            logger.info("Dynamic stock selection active: %d stocks in watchlist.", len(self.target_stocks))
+            self._ensure_pdh_pdl_for_target_stocks(force=force)
+            self._save_state()
+        else:
+            logger.warning("Dynamic stock selection yielded no stocks. Retaining previous/fallback target stocks.")
+
+        return self.target_stocks
+
     def initialize_day(self, force: bool = False):
         """
-        Fetches Previous Day High (PDH) and Previous Day Low (PDL) for all 30 stocks,
+        Fetches Previous Day High (PDH) and Previous Day Low (PDL) for target stocks,
         and retrieves NIFTY 50 Day Open.
         """
-        logger.info("Initializing ORB Desk for %s across %d stocks...", self.today, len(TARGET_STOCKS))
+        logger.info("Initializing ORB Desk for %s...", self.today)
 
         # Check NIFTY 50 Day Open
         try:
@@ -114,54 +235,22 @@ class ORBDesk:
         except Exception as e:
             logger.warning("Could not fetch NIFTY Day Open: %s", e)
 
-        # Fetch Previous Day High and Low for all 30 stocks
-        end_dt = datetime.now()
-        start_dt = end_dt - timedelta(days=10)
-
-        for item in TARGET_STOCKS:
-            sym = item["symbol"]
-            token = item["token"]
-            if sym in self.stock_stats and not force:
-                continue
-
-            try:
-                # Fetch daily candles
-                hist = self.kite.historical_data(
-                    instrument_token=token,
-                    from_date=start_dt.date(),
-                    to_date=end_dt.date(),
-                    interval="day"
-                )
-                if len(hist) >= 2:
-                    prev_candle = hist[-2]  # Candle immediately preceding today
-                    pdh = float(prev_candle["high"])
-                    pdl = float(prev_candle["low"])
-                elif len(hist) == 1:
-                    pdh = float(hist[0]["high"])
-                    pdl = float(hist[0]["low"])
-                else:
-                    pdh = None
-                    pdl = None
-
-                self.stock_stats[sym] = {
-                    "token": token,
-                    "lot": item["lot"],
-                    "pdh": pdh,
-                    "pdl": pdl,
-                    "ib_high": None,
-                    "ib_low": None
-                }
-                time.sleep(0.35)  # Respect Kite 3 req/sec rate limit
-            except Exception as e:
-                logger.warning("Failed to fetch daily history for %s: %s", sym, e)
-                self.stock_stats[sym] = {
-                    "token": token,
-                    "lot": item["lot"],
-                    "pdh": None,
-                    "pdl": None,
-                    "ib_high": None,
-                    "ib_low": None
-                }
+        if self.config.use_dynamic_stock_selection:
+            now_t = datetime.now().time()
+            if now_t >= dt_time(10, 15) or force:
+                self.select_dynamic_stocks(force=force)
+            else:
+                # Pre-screen coiling stocks in the morning so 10:15 is instantaneous
+                if self.config.enable_coiling_filter and not self.pre_scanned_coiling:
+                    fno_meta = get_fno_stock_metadata(self.kite)
+                    symbols_data = [
+                        {"symbol": sym, "token": v.get("nfo_token") or v.get("token"), "lot": v.get("lot_size", 1)}
+                        for sym, v in fno_meta.items()
+                    ]
+                    self.pre_scanned_coiling = screen_coiling_pattern_stocks(self.kite, symbols_data, today_date=self.today)
+                    self._save_state()
+        else:
+            self._ensure_pdh_pdl_for_target_stocks(force=force)
 
         self._save_state()
         self._notify_desk_started()
@@ -171,16 +260,21 @@ class ORBDesk:
     # -------------------------------------------------------------------------
     def compute_initial_balance(self):
         """
-        Fetches 15-minute candles from 09:15 to 10:15 for all 30 stocks
+        Fetches 15-minute candles from 09:15 to 10:15 for target stocks
         and records Initial Balance (IB High, IB Low).
         """
-        logger.info("Computing 15-minute Initial Balance (09:15 - 10:15) for all 30 stocks...")
+        if self.config.use_dynamic_stock_selection and not self.dynamic_stocks_selected:
+            self.select_dynamic_stocks()
+
+        logger.info("Computing 15-minute Initial Balance (09:15 - 10:15) for %d stocks...", len(self.target_stocks))
         now = datetime.now()
         today_start = datetime.combine(self.today, dt_time(9, 15))
 
-        for item in TARGET_STOCKS:
+        for item in self.target_stocks:
             sym = item["symbol"]
-            token = item["token"]
+            token = item.get("token")
+            if not token:
+                continue
             try:
                 candles = self.kite.historical_data(
                     instrument_token=token,
@@ -215,7 +309,7 @@ class ORBDesk:
     # -------------------------------------------------------------------------
     def scan_and_enter_breakouts(self):
         """
-        Scans all 30 stocks at candle completion for valid breakout triggers.
+        Scans target stocks at candle completion for valid breakout triggers.
         Applies:
           - 20% rejection wick filter
           - PDH / PDL clearance filter
@@ -227,7 +321,7 @@ class ORBDesk:
             logger.info("Circuit breaker active. Scanning skipped.")
             return
 
-        total_trades_today = len(self.closed_trades) + len(self.active_positions)
+        total_trades_today = len(self.closed_trades) + len(self.active_positions) + len(self.armed_positions)
         available_slots = self.config.max_trades_per_day - total_trades_today
         if available_slots <= 0:
             logger.info("Daily trade limit reached (%d/%d). No new entries.", total_trades_today, self.config.max_trades_per_day)
@@ -249,12 +343,14 @@ class ORBDesk:
         candidates = []
 
         # Collect current 15-min candles for candidates
-        for item in TARGET_STOCKS:
+        for item in self.target_stocks:
             sym = item["symbol"]
-            token = item["token"]
+            token = item.get("token")
+            if not token:
+                continue
             if sym in self.traded_stocks_today:
                 continue
-            if any(p["symbol"] == sym for p in self.active_positions):
+            if any(p["symbol"] == sym for p in self.active_positions) or any(p["symbol"] == sym for p in self.armed_positions):
                 continue
 
             stk_stat = self.stock_stats.get(sym, {})
@@ -273,10 +369,17 @@ class ORBDesk:
                     to_date=now,
                     interval="15minute"
                 )
-                if len(candles) < 5:  # Needs at least 1 candle past IB
+                # Ensure we evaluate the latest completed 15-minute candle
+                completed_candles = [
+                    c for c in candles
+                    if ((c["date"].replace(tzinfo=None) if hasattr(c["date"], "replace") else c["date"]) + timedelta(minutes=14, seconds=45)) <= now
+                ]
+                if len(completed_candles) >= 5:
+                    latest_candle = completed_candles[-1]
+                elif len(candles) >= 5:
+                    latest_candle = candles[-1]
+                else:
                     continue
-
-                latest_candle = candles[-1]
                 o = float(latest_candle["open"])
                 h = float(latest_candle["high"])
                 l = float(latest_candle["low"])
@@ -324,18 +427,35 @@ class ORBDesk:
                 if risk_per_share <= 0:
                     continue
 
-                # Risk-Parity Sizing: Fixed Rs 2,500
-                qty = max(1, int(self.config.fixed_risk_per_trade / risk_per_share))
+                # Sizing: Risk-Parity (Fixed Rs 2,500) or Lots (2 Lots)
+                lot_size = item.get("lot", 1)
+                if self.config.sizing_mode == "LOTS":
+                    qty = max(1, self.config.lots * lot_size)
+                    half_qty = max(1, (self.config.lots // 2) * lot_size)
+                else:
+                    qty = max(2, int(self.config.fixed_risk_per_trade / risk_per_share))
+                    half_qty = max(1, qty // 2)
+
+                target_1r = _round_to_nse_tick(
+                    entry_trigger + (self.config.target_1_r * risk_per_share)
+                    if direction == "LONG"
+                    else entry_trigger - (self.config.target_1_r * risk_per_share)
+                )
 
                 candidates.append({
                     "symbol": sym,
                     "direction": direction,
                     "entry_trigger": entry_trigger,
+                    "trigger_price": entry_trigger,
                     "initial_sl": initial_sl,
+                    "current_sl": initial_sl,
                     "risk_per_share": risk_per_share,
                     "qty": qty,
+                    "half_quantity": half_qty,
+                    "target_1r": target_1r,
                     "wick_ratio": wick_ratio,
-                    "token": token
+                    "token": token,
+                    "armed_time": datetime.now().strftime("%H:%M:%S")
                 })
 
             except Exception as e:
@@ -351,18 +471,28 @@ class ORBDesk:
         to_execute = candidates[:available_slots]
 
         for cand in to_execute:
-            self._execute_entry(cand)
+            if self.config.use_armed_candle_trigger:
+                self.armed_positions.append(cand)
+                logger.info(
+                    "[STOCK ARMED] %s %s (Trigger: Rs %.2f, SL: Rs %.2f, Qty: %d). Waiting for break of armed candle.",
+                    cand["symbol"], cand["direction"], cand["trigger_price"], cand["initial_sl"], cand["qty"]
+                )
+                self._save_state()
+                self._notify_stock_armed(cand)
+            else:
+                self._execute_entry(cand)
 
-    def _execute_entry(self, cand: Dict[str, Any]):
+    def _execute_entry(self, cand: Dict[str, Any], fill_price: Optional[float] = None):
         sym = cand["symbol"]
         direction = cand["direction"]
         qty = cand["qty"]
-        entry_price = cand["entry_trigger"]
+        entry_price = fill_price or cand.get("trigger_price") or cand["entry_trigger"]
         initial_sl = cand["initial_sl"]
         risk = cand["risk_per_share"]
 
-        target_1r = _round_to_nse_tick(entry_price + risk if direction == "LONG" else entry_price - risk)
-        target_2_5r = _round_to_nse_tick(entry_price + 2.5 * risk if direction == "LONG" else entry_price - 2.5 * risk)
+        target_1r = cand.get("target_1r") or _round_to_nse_tick(
+            entry_price + (self.config.target_1_r * risk) if direction == "LONG" else entry_price - (self.config.target_1_r * risk)
+        )
 
         # Place Entry Order
         order_res = self.om.place_entry(
@@ -371,19 +501,18 @@ class ORBDesk:
             quantity=qty,
             entry_price=entry_price,
             initial_sl=initial_sl,
-            target_2_5r=target_2_5r
+            target_2_5r=0.0
         )
 
         pos_record = {
             "symbol": sym,
             "direction": direction,
             "quantity": qty,
-            "half_quantity": max(1, qty // 2),
+            "half_quantity": cand.get("half_quantity", max(1, qty // 2)),
             "entry_price": entry_price,
             "initial_sl": initial_sl,
             "current_sl": initial_sl,
             "target_1r": target_1r,
-            "target_2_5r": target_2_5r,
             "risk_per_share": risk,
             "half_booked": False,
             "be_moved": False,
@@ -402,28 +531,85 @@ class ORBDesk:
     # -------------------------------------------------------------------------
     def monitor_positions(self, current_time: Optional[dt_time] = None):
         """
-        Monitors active positions against live Kite quotes:
-          - 1:1 trail to Breakeven
-          - 1:2.5 book 50%
+        Monitors active and armed positions against live Kite quotes:
+          - Confirmation breakout triggers on armed setups
+          - Invalidation of armed setups if opposite extreme breached
+          - 1:1 trail to Breakeven + book 50% profit
+          - 1:1.5 book remaining 50%
           - Stop-Loss exit
           - Portfolio Circuit Breaker (-Rs 10,000)
           - EOD 15:15 Square-Off
         """
-        if not self.active_positions:
+        if not self.active_positions and not self.armed_positions:
             return
 
         now = datetime.now()
         check_time = current_time if current_time is not None else now.time()
-        is_eod = (check_time >= dt_time(15, 15))
+        try:
+            h_str, m_str = self.config.eod_squareoff_time.split(":")
+            eod_limit = dt_time(int(h_str), int(m_str))
+        except Exception:
+            eod_limit = dt_time(15, 0)
+        is_eod = (check_time >= eod_limit)
 
-        # Fetch live LTP for all active symbols
-        symbols_to_fetch = [f"NSE:{p['symbol']}" for p in self.active_positions]
+        # Fetch live LTP for all active and armed symbols
+        symbols_to_fetch = list(set(
+            [f"NSE:{p['symbol']}" for p in self.active_positions] +
+            [f"NSE:{p['symbol']}" for p in self.armed_positions]
+        ))
         try:
             quotes = self.kite.ltp(symbols_to_fetch)
         except Exception as e:
-            logger.error("Failed to fetch live quotes for active positions: %s", e)
+            logger.error("Failed to fetch live quotes for positions: %s", e)
             return
 
+        # ---------------------------------------------------------------------
+        # 1. Process Armed Setups (Waiting for break of armed candle)
+        # ---------------------------------------------------------------------
+        remaining_armed = []
+        for armed in list(self.armed_positions):
+            sym = armed["symbol"]
+            kite_key = f"NSE:{sym}"
+            if kite_key not in quotes:
+                remaining_armed.append(armed)
+                continue
+
+            ltp = float(quotes[kite_key]["last_price"])
+            direction = armed["direction"]
+            trigger_p = armed["trigger_price"]
+            sl_p = armed["initial_sl"]
+
+            triggered = False
+            invalidated = False
+
+            if direction == "LONG":
+                if ltp >= trigger_p:
+                    triggered = True
+                elif ltp <= sl_p:
+                    invalidated = True
+            elif direction == "SHORT":
+                if ltp <= trigger_p:
+                    triggered = True
+                elif ltp >= sl_p:
+                    invalidated = True
+
+            if triggered:
+                logger.info("[ARMED TRIGGERED] %s %s broken @ Rs %.2f (Trigger: Rs %.2f)", sym, direction, ltp, trigger_p)
+                self._execute_entry(armed, fill_price=trigger_p)
+            elif invalidated:
+                logger.info(
+                    "[ARMED INVALIDATED] %s %s breached opposite extreme @ Rs %.2f (SL: Rs %.2f). Setup canceled.",
+                    sym, direction, ltp, sl_p
+                )
+                self._notify_armed_invalidated(armed, ltp)
+            else:
+                remaining_armed.append(armed)
+
+        self.armed_positions = remaining_armed
+
+        # ---------------------------------------------------------------------
+        # 2. Process Active Positions
+        # ---------------------------------------------------------------------
         remaining_positions = []
         day_realized_pnl = sum(t.get("realized_pnl_rs", 0.0) for t in self.closed_trades)
         total_unrealized_mtm = 0.0
@@ -440,7 +626,6 @@ class ORBDesk:
             entry_p = pos["entry_price"]
             cur_sl = pos["current_sl"]
             t_1r = pos["target_1r"]
-            t_2_5r = pos["target_2_5r"]
             qty = pos["quantity"]
             half_qty = pos["half_quantity"]
             rem_qty = half_qty if pos["half_booked"] else qty
@@ -453,45 +638,38 @@ class ORBDesk:
             exit_reason = None
             exit_price = ltp
 
-            # 1. Stop-Loss Check
+            # A. Stop-Loss Check (Initial SL or Trailed to Cost/BE)
             if (direction == "LONG" and ltp <= cur_sl) or (direction == "SHORT" and ltp >= cur_sl):
                 pos_closed = True
                 exit_price = cur_sl
                 if pos["half_booked"]:
-                    exit_reason = "TARGET_2.5_THEN_BE"
+                    exit_reason = "TRAIL_TO_COST_EXIT"
                 elif pos["be_moved"]:
                     exit_reason = "BREAKEVEN"
                 else:
                     exit_reason = "STOP_LOSS"
 
-            # 2. Target 1:2.5 Book 50%
-            elif not pos["half_booked"] and ((direction == "LONG" and ltp >= t_2_5r) or (direction == "SHORT" and ltp <= t_2_5r)):
+            # B. Target 1 (1.0 R): Book 50% & Trail SL to Cost / Breakeven
+            elif not pos["half_booked"] and ((direction == "LONG" and ltp >= t_1r) or (direction == "SHORT" and ltp <= t_1r)):
                 pos["half_booked"] = True
-                half_booked_pnl = (t_2_5r - entry_p) * half_qty if direction == "LONG" else (entry_p - t_2_5r) * half_qty
+                pos["be_moved"] = True
+                pos["current_sl"] = entry_p  # Trail SL to Cost
+                half_booked_pnl = (t_1r - entry_p) * half_qty if direction == "LONG" else (entry_p - t_1r) * half_qty
                 pos["half_booked_pnl"] = half_booked_pnl
-                logger.info("50%% Booked at 1:2.5 on %s (+Rs %.2f)", sym, half_booked_pnl)
-                # Place half-position exit
+                logger.info("50%% Booked at Target 1 on %s (+Rs %.2f). SL trailed to Cost (Rs %.2f)", sym, half_booked_pnl, entry_p)
                 self.om.place_exit(
                     symbol=sym,
                     direction=direction,
                     quantity=half_qty,
-                    exit_price=t_2_5r,
-                    reason="TARGET_2.5_BOOK_50%"
+                    exit_price=t_1r,
+                    reason="TARGET_1R_BOOK_50%"
                 )
-                self._notify_target_booked(pos, t_2_5r, half_booked_pnl)
+                self._notify_target_booked(pos, t_1r, half_booked_pnl)
 
-            # 3. 1:1 Trail to Breakeven
-            if not pos["be_moved"] and not pos_closed:
-                if (direction == "LONG" and ltp >= t_1r) or (direction == "SHORT" and ltp <= t_1r):
-                    pos["be_moved"] = True
-                    pos["current_sl"] = entry_p
-                    logger.info("1:1 Reached for %s. Trailing SL moved to BE (Rs %.2f)", sym, entry_p)
-                    self._notify_trail_be(pos)
-
-            # 4. Mandatory EOD 15:15 Square-Off
+            # C. Mandatory 3:00 PM IST Square-Off (Option 3 Canonical Runner Exit)
             if is_eod and not pos_closed:
                 pos_closed = True
-                exit_reason = "TARGET_2.5_THEN_EOD" if pos["half_booked"] else "EOD_SQUAREOFF"
+                exit_reason = "3PM_EXIT_AFTER_T1" if pos["half_booked"] else "3PM_EXIT_NO_T1"
                 exit_price = ltp
 
             if pos_closed:
@@ -583,11 +761,12 @@ class ORBDesk:
     # Rich Telegram Notifications
     # -------------------------------------------------------------------------
     def _notify_desk_started(self):
+        universe_type = "Dynamic F&O" if self.config.use_dynamic_stock_selection else "Static"
         msg = (
             f"🌅 <b>ORB Trading Desk Initialized</b>\n\n"
             f"📅 Date: <b>{self.today}</b>\n"
             f"⚙️ Mode: <b>{self.config.mode} TRADING</b>\n"
-            f"🎯 Universe: <b>{len(TARGET_STOCKS)} High-Beta Stocks</b>\n"
+            f"🎯 Universe: <b>{len(self.target_stocks)} Stocks ({universe_type})</b>\n"
             f"🛡️ Risk / Trade: <b>₹{self.config.fixed_risk_per_trade:,.0f}</b>\n"
             f"🛑 Daily Circuit Breaker: <b>₹{self.config.daily_stop_loss_limit:,.0f}</b>\n"
             f"📊 NIFTY Day Open: <b>{self.nifty_day_open or 'Pending'}</b>\n\n"
@@ -598,9 +777,36 @@ class ORBDesk:
     def _notify_ib_formed(self):
         msg = (
             f"📊 <b>Initial Balance (IB) Established!</b>\n\n"
-            f"Initial 1-hour range (09:15 - 10:15) calculated across 30 stocks.\n"
+            f"Initial 1-hour range (09:15 - 10:15) calculated across {len(self.target_stocks)} stocks.\n"
             f"Scanning for breakouts with <b>20% Wick Filter</b> + <b>PDH/PDL</b> + <b>NIFTY Bias</b>.\n"
             f"Max Available Trades Today: <b>{self.config.max_trades_per_day}</b>"
+        )
+        self.notifier.send_message(msg)
+
+    def _notify_stock_armed(self, cand: Dict[str, Any]):
+        direction_emoji = "🟡"
+        breakout_type = "IB HIGH" if cand["direction"] == "LONG" else "IB LOW"
+        trigger_desc = "above High" if cand["direction"] == "LONG" else "below Low"
+        msg = (
+            f"{direction_emoji} <b>ORB STOCK ARMED ({self.config.mode})</b>\n\n"
+            f"Stock: <b>{cand['symbol']}</b> ({cand['direction']})\n"
+            f"Armed Candle: Closed outside <b>{breakout_type}</b>\n"
+            f"🎯 <b>Entry Trigger</b>: Break {trigger_desc} @ <b>₹{cand['trigger_price']:.2f}</b>\n"
+            f"🛡️ <b>Initial SL</b>: ₹{cand['initial_sl']:.2f} (Risk: ₹{cand['risk_per_share'] * cand['qty']:,.0f})\n"
+            f"Quantity: <b>{cand['qty']} shares</b>\n"
+            f"Target 1 (1.0 R): ₹{cand['target_1r']:.2f} (Book 50% & Trail to Cost)\n"
+            f"Final Exit: 3:00 PM IST (Ride remaining 50%)\n"
+            f"Conviction Wick: <b>{cand.get('wick_pct', cand.get('wick_ratio', 0) * 100):.1f}%</b>\n"
+            f"<i>Waiting for confirmation break of armed candle...</i>"
+        )
+        self.notifier.send_message(msg)
+
+    def _notify_armed_invalidated(self, cand: Dict[str, Any], ltp: float):
+        msg = (
+            f"⚠️ <b>ORB Setup Invalidated: {cand['symbol']}</b>\n\n"
+            f"Direction: <b>{cand['direction']}</b>\n"
+            f"Price breached opposite extreme @ <b>₹{ltp:.2f}</b> before trigger.\n"
+            f"Setup canceled. <b>₹0 lost</b> (false breakout avoided)."
         )
         self.notifier.send_message(msg)
 
@@ -610,10 +816,10 @@ class ORBDesk:
             f"{direction_emoji} <b>ORB BREAKOUT ENTERED ({self.config.mode})</b>\n\n"
             f"Stock: <b>{pos['symbol']}</b> ({pos['direction']})\n"
             f"Quantity: <b>{pos['quantity']} shares</b>\n"
-            f"Entry Trigger: <b>₹{pos['entry_price']:.2f}</b>\n"
+            f"Entry Price: <b>₹{pos['entry_price']:.2f}</b>\n"
             f"Initial Stop Loss: <b>₹{pos['initial_sl']:.2f}</b> (Risk: ₹{pos['risk_per_share'] * pos['quantity']:,.0f})\n"
-            f"🎯 1:1 BE Target: <b>₹{pos['target_1r']:.2f}</b>\n"
-            f"💰 1:2.5 Target: <b>₹{pos['target_2_5r']:.2f}</b>\n"
+            f"🎯 Target 1 (1.0 R): <b>₹{pos['target_1r']:.2f}</b> (Book 50% & Trail to Cost)\n"
+            f"💰 Final Exit: <b>3:00 PM IST</b> (Ride remaining 50%)\n"
             f"Conviction Wick: <b>{pos['wick_pct']:.1f}%</b>\n"
             f"Time: <b>{pos['entry_time']}</b>"
         )
@@ -630,11 +836,11 @@ class ORBDesk:
 
     def _notify_target_booked(self, pos: Dict[str, Any], exit_p: float, booked_pnl: float):
         msg = (
-            f"💰 <b>1:2.5 Target Hit — 50% Profit Booked!</b>\n\n"
+            f"💰 <b>Target 1 Hit — 50% Profit Booked!</b>\n\n"
             f"Stock: <b>{pos['symbol']}</b>\n"
             f"Booked 50% Qty ({pos['half_quantity']} shares) @ <b>₹{exit_p:.2f}</b>\n"
-            f"Realized Gain: <b>+₹{booked_pnl:,.2f} (+1.25 R)</b>\n"
-            f"Remaining 50% trailing with SL at Breakeven until 15:15 EOD."
+            f"Realized Gain: <b>+₹{booked_pnl:,.2f} (+0.5 R)</b>\n"
+            f"SL on remaining 50% trailed to Breakeven (₹{pos['entry_price']:.2f})."
         )
         self.notifier.send_message(msg)
 

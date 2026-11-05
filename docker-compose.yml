@@ -77,9 +77,9 @@ services:
       - ./logs:/app/logs
       - ./.env:/app/.env
     # -----------------------------------------------------------------------------------
-    # Conservative B2 Setup (Paper simulation default):
-    command: ["--paper", "--risk", "2500", "--max-trades", "5", "--daily-loss", "10000", "--poll", "5"]
+    # Option 3 Production Desk (Static 30 Stocks Universe, Rs 2,500 Risk / Trade):
+    # command: ["--paper", "--risk", "2500", "--max-trades", "5", "--daily-loss", "10000", "--poll", "5"]
     # Live Production:
-    # command: ["--live", "--risk", "2500", "--max-trades", "5", "--daily-loss", "10000", "--poll", "5"]
+    command: ["--live", "--risk", "2500", "--max-trades", "5", "--daily-loss", "10000", "--poll", "5"]
     # -----------------------------------------------------------------------------------
 

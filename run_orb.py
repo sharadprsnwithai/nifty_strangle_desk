@@ -37,7 +37,9 @@ def parse_args(args=None):
     mode_group.add_argument("--paper", action="store_true", default=True, help="Run simulated PAPER trading with live Kite data (default)")
     mode_group.add_argument("--live", action="store_true", help="Execute real LIVE orders via Kite Connect")
 
-    parser.add_argument("--risk", type=float, default=2500.0, help="Fixed Rupee Risk per trade (default: 2500.0)")
+    parser.add_argument("--risk", type=float, default=2500.0, help="Fixed Rupee Risk per trade in FIXED_RISK mode (default: 2500.0)")
+    parser.add_argument("--sizing-mode", choices=["FIXED_RISK", "LOTS"], default="FIXED_RISK", help="Position sizing mode (default: FIXED_RISK)")
+    parser.add_argument("--lots", type=int, default=2, help="Number of futures lots to trade if sizing-mode is LOTS (default: 2)")
     parser.add_argument("--max-trades", type=int, default=5, help="Maximum trades per day (default: 5)")
     parser.add_argument("--daily-loss", type=float, default=10000.0, help="Daily Portfolio Circuit Breaker Loss limit (default: 10000.0)")
     parser.add_argument("--poll", type=int, default=5, help="Monitoring polling interval in seconds (default: 5)")
@@ -45,6 +47,10 @@ def parse_args(args=None):
     parser.add_argument("--exchange", choices=["NSE", "NFO"], default="NSE", help="Exchange segment (default: NSE)")
     parser.add_argument("--dry-run", action="store_true", help="Initialize desk, verify Kite and Telegram, and display setup status without looping")
     parser.add_argument("--once", action="store_true", help="Run single scan/monitor cycle and exit")
+    parser.add_argument("--dynamic-stocks", action="store_true", help="Enable dynamic F&O screening (default: False, runs Static 30 stocks universe)")
+    parser.add_argument("--top-gainers", type=int, default=3, help="Number of Top Gainers to screen if dynamic enabled (default: 3)")
+    parser.add_argument("--top-losers", type=int, default=3, help="Number of Top Losers to screen if dynamic enabled (default: 3)")
+    parser.add_argument("--no-coiling", action="store_true", help="Disable 3-day contraction / coiling pattern filter")
 
     return parser.parse_args(args)
 
@@ -55,7 +61,7 @@ def main(args=None):
 
     logger.info("=" * 75)
     logger.info("  STARTING SHARAD'S 15-MINUTE ORB TRADING DESK [%s MODE]", mode)
-    logger.info("  Strategy: Indrajit Shantharaj 15m ORB + 20%% Rejection Wick Filter")
+    logger.info("  Strategy: Option 3 Canonical ORB Desk (Armed Candle Confirmation Break)")
     logger.info("  Risk Guardrails: Fixed Rs %.0f Risk | Max %d Trades/Day | Rs %.0f Daily SL", parsed.risk, parsed.max_trades, parsed.daily_loss)
     logger.info("  Universe: %d Stocks | Sizing: Risk Parity Equity MIS", len(TARGET_STOCKS))
     logger.info("=" * 75)
@@ -66,12 +72,18 @@ def main(args=None):
 
     orb_cfg = ORBConfig(
         fixed_risk_per_trade=parsed.risk,
+        sizing_mode=parsed.sizing_mode,
+        lots=parsed.lots,
         max_trades_per_day=parsed.max_trades,
         daily_stop_loss_limit=parsed.daily_loss,
         mode=mode,
         product=parsed.product,
         exchange=parsed.exchange,
-        poll_interval_seconds=parsed.poll
+        poll_interval_seconds=parsed.poll,
+        use_dynamic_stock_selection=parsed.dynamic_stocks,
+        top_gainers_n=parsed.top_gainers,
+        top_losers_n=parsed.top_losers,
+        enable_coiling_filter=not parsed.no_coiling
     )
 
     om = ORBOrderManager(
@@ -94,7 +106,17 @@ def main(args=None):
     if parsed.dry_run:
         logger.info("[DRY RUN] Initialized successfully. Inspecting status:")
         logger.info("  NIFTY 50 Day Open : %s", desk.nifty_day_open)
-        logger.info("  Stocks Tracked    : %d", len(desk.stock_stats))
+        logger.info("  Stock Selection   : %s", "Dynamic F&O" if orb_cfg.use_dynamic_stock_selection else "Static")
+        logger.info("  Target Universe   : %d stocks", len(desk.target_stocks))
+        for item in desk.target_stocks:
+            sym = item["symbol"]
+            stat = desk.stock_stats.get(sym, {})
+            reasons = "+".join(item.get("reasons", [])) or "STATIC"
+            pct_str = f"{item['pct_change']:+.2f}%" if item.get("pct_change") is not None else "N/A"
+            logger.info(
+                "    -> %-12s | Reasons: %-22s | Day Chg: %-8s | PDH: %s | PDL: %s",
+                sym, reasons, pct_str, stat.get("pdh"), stat.get("pdl")
+            )
         logger.info("  Active Positions  : %d", len(desk.active_positions))
         logger.info("  Closed Trades     : %d", len(desk.closed_trades))
         logger.info("  Circuit Breaker   : %s", "TRIPPED" if desk.circuit_tripped else "NORMAL")
@@ -111,7 +133,7 @@ def main(args=None):
 
     # Main Automated Trading Loop
     logger.info("Entering live automated market loop (Polling every %d seconds)...", parsed.poll)
-    last_scan_time = None
+    last_scan_slot = None
 
     try:
         while True:
@@ -129,11 +151,11 @@ def main(args=None):
                 desk.compute_initial_balance()
 
             # Step 2: Scan for breakouts on 15-minute candle completion (10:15 to 13:15)
-            # Scan at minute :00, :15, :30, :45
-            is_candle_close = now.minute in [0, 15, 30, 45] and now.second < 15
+            # 15-min candles complete at :00, :15, :30, :45
+            slot_key = (now.date(), now.hour, now.minute // 15)
             if desk.ib_formed and current_time <= dt_time(13, 15):
-                if is_candle_close and (last_scan_time != now.minute):
-                    last_scan_time = now.minute
+                if (now.minute in [0, 15, 30, 45]) and (last_scan_slot != slot_key):
+                    last_scan_slot = slot_key
                     logger.info("15-minute candle closed at %s. Scanning for breakouts...", now.strftime("%H:%M:%S"))
                     desk.scan_and_enter_breakouts()
 

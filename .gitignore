@@ -12,4 +12,5 @@ data/*.json
 data/*.parquet
 data/*.csv
 data/cache_15m/
+data/cache_15m_fno/
 !data/.gitkeep
