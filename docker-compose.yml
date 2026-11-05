@@ -77,9 +77,10 @@ services:
       - ./logs:/app/logs
       - ./.env:/app/.env
     # -----------------------------------------------------------------------------------
-    # Option 3 Production Desk (Static 30 Stocks Universe, Rs 2,500 Risk / Trade):
-    # command: ["--paper", "--risk", "2500", "--max-trades", "5", "--daily-loss", "10000", "--poll", "5"]
-    # Live Production:
-    command: ["--live", "--risk", "2500", "--max-trades", "5", "--daily-loss", "10000", "--poll", "5"]
+    # Option 3 Desk (Static 30 Stocks Universe, 2 Lots Sizing):
+    # Paper Trading Mode (Simulated Execution with Live Market Feeds):
+    command: ["--paper", "--sizing-mode", "LOTS", "--lots", "2", "--max-trades", "5", "--daily-loss", "50000", "--poll", "5"]
+    #
+    # Live Production Mode (Real Broker Order Execution):
+    # command: ["--live", "--sizing-mode", "LOTS", "--lots", "2", "--max-trades", "5", "--daily-loss", "50000", "--poll", "5"]
     # -----------------------------------------------------------------------------------
-
