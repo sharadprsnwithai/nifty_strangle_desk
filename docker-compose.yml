@@ -32,31 +32,29 @@ services:
     # command: ["--paper", "--lots", "10", "--poll", "5"]
     # -----------------------------------------------------------------------------------
 
-  positional-condor-desk:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: nifty_positional_condor
-    image: ${DOCKER_USER:-sharadprsn}/nifty_strangle_desk:latest
-    restart: unless-stopped
-    entrypoint: ["python", "run_positional_condor.py"]
-    env_file:
-      - .env
-    environment:
-      - TZ=Asia/Kolkata
-      - PYTHONUNBUFFERED=1
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./.env:/app/.env
-    # -----------------------------------------------------------------------------------
-    # Positional Condor Automated Daemon (Runs continuous 15:20 IST daily scheduler):
-    # Paper Simulation:
-    # command: ["--paper", "--lots", "1", "--monthly-stop-loss", "0.03", "--monthly-target", "0.04", "--schedule-time", "15:20"]
-    # Live Production:
-    command: ["--live", "--lots", "1", "--monthly-stop-loss", "0.03", "--monthly-target", "0.04", "--schedule-time", "15:20"]
-    # -----------------------------------------------------------------------------------
+  # ===================================================================================
+  # POSITIONAL CONDOR STRATEGY - DISABLED
+  # ===================================================================================
+  # positional-condor-desk:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: nifty_positional_condor
+  #   image: ${DOCKER_USER:-sharadprsn}/nifty_strangle_desk:latest
+  #   restart: unless-stopped
+  #   entrypoint: ["python", "run_positional_condor.py"]
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - TZ=Asia/Kolkata
+  #     - PYTHONUNBUFFERED=1
+  #     - LOG_LEVEL=${LOG_LEVEL:-INFO}
+  #   volumes:
+  #     - ./data:/app/data
+  #     - ./logs:/app/logs
+  #     - ./.env:/app/.env
+  #   command: ["--live", "--lots", "1", "--monthly-stop-loss", "0.03", "--monthly-target", "0.04", "--schedule-time", "15:20"]
+  # ===================================================================================
 
   orb-desk:
     build:

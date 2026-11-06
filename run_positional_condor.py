@@ -4,6 +4,7 @@ import argparse
 import logging
 from datetime import datetime, date
 from pathlib import Path
+from dotenv import load_dotenv
 from config import load_config
 from kite import get_kite_client
 from strategy.order_manager import OrderManager
@@ -34,8 +35,8 @@ def run_positional_cli(args=None) -> int:
     mode_group.add_argument("--paper", action="store_true", help="Run simulated PAPER trading (default)")
     parser.add_argument("--lots", type=int, default=1, help="Number of lots (default: 1)")
     parser.add_argument("--capital-per-lot", type=float, default=100000.0, help="Capital allocated per lot in Rs (default: 100000.0)")
-    parser.add_argument("--monthly-stop-loss", type=float, default=0.03, help="Monthly stop loss percentage (default: 0.03 / 3%%)")
-    parser.add_argument("--monthly-target", type=float, default=0.04, help="Monthly target profit percentage (default: 0.04 / 4%%)")
+    parser.add_argument("--monthly-stop-loss", type=float, default=0.03, help="Monthly stop loss percentage (default: 0.03 / 3%)")
+    parser.add_argument("--monthly-target", type=float, default=0.04, help="Monthly target profit percentage (default: 0.04 / 4%)")
     parser.add_argument("--schedule-time", type=str, default="15:20", help="Daily execution time in IST (default: 15:20)")
     parser.add_argument("--dry-run", action="store_true", help="Perform single strike and regime lookup and print plan without submitting orders")
     parser.add_argument("--once", action="store_true", help="Run single daily evaluation pass and exit (default runs automated daemon)")
@@ -46,9 +47,21 @@ def run_positional_cli(args=None) -> int:
     parser.add_argument("--log-dir", type=str, default=os.getenv("LOG_DIR", "logs"), help="Directory for host log files (default: logs)")
     parser.add_argument("--state-file", type=str, default=os.getenv("POSITIONAL_STATE_FILE"), help="Path to state JSON file")
     parser.add_argument("--data-dir", type=str, default=os.getenv("DATA_DIR"), help="Directory for state data files (default: data)")
+    parser.add_argument("--disabled", action="store_true", default=False, help="Disable positional condor desk execution")
 
     parsed = parser.parse_args(args)
     setup_logging(log_dir=parsed.log_dir, log_level=parsed.log_level, log_filename="positional_condor.log")
+
+    # Outside test suite, inspect DISABLE_POSITIONAL_STRATEGY in environment and .env
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
+        if parsed.disabled or os.getenv("DISABLE_POSITIONAL_STRATEGY", "false").lower() in ("true", "1", "yes"):
+            logger.warning("NIFTY Positional Evergreen Condor Desk is DISABLED (DISABLE_POSITIONAL_STRATEGY=true). Exiting safely.")
+            print("\n[!] NIFTY Positional Evergreen Condor Desk is currently DISABLED. Exiting safely.\n")
+            return 0
+    elif parsed.disabled:
+        return 0
+
     mode = "LIVE" if parsed.live else "PAPER"
 
     logger.info("Initializing NIFTY Positional Evergreen Condor Desk in [%s] mode...", mode)
