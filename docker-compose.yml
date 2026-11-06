@@ -75,10 +75,16 @@ services:
       - ./logs:/app/logs
       - ./.env:/app/.env
     # -----------------------------------------------------------------------------------
-    # Option 3 Desk (Static 30 Stocks Universe, 2 Lots Sizing, Marketable LIMIT Execution):
-    # Paper Trading Mode (Simulated Execution with Live Market Feeds):
-    command: ["--paper", "--sizing-mode", "LOTS", "--lots", "2", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--max-trades", "5", "--daily-loss", "50000", "--poll", "5"]
+    # Option 3 Desk (Static 30 Stocks Universe, Minimum Drawdown Risk-Parity Configuration):
+    # - Risk Parity: Fixed Rs 2,500 risk per trade (Quantity = int(2500 / SL_distance))
+    # - Portfolio Circuit Breaker: Hard halt at -Rs 10,000 daily loss
+    # - Max Trades Cap: 5 trades per day
+    # - Trade Lifecycle: 1:1 R target (50% profit booked, SL to Cost), 3:00 PM runner exit
+    # - Marketable LIMIT execution with 0.2% price buffer
     #
-    # Live Production Mode (Real Broker Order Execution):
-    # command: ["--live", "--sizing-mode", "LOTS", "--lots", "2", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--max-trades", "5", "--daily-loss", "50000", "--poll", "5"]
+    # 1. Paper Trading Mode (Simulated Execution + Full Telegram Alerts):
+    command: ["--paper", "--sizing-mode", "FIXED_RISK", "--risk", "2500", "--daily-loss", "10000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
+    #
+    # 2. Live Production Mode (Real Broker Order Execution via Kite Connect API + Telegram Alerts):
+    # command: ["--live", "--sizing-mode", "FIXED_RISK", "--risk", "2500", "--daily-loss", "10000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
     # -----------------------------------------------------------------------------------
