@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 *.log
 logs/*.log
+logs/*.log*
 !logs/.gitkeep
 .superpowers/
 data/*.json

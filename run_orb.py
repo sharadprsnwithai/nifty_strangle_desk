@@ -21,13 +21,9 @@ if hasattr(sys.stderr, "reconfigure"):
 from config import load_config
 from kite import get_kite_client
 from notifications.telegram import TelegramNotifier
+from strategy.logger import setup_logging
 from strategy.orb_desk import ORBConfig, ORBOrderManager, ORBDesk, TARGET_STOCKS
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
-    datefmt="%H:%M:%S"
-)
 logger = logging.getLogger("run_orb")
 
 
@@ -49,12 +45,15 @@ def parse_args(args=None):
     parser.add_argument("--exchange", choices=["NSE", "NFO"], default="NSE", help="Exchange segment (default: NSE)")
     parser.add_argument("--dry-run", action="store_true", help="Initialize desk, verify Kite and Telegram, and display setup status without looping")
     parser.add_argument("--once", action="store_true", help="Run single scan/monitor cycle and exit")
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default=os.getenv("LOG_LEVEL", "INFO"), help="Logging verbosity level (default: INFO)")
+    parser.add_argument("--log-dir", type=str, default=os.getenv("LOG_DIR", "logs"), help="Directory for host log files (default: logs)")
 
     return parser.parse_args(args)
 
 
 def main(args=None):
     parsed = parse_args(args)
+    setup_logging(log_dir=parsed.log_dir, log_level=parsed.log_level, log_filename="orb_desk.log")
     mode = "LIVE" if parsed.live else "PAPER"
 
     logger.info("=" * 75)
