@@ -10,6 +10,7 @@ from kiteconnect import KiteConnect
 
 from strategy.orb_desk.config import ORBConfig, TARGET_STOCKS, NIFTY_TOKEN, NIFTY_SYMBOL
 from strategy.orb_desk.order_manager import ORBOrderManager, _round_to_nse_tick
+from strategy.fo_ban import get_nse_fo_ban_list, filter_banned_stocks
 from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger("orb.desk")
@@ -53,6 +54,7 @@ class ORBDesk:
 
         # Target universe: Static 30 Stocks
         self.target_stocks: List[Dict[str, Any]] = list(TARGET_STOCKS)
+        self.banned_stocks_today: List[str] = []
 
         self._load_state()
 
@@ -70,7 +72,8 @@ class ORBDesk:
             "armed_positions": self.armed_positions,
             "closed_trades": self.closed_trades,
             "stock_stats": self.stock_stats,
-            "target_stocks": self.target_stocks
+            "target_stocks": self.target_stocks,
+            "banned_stocks_today": self.banned_stocks_today
         }
         try:
             with open(self.state_file, "w") as f:
@@ -94,12 +97,14 @@ class ORBDesk:
                 self.closed_trades = data.get("closed_trades", [])
                 self.stock_stats = data.get("stock_stats", {})
                 self.target_stocks = data.get("target_stocks", list(TARGET_STOCKS))
+                self.banned_stocks_today = data.get("banned_stocks_today", [])
                 logger.info(
-                    "Restored daily state for %s: %d active, %d closed trades, %d target stocks.",
+                    "Restored daily state for %s: %d active, %d closed trades, %d target stocks, %d banned.",
                     self.today,
                     len(self.active_positions),
                     len(self.closed_trades),
-                    len(self.target_stocks)
+                    len(self.target_stocks),
+                    len(self.banned_stocks_today)
                 )
         except Exception as e:
             logger.warning("Could not read previous ORB state file: %s", e)
@@ -179,14 +184,29 @@ class ORBDesk:
         self.armed_positions = []
         self.closed_trades = []
         self.stock_stats = {}
+        self.banned_stocks_today = []
         self.initialize_day(force=True)
 
     def initialize_day(self, force: bool = False):
         """
-        Fetches Previous Day High (PDH) and Previous Day Low (PDL) for the 30 target stocks,
-        and retrieves NIFTY 50 Day Open.
+        Filters out any F&O banned stocks, fetches Previous Day High (PDH) and 
+        Previous Day Low (PDL) for active universe stocks, and retrieves NIFTY 50 Day Open.
         """
         logger.info("Initializing ORB Desk for %s (Static 30 Stocks)...", self.today)
+
+        # Apply NSE F&O Ban Filter
+        check_d = datetime.strptime(self.today, "%Y-%m-%d").date() if isinstance(self.today, str) else self.today
+        banned_set = get_nse_fo_ban_list(check_date=check_d)
+        allowed, excluded = filter_banned_stocks(TARGET_STOCKS, banned_set)
+        self.target_stocks = allowed
+        self.banned_stocks_today = excluded
+        if excluded:
+            logger.warning(
+                "F&O Ban Filter: Excluded %d stocks from trading universe today (%s). Active universe: %d stocks.",
+                len(excluded), ", ".join(excluded), len(self.target_stocks)
+            )
+        else:
+            logger.info("F&O Ban Filter: All %d universe stocks cleared (0 in ban list).", len(self.target_stocks))
 
         # Check NIFTY 50 Day Open
         try:
