@@ -1,18 +1,31 @@
+import os
 import json
 import logging
 import time
-from datetime import datetime, time as dt_time
+import tempfile
+from datetime import date, datetime, time as dt_time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from kiteconnect import KiteConnect
 from strategy.order_manager import OrderManager
-from strategy.option_chain import find_strangle_strikes
+from strategy.option_chain import find_strangle_strikes, resolve_target_expiry, _normalize_date
 from strategy.holidays import is_trading_holiday
 from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger("strategy.desk")
 
-DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "trades_today.json"
+
+def get_default_strangle_state_file() -> Path:
+    env_file = os.getenv("STRANGLE_STATE_FILE")
+    if env_file:
+        return Path(env_file).resolve()
+    data_dir = os.getenv("DATA_DIR")
+    if data_dir:
+        return Path(data_dir).resolve() / "trades_today.json"
+    return Path(__file__).resolve().parent.parent / "data" / "trades_today.json"
+
+
+DEFAULT_STATE_FILE = get_default_strangle_state_file()
 
 
 class StrangleDesk:
@@ -25,31 +38,63 @@ class StrangleDesk:
         notifier: Optional[TelegramNotifier] = None
     ):
         self.order_manager = order_manager
-        self.state_file = state_file or DEFAULT_STATE_FILE
+        self.state_file = Path(state_file).resolve() if state_file else get_default_strangle_state_file()
         self.notifier = notifier
         self.state: Optional[Dict[str, Any]] = None
 
+    def _get_fallback_file(self) -> Path:
+        fallback_dir = Path(tempfile.gettempdir()) / "trading_state"
+        return fallback_dir / self.state_file.name
+
     def save_state(self, state: Dict[str, Any]) -> None:
+        """Atomically saves strangle state to disk with fallback resilience against filesystem/mount errors."""
         self.state = state
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        temp_file = self.state_file.with_suffix(".tmp")
-        temp_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        temp_file.replace(self.state_file)
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_file = self.state_file.with_suffix(".tmp")
+            temp_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            temp_file.replace(self.state_file)
+        except Exception as e:
+            logger.error("Primary state save failed at %s (%s). Attempting fallback...", self.state_file, e)
+            try:
+                fallback_file = self._get_fallback_file()
+                fallback_file.parent.mkdir(parents=True, exist_ok=True)
+                temp_fallback = fallback_file.with_suffix(".tmp")
+                temp_fallback.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                temp_fallback.replace(fallback_file)
+                logger.warning("Strangle state saved to fallback path: %s", fallback_file)
+                if self.notifier:
+                    self.notifier.send_message(
+                        f"⚠️ <b>State Warning</b>: Primary state save failed at <code>{self.state_file}</code> ({e}). "
+                        f"State saved to fallback <code>{fallback_file}</code>."
+                    )
+            except Exception as fb_err:
+                logger.critical("All state save attempts failed: %s (Fallback error: %s). Preserving state in memory.", e, fb_err)
 
     def load_state(self) -> Optional[Dict[str, Any]]:
-        if not self.state_file.exists():
-            return None
+        target_file = self.state_file
+        if not target_file.exists():
+            fallback_file = self._get_fallback_file()
+            if fallback_file.exists():
+                logger.info("Primary state file not found; loading from fallback: %s", fallback_file)
+                target_file = fallback_file
+            else:
+                return None
         try:
-            content = self.state_file.read_text(encoding="utf-8")
+            content = target_file.read_text(encoding="utf-8")
             self.state = json.loads(content)
             return self.state
         except Exception as e:
-            logger.error("Failed to load state from %s: %s", self.state_file, e)
+            logger.error("Failed to load state from %s: %s", target_file, e)
             return None
 
     def clear_state(self) -> None:
-        if self.state_file.exists():
-            self.state_file.unlink()
+        for f in (self.state_file, self._get_fallback_file()):
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception as e:
+                    logger.warning("Could not delete state file %s: %s", f, e)
         self.state = None
 
     @staticmethod
@@ -75,6 +120,44 @@ class StrangleDesk:
         elif isinstance(data, (int, float)):
             return float(data)
         return default
+
+    def _safe_exit_leg(
+        self,
+        leg_name: str,
+        symbol: str,
+        qty: int,
+        exit_price: float,
+        reason: str,
+        order_type: str,
+        limit_buffer_pct: float,
+        state: Dict[str, Any]
+    ) -> bool:
+        """
+        Safely executes buy_to_cover for a single strangle leg.
+        Catches broker exceptions, logs errors, alerts Telegram, and prevents loop crashes.
+        """
+        try:
+            leg_product = (
+                state.get(leg_name, {}).get("product")
+                or state.get("product")
+                or getattr(self.order_manager, "product", "MIS")
+            )
+            self.order_manager.buy_to_cover(
+                symbol, qty, exit_price, reason=reason, order_type=order_type, buffer_pct=limit_buffer_pct,
+                product=leg_product
+            )
+            state[leg_name]["status"] = "CLOSED"
+            state[leg_name]["exit_price"] = exit_price
+            state[leg_name]["exit_reason"] = reason
+            self.save_state(state)
+            return True
+        except Exception as e:
+            logger.error("Failed to execute %s exit for %s (%s): %s", reason, leg_name.upper(), symbol, e)
+            if self.notifier:
+                self.notifier.send_message(
+                    f"🚨 <b>Order Exit Failed</b>: Failed to exit {leg_name.upper()} <code>{symbol}</code> ({reason}): {e}"
+                )
+            return False
 
     def wait_for_orders_completion(
         self,
@@ -132,6 +215,231 @@ class StrangleDesk:
         )
         return res.get(order_id, {})
 
+    def _ensure_kite_session(self, kite: Optional[Any] = None, force_login: bool = False) -> Any:
+        """
+        Validates that the provided KiteConnect client has a live, valid session.
+        If the access token has expired or is invalidated, triggers automated TOTP re-authentication.
+        """
+        if kite is None:
+            kite = getattr(self.order_manager, "kite", None)
+
+        if not force_login and kite is not None:
+            try:
+                kite.profile()
+                return kite
+            except Exception as e:
+                err_str = str(e).lower()
+                if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+                    logger.warning("Kite session token is expired or invalidated (%s). Initiating TOTP re-authentication...", e)
+                else:
+                    logger.warning("Kite profile check encountered unexpected error (%s). Proceeding to re-authenticate...", e)
+
+        logger.info("Refreshing Kite session via automated TOTP login...")
+        from kite.client import get_kite_client
+        new_kite = get_kite_client(force_login=True)
+        if hasattr(self.order_manager, "kite") and self.order_manager.kite is not None:
+            self.order_manager.kite = new_kite
+        return new_kite
+
+    def perform_daily_morning_login(self, kite: Optional[Any] = None) -> Any:
+        """
+        Executes an automated headless TOTP login to obtain a fresh daily Zerodha Kite access token.
+        Saves the token to .env, updates the OrderManager client, and notifies via Telegram.
+        """
+        logger.info("Executing daily morning TOTP login (08:00 AM IST schedule)...")
+        from kite.client import get_kite_client
+        new_kite = get_kite_client(force_login=True)
+        if hasattr(self.order_manager, "kite"):
+            self.order_manager.kite = new_kite
+
+        user_desc = "Zerodha Account"
+        try:
+            profile = new_kite.profile()
+            user_desc = f"{profile.get('user_name', 'Trader')} ({profile.get('user_id')})"
+            logger.info("Daily morning TOTP login successful for %s.", user_desc)
+        except Exception as e:
+            logger.warning("Could not fetch profile after morning login: %s", e)
+
+        # Morning login notification removed per policy (alerts only on entry, exit, sl)
+        return new_kite
+
+    def reconcile_with_broker(
+        self,
+        kite: Optional[KiteConnect] = None,
+        state: Optional[Dict[str, Any]] = None,
+        target_expiry: Optional[date] = None,
+        underlying: str = "NIFTY"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Reconciles local trade state with actual open net positions on Zerodha Kite.
+        - If state records an active strangle but both legs are closed on Kite,
+          marks the session COMPLETED locally.
+        - If state has an active strangle and one leg is closed, updates that leg to CLOSED.
+        - If state is None (or IDLE) but open short NIFTY CE & PE options matching target weekly expiry
+          exist on Kite, reconstructs and adopts them into state (including exact entry prices, product,
+          +50% SL, and 80% decay targets).
+        """
+        if kite is None:
+            kite = getattr(self.order_manager, "kite", None)
+        if kite is None:
+            return state
+
+        if state is None:
+            state = self.load_state()
+
+        try:
+            raw_pos = kite.positions()
+            net_positions = raw_pos.get("net", []) if isinstance(raw_pos, dict) else []
+            net_map = {
+                p.get("tradingsymbol", ""): p
+                for p in net_positions
+                if p.get("exchange") == "NFO"
+            }
+
+            today_str = datetime.now().strftime("%Y-%m-%d")
+
+            # 1. Existing open trade: check if broker has closed legs
+            if state is not None and state.get("date") == today_str and state.get("status") == "OPEN":
+                ce_sym = state.get("ce", {}).get("symbol")
+                pe_sym = state.get("pe", {}).get("symbol")
+                ce_qty = net_map.get(ce_sym, {}).get("quantity", 0)
+                pe_qty = net_map.get(pe_sym, {}).get("quantity", 0)
+
+                ce_closed = (ce_qty == 0)
+                pe_closed = (pe_qty == 0)
+
+                changed = False
+                if ce_closed and state.get("ce", {}).get("status") == "OPEN":
+                    state["ce"]["status"] = "CLOSED"
+                    state["ce"]["exit_reason"] = "BROKER_RECONCILED"
+                    changed = True
+                    logger.info("Reconciliation: CE leg %s is flat on Kite. Marked CLOSED.", ce_sym)
+
+                if pe_closed and state.get("pe", {}).get("status") == "OPEN":
+                    state["pe"]["status"] = "CLOSED"
+                    state["pe"]["exit_reason"] = "BROKER_RECONCILED"
+                    changed = True
+                    logger.info("Reconciliation: PE leg %s is flat on Kite. Marked CLOSED.", pe_sym)
+
+                if ce_closed and pe_closed:
+                    state["status"] = "COMPLETED"
+                    changed = True
+                    logger.warning("Reconciliation: Both strangle legs are closed on Kite. Synchronizing local state to COMPLETED.")
+
+                if changed:
+                    self.save_state(state)
+                return state
+
+            # 2. No active trade locally: check if broker has open short strangle positions
+            if state is None or state.get("status") not in ("OPEN", "COMPLETED", "ABORTED"):
+                # Short-circuit: If broker has no short NFO positions at all, avoid fetching instruments
+                has_candidate_positions = any(
+                    p.get("exchange") == "NFO" and int(p.get("quantity", 0)) < 0
+                    for p in net_positions
+                )
+                if not has_candidate_positions:
+                    return state
+
+                # Fetch instruments to identify target expiry
+                instruments = kite.instruments("NFO")
+                if target_expiry is None:
+                    target_expiry = resolve_target_expiry(instruments, underlying=underlying)
+
+                # Filter contracts matching underlying and target weekly expiry
+                inst_map = {
+                    i["tradingsymbol"]: i
+                    for i in instruments
+                    if i.get("name") == underlying
+                    and _normalize_date(i.get("expiry")) == target_expiry
+                }
+
+                open_ce = []
+                open_pe = []
+
+                for p in net_positions:
+                    sym = p.get("tradingsymbol", "")
+                    qty = p.get("quantity", 0)
+                    if p.get("exchange") == "NFO" and sym in inst_map and qty < 0:
+                        inst = inst_map[sym]
+                        itype = inst.get("instrument_type")
+                        leg_info = {
+                            "symbol": sym,
+                            "strike": float(inst.get("strike", 0.0)),
+                            "quantity": abs(qty),
+                            "product": p.get("product", "MIS"),
+                            "entry_price": float(p.get("average_price") or p.get("sell_price") or 0.0),
+                            "lot_size": int(inst.get("lot_size", 65))
+                        }
+                        if itype == "CE":
+                            open_ce.append(leg_info)
+                        elif itype == "PE":
+                            open_pe.append(leg_info)
+
+                if open_ce and open_pe:
+                    ce_leg = open_ce[0]
+                    pe_leg = open_pe[0]
+                    qty = min(ce_leg["quantity"], pe_leg["quantity"])
+                    lot_size = ce_leg["lot_size"]
+                    total_lots = qty // lot_size
+
+                    ce_entry = ce_leg["entry_price"]
+                    pe_entry = pe_leg["entry_price"]
+
+                    ce_sl = round(ce_entry * 1.50, 2)
+                    ce_tgt = round(ce_entry * 0.20, 2)
+                    pe_sl = round(pe_entry * 1.50, 2)
+                    pe_tgt = round(pe_entry * 0.20, 2)
+
+                    logger.info(
+                        "Reconciliation: Found open broker strangle positions on Kite: "
+                        "CE %s x %d @ Rs %.2f [%s] (SL: %.2f, Tgt: %.2f), "
+                        "PE %s x %d @ Rs %.2f [%s] (SL: %.2f, Tgt: %.2f). Adopting into active state.",
+                        ce_leg["symbol"], qty, ce_entry, ce_leg["product"], ce_sl, ce_tgt,
+                        pe_leg["symbol"], qty, pe_entry, pe_leg["product"], pe_sl, pe_tgt
+                    )
+
+                    state = {
+                        "status": "OPEN",
+                        "date": today_str,
+                        "underlying": underlying,
+                        "expiry": str(target_expiry),
+                        "lots": total_lots,
+                        "quantity": qty,
+                        "product": ce_leg["product"],
+                        "ce": {
+                            "symbol": ce_leg["symbol"],
+                            "strike": ce_leg["strike"],
+                            "entry_price": ce_entry,
+                            "sl_price": ce_sl,
+                            "target_price": ce_tgt,
+                            "status": "OPEN",
+                            "product": ce_leg["product"],
+                            "order_id": None,
+                            "exit_price": None,
+                            "exit_reason": None
+                        },
+                        "pe": {
+                            "symbol": pe_leg["symbol"],
+                            "strike": pe_leg["strike"],
+                            "entry_price": pe_entry,
+                            "sl_price": pe_sl,
+                            "target_price": pe_tgt,
+                            "status": "OPEN",
+                            "product": pe_leg["product"],
+                            "order_id": None,
+                            "exit_price": None,
+                            "exit_reason": None
+                        }
+                    }
+                    self.save_state(state)
+
+                    pass  # Reconciliation alert removed per policy (alerts only on entry, exit, sl)
+
+            return state
+        except Exception as e:
+            logger.warning("Broker position reconciliation failed: %s", e)
+            return state
+
     def run_session(
         self,
         underlying: str = "NIFTY",
@@ -140,11 +448,12 @@ class StrangleDesk:
         dry_run: bool = False,
         execute_once: bool = False,
         kite: Optional[KiteConnect] = None,
-        max_loss_per_leg: float = 10000.0,
+        strategy_max_loss: Optional[float] = 10000.0,
         order_type: str = "LIMIT",
         limit_buffer_pct: float = 0.05,
         ignore_holidays: bool = False,
-        order_timeout: int = 300
+        order_timeout: int = 300,
+        check_market_hours: bool = False
     ) -> Optional[Dict[str, Any]]:
         """
         Executes and monitors the 10:00 AM Short Strangle intraday session.
@@ -155,9 +464,21 @@ class StrangleDesk:
             is_holiday, reason = is_trading_holiday()
             if is_holiday:
                 logger.info("Exchange is closed today (%s). Skipping session.", reason)
-                if self.notifier:
-                    self.notifier.send_message(f"⏸ <b>Strangle Desk</b>: Exchange closed today ({reason}). Skipping session.")
+                # Exchange closed notification removed per policy
                 return {"status": "HOLIDAY", "reason": reason}
+
+        # Market Hours Validation (prevent placing regular orders outside NSE trading hours)
+        mode = getattr(self.order_manager, "mode", "PAPER")
+        now_time = datetime.now().time()
+        if mode == "LIVE" and not dry_run and not ignore_holidays and check_market_hours:
+            if now_time < dt_time(9, 15) or now_time > dt_time(15, 30):
+                err_msg = (
+                    f"Cannot execute LIVE strangle orders: NSE market is closed. "
+                    f"Current time: {now_time.strftime('%H:%M:%S')} IST. Regular trading hours are 09:15 - 15:30 IST."
+                )
+                logger.warning(err_msg)
+                # Market closed warning removed per policy
+                return {"status": "MARKET_CLOSED", "reason": err_msg}
 
         state = self.load_state()
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -174,12 +495,28 @@ class StrangleDesk:
         if kite is None:
             kite = getattr(self.order_manager, "kite", None)
 
+        if not dry_run and kite is not None:
+            kite = self._ensure_kite_session(kite)
+            state = self.reconcile_with_broker(kite, state, underlying=underlying)
+
         if state is None:
             if kite is None:
                 raise ValueError("KiteConnect instance required to discover strikes and fetch live quotes.")
 
+            kite = self._ensure_kite_session(kite)
+
             logger.info("Scanning option chain for strikes with LTP >= Rs 30 (0 DTE -> Next Week)...")
-            strikes = find_strangle_strikes(kite, underlying=underlying, target_price=30.0, lots=lots)
+            try:
+                strikes = find_strangle_strikes(kite, underlying=underlying, target_price=30.0, lots=lots)
+            except Exception as e:
+                err_str = str(e).lower()
+                if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+                    logger.warning("Token error during strike discovery (%s). Refreshing token and retrying...", e)
+                    kite = self._ensure_kite_session(kite, force_login=True)
+                    strikes = find_strangle_strikes(kite, underlying=underlying, target_price=30.0, lots=lots)
+                else:
+                    raise
+
             mode = getattr(self.order_manager, "mode", "PAPER")
             self._print_plan(strikes, mode=mode)
 
@@ -191,12 +528,46 @@ class StrangleDesk:
             pe_info = strikes["pe"]
             total_qty = strikes["total_quantity"]
 
-            ce_order = self.order_manager.sell(
-                ce_info["symbol"], total_qty, ce_info["ltp"], order_type=order_type, buffer_pct=limit_buffer_pct
-            )
-            pe_order = self.order_manager.sell(
-                pe_info["symbol"], total_qty, pe_info["ltp"], order_type=order_type, buffer_pct=limit_buffer_pct
-            )
+            ce_order = None
+            pe_order = None
+            try:
+                ce_order = self.order_manager.sell(
+                    ce_info["symbol"], total_qty, ce_info["ltp"], order_type=order_type, buffer_pct=limit_buffer_pct
+                )
+            except Exception as e:
+                err_msg = f"Failed to place CE entry order ({ce_info['symbol']}): {e}"
+                logger.error(err_msg)
+                if self.notifier:
+                    self.notifier.send_message(f"🚨 <b>Strangle Desk Error</b>: {err_msg}")
+                return {"status": "ABORTED", "reason": err_msg}
+
+            try:
+                pe_order = self.order_manager.sell(
+                    pe_info["symbol"], total_qty, pe_info["ltp"], order_type=order_type, buffer_pct=limit_buffer_pct
+                )
+            except Exception as e:
+                err_msg = f"Failed to place PE entry order ({pe_info['symbol']}) after CE placed: {e}. Squaring off CE leg..."
+                logger.error(err_msg)
+                if self.notifier:
+                    self.notifier.send_message(f"🚨 <b>Strangle Desk Error</b>: {err_msg}")
+                ce_id = ce_order.get("order_id") if isinstance(ce_order, dict) else None
+                if ce_id:
+                    try:
+                        self.order_manager.cancel_order(ce_id)
+                        ce_status = self.wait_for_order_completion(ce_id, timeout_seconds=5, poll_seconds=1, execute_once=True)
+                        ce_filled = int(ce_status.get("filled_quantity") or 0)
+                        if ce_filled > 0:
+                            logger.warning("CE leg was partially/fully filled (%d qty). Buying back to close exposure...", ce_filled)
+                            self.order_manager.buy_to_cover(
+                                symbol=ce_info["symbol"],
+                                quantity=ce_filled,
+                                price=ce_info["ltp"] * 1.05,
+                                reason="ABORT_CLEANUP",
+                                order_type=order_type
+                            )
+                    except Exception as clean_err:
+                        logger.error("Failed to clean up CE leg after PE entry failure: %s", clean_err)
+                return {"status": "ABORTED", "reason": err_msg}
 
             ce_id = ce_order.get("order_id")
             pe_id = pe_order.get("order_id")
@@ -311,6 +682,7 @@ class StrangleDesk:
             pe_tgt = round(pe_exec_price * 0.20, 2)
 
             if self.notifier:
+                risk_cap_str = f"Max Rs {strategy_max_loss:,.0f} portfolio loss" if strategy_max_loss is not None else "None"
                 entry_msg = (
                     f"🚀 <b>NIFTY 10:00 AM Strangle Opened [{mode}]</b>\n"
                     f"Expiry: <code>{strikes['expiry']}</code> | Qty: {total_qty} ({strikes['total_lots']} lots)\n"
@@ -319,7 +691,7 @@ class StrangleDesk:
                     f"  SL: Rs {ce_sl:.2f} | Target: Rs {ce_tgt:.2f}\n"
                     f"• <b>PUT</b>: <code>{pe_info['symbol']}</code> @ Rs {pe_exec_price:.2f}\n"
                     f"  SL: Rs {pe_sl:.2f} | Target: Rs {pe_tgt:.2f}\n"
-                    f"• Risk Cap: Max Rs {max_loss_per_leg:,.0f} loss per leg"
+                    f"• Risk Cap: {risk_cap_str}"
                 )
                 self.notifier.send_message(entry_msg)
 
@@ -379,28 +751,19 @@ class StrangleDesk:
                 pe_ltp = self._extract_ltp(quotes, pe_sym, default=state["pe"]["entry_price"])
 
                 if state["ce"].get("status") == "OPEN":
-                    self.order_manager.buy_to_cover(
-                        ce_sym, qty, ce_ltp, reason="TIME_EXIT", order_type=order_type, buffer_pct=limit_buffer_pct
-                    )
-                    state["ce"]["status"] = "CLOSED"
-                    state["ce"]["exit_price"] = ce_ltp
-                    state["ce"]["exit_reason"] = "TIME_EXIT"
+                    self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "TIME_EXIT", order_type, limit_buffer_pct, state)
 
                 if state["pe"].get("status") == "OPEN":
-                    self.order_manager.buy_to_cover(
-                        pe_sym, qty, pe_ltp, reason="TIME_EXIT", order_type=order_type, buffer_pct=limit_buffer_pct
-                    )
-                    state["pe"]["status"] = "CLOSED"
-                    state["pe"]["exit_price"] = pe_ltp
-                    state["pe"]["exit_reason"] = "TIME_EXIT"
+                    self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "TIME_EXIT", order_type, limit_buffer_pct, state)
 
-                state["status"] = "COMPLETED"
-                self.save_state(state)
-                if self.notifier:
-                    self.notifier.send_message(
-                        f"🏁 <b>15:00 Cutoff Exit</b>: Closed open legs (CE @ Rs {ce_ltp:.2f}, PE @ Rs {pe_ltp:.2f})"
-                    )
-                break
+                if state["ce"].get("status") == "CLOSED" and state["pe"].get("status") == "CLOSED":
+                    state["status"] = "COMPLETED"
+                    self.save_state(state)
+                    if self.notifier:
+                        self.notifier.send_message(
+                            f"🏁 <b>15:00 Cutoff Exit</b>: Closed open legs (CE @ Rs {ce_ltp:.2f}, PE @ Rs {pe_ltp:.2f})"
+                        )
+                    break
 
             # Fetch live quotes
             if kite is None:
@@ -411,90 +774,89 @@ class StrangleDesk:
                                     f"NFO:{pe_sym}" if ":" not in pe_sym else pe_sym]
                 quotes = kite.ltp(symbols_to_query)
             except Exception as e:
-                logger.error("Failed to fetch live quotes: %s", e)
-                if execute_once:
-                    break
-                time.sleep(poll_seconds)
-                continue
+                err_str = str(e).lower()
+                if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+                    logger.warning("Token error during live quote polling (%s). Refreshing session...", e)
+                    try:
+                        kite = self._ensure_kite_session(kite, force_login=True)
+                        quotes = kite.ltp(symbols_to_query)
+                    except Exception as retry_err:
+                        logger.error("Failed to fetch live quotes after re-authentication: %s", retry_err)
+                        if execute_once:
+                            break
+                        time.sleep(poll_seconds)
+                        continue
+                else:
+                    logger.error("Failed to fetch live quotes: %s", e)
+                    if execute_once:
+                        break
+                    time.sleep(poll_seconds)
+                    continue
 
             ce_ltp = self._extract_ltp(quotes, ce_sym, default=state["ce"]["entry_price"])
             pe_ltp = self._extract_ltp(quotes, pe_sym, default=state["pe"]["entry_price"])
+
+            ce_status = state["ce"].get("status")
+            pe_status = state["pe"].get("status")
+            ce_entry = float(state["ce"]["entry_price"])
+            pe_entry = float(state["pe"]["entry_price"])
+            ce_pnl = (ce_entry - ce_ltp) * qty if ce_status == "OPEN" else (ce_entry - float(state["ce"].get("exit_price") or ce_ltp)) * qty
+            pe_pnl = (pe_entry - pe_ltp) * qty if pe_status == "OPEN" else (pe_entry - float(state["pe"].get("exit_price") or pe_ltp)) * qty
+            total_strategy_pnl = ce_pnl + pe_pnl
+            logger.info(
+                "Tick | CE (%s): LTP=%.2f, P&L=Rs %.2f [%s] | PE (%s): LTP=%.2f, P&L=Rs %.2f [%s] | Total Strangle P&L=Rs %.2f",
+                ce_sym, ce_ltp, ce_pnl, ce_status,
+                pe_sym, pe_ltp, pe_pnl, pe_status,
+                total_strategy_pnl
+            )
+
+            # Evaluate strategy-level portfolio stop loss
+            if strategy_max_loss is not None and total_strategy_pnl <= -strategy_max_loss:
+                logger.warning(
+                    "Total strategy loss Rs %.2f >= limit Rs %.2f. Triggering immediate portfolio exit for all open legs.",
+                    abs(total_strategy_pnl), strategy_max_loss
+                )
+                if state["ce"].get("status") == "OPEN":
+                    self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state)
+                if state["pe"].get("status") == "OPEN":
+                    self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state)
+                if self.notifier:
+                    self.notifier.send_message(
+                        f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss Rs {abs(total_strategy_pnl):,.2f} >= Rs {strategy_max_loss:,.2f}. Exited all open legs!"
+                    )
+
 
             # Evaluate CE leg
             if state["ce"].get("status") == "OPEN":
                 ce_sl = state["ce"]["sl_price"]
                 ce_target = state["ce"]["target_price"]
-                ce_entry = state["ce"]["entry_price"]
-                ce_loss = (ce_ltp - ce_entry) * qty
 
-                if ce_loss >= max_loss_per_leg:
-                    logger.warning("CE leg loss Rs %.2f >= max loss limit Rs %.2f. Triggering immediate exit.", ce_loss, max_loss_per_leg)
-                    self.order_manager.buy_to_cover(
-                        ce_sym, qty, ce_ltp, reason="MAX_LOSS_10K", order_type=order_type, buffer_pct=limit_buffer_pct
-                    )
-                    state["ce"]["status"] = "CLOSED"
-                    state["ce"]["exit_price"] = ce_ltp
-                    state["ce"]["exit_reason"] = "MAX_LOSS_10K"
-                    if self.notifier:
-                        self.notifier.send_message(f"⚠️ <b>MAX LOSS HIT</b>: CE <code>{ce_sym}</code> exited @ Rs {ce_ltp:.2f} (Loss: Rs {ce_loss:,.2f})")
-                elif ce_ltp >= ce_sl:
+                if ce_ltp >= ce_sl:
                     logger.warning("CE Stop-Loss hit! LTP: %.2f >= SL: %.2f", ce_ltp, ce_sl)
-                    self.order_manager.buy_to_cover(
-                        ce_sym, qty, ce_ltp, reason="STOP_LOSS", order_type=order_type, buffer_pct=limit_buffer_pct
-                    )
-                    state["ce"]["status"] = "CLOSED"
-                    state["ce"]["exit_price"] = ce_ltp
-                    state["ce"]["exit_reason"] = "STOP_LOSS"
-                    if self.notifier:
-                        self.notifier.send_message(f"🛑 <b>STOP LOSS HIT</b>: CE <code>{ce_sym}</code> exited @ Rs {ce_ltp:.2f} (SL: Rs {ce_sl:.2f})")
+                    if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state):
+                        if self.notifier:
+                            self.notifier.send_message(f"🛑 <b>STOP LOSS HIT</b>: CE <code>{ce_sym}</code> exited @ Rs {ce_ltp:.2f} (SL: Rs {ce_sl:.2f})")
                 elif ce_ltp <= ce_target:
                     logger.info("CE Decay Target reached! LTP: %.2f <= Target: %.2f", ce_ltp, ce_target)
-                    self.order_manager.buy_to_cover(
-                        ce_sym, qty, ce_ltp, reason="DECAY_TARGET", order_type=order_type, buffer_pct=limit_buffer_pct
-                    )
-                    state["ce"]["status"] = "CLOSED"
-                    state["ce"]["exit_price"] = ce_ltp
-                    state["ce"]["exit_reason"] = "DECAY_TARGET"
-                    if self.notifier:
-                        self.notifier.send_message(f"🎯 <b>DECAY TARGET REACHED</b>: CE <code>{ce_sym}</code> exited @ Rs {ce_ltp:.2f} (Target: Rs {ce_target:.2f})")
+                    if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state):
+                        if self.notifier:
+                            self.notifier.send_message(f"🎯 <b>DECAY TARGET REACHED</b>: CE <code>{ce_sym}</code> exited @ Rs {ce_ltp:.2f} (Target: Rs {ce_target:.2f})")
 
             # Evaluate PE leg
             if state["pe"].get("status") == "OPEN":
                 pe_sl = state["pe"]["sl_price"]
                 pe_target = state["pe"]["target_price"]
-                pe_entry = state["pe"]["entry_price"]
-                pe_loss = (pe_ltp - pe_entry) * qty
 
-                if pe_loss >= max_loss_per_leg:
-                    logger.warning("PE leg loss Rs %.2f >= max loss limit Rs %.2f. Triggering immediate exit.", pe_loss, max_loss_per_leg)
-                    self.order_manager.buy_to_cover(
-                        pe_sym, qty, pe_ltp, reason="MAX_LOSS_10K", order_type=order_type, buffer_pct=limit_buffer_pct
-                    )
-                    state["pe"]["status"] = "CLOSED"
-                    state["pe"]["exit_price"] = pe_ltp
-                    state["pe"]["exit_reason"] = "MAX_LOSS_10K"
-                    if self.notifier:
-                        self.notifier.send_message(f"⚠️ <b>MAX LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (Loss: Rs {pe_loss:,.2f})")
-                elif pe_ltp >= pe_sl:
+                if pe_ltp >= pe_sl:
                     logger.warning("PE Stop-Loss hit! LTP: %.2f >= SL: %.2f", pe_ltp, pe_sl)
-                    self.order_manager.buy_to_cover(
-                        pe_sym, qty, pe_ltp, reason="STOP_LOSS", order_type=order_type, buffer_pct=limit_buffer_pct
-                    )
-                    state["pe"]["status"] = "CLOSED"
-                    state["pe"]["exit_price"] = pe_ltp
-                    state["pe"]["exit_reason"] = "STOP_LOSS"
-                    if self.notifier:
-                        self.notifier.send_message(f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (SL: Rs {pe_sl:.2f})")
+                    if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state):
+                        if self.notifier:
+                            self.notifier.send_message(f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (SL: Rs {pe_sl:.2f})")
                 elif pe_ltp <= pe_target:
                     logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f", pe_ltp, pe_target)
-                    self.order_manager.buy_to_cover(
-                        pe_sym, qty, pe_ltp, reason="DECAY_TARGET", order_type=order_type, buffer_pct=limit_buffer_pct
-                    )
-                    state["pe"]["status"] = "CLOSED"
-                    state["pe"]["exit_price"] = pe_ltp
-                    state["pe"]["exit_reason"] = "DECAY_TARGET"
-                    if self.notifier:
-                        self.notifier.send_message(f"🎯 <b>DECAY TARGET REACHED</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (Target: Rs {pe_target:.2f})")
+                    if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state):
+                        if self.notifier:
+                            self.notifier.send_message(f"🎯 <b>DECAY TARGET REACHED</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (Target: Rs {pe_target:.2f})")
 
             # If both legs closed, complete session
             if state["ce"].get("status") == "CLOSED" and state["pe"].get("status") == "CLOSED":
@@ -524,3 +886,157 @@ class StrangleDesk:
             time.sleep(poll_seconds)
 
         return state
+
+    def run_scheduler(
+        self,
+        underlying: str = "NIFTY",
+        lots: int = 10,
+        poll_seconds: int = 5,
+        kite: Optional[KiteConnect] = None,
+        strategy_max_loss: Optional[float] = 10000.0,
+        order_type: str = "LIMIT",
+        limit_buffer_pct: float = 0.05,
+        ignore_holidays: bool = False,
+        order_timeout: int = 300,
+        entry_time_str: str = "10:00",
+        exit_time_str: str = "15:00",
+        idle_sleep_seconds: int = 15,
+        max_iterations: Optional[int] = None
+    ) -> None:
+        """
+        Runs the automated daily daemon scheduler for the 10:00 AM Short Strangle Desk.
+        - Continuously runs in background (ideal for Docker Compose and Cloud VPS)
+        - Logs hourly heartbeat with market status
+        - Skips weekends and official NSE trading holidays
+        - If active trade exists for today: resumes monitoring until completion
+        - At 10:00 AM IST: executes option chain scan, places dual-leg entry, and starts monitoring loop
+        - At 15:00 PM IST: closes any remaining open positions
+        - Outside market hours (e.g. evening 18:33 IST): sleeps peacefully and never submits orders
+        """
+        mode = getattr(self.order_manager, "mode", "PAPER")
+        logger.info(
+            "Starting 10:00 AM Strangle Desk Daemon [%s] (Lots: %d, Entry: %s IST, Cutoff: %s IST)...",
+            mode, lots, entry_time_str, exit_time_str
+        )
+        # Daemon started notification removed per policy (alerts only on entry, exit, sl)
+
+        entry_h, entry_m = map(int, entry_time_str.split(":"))
+        last_heartbeat_hour: int = -1
+        last_holiday_date: Optional[date] = None
+        last_totp_login_date: Optional[date] = None
+        iteration = 0
+
+        while True:
+            if max_iterations is not None and iteration >= max_iterations:
+                logger.info("Reached max iterations (%d). Stopping scheduler.", max_iterations)
+                break
+            iteration += 1
+
+            now = datetime.now()
+            today_d = now.date()
+            current_t = now.time()
+
+            # Heartbeat once per hour
+            if now.hour != last_heartbeat_hour:
+                last_heartbeat_hour = now.hour
+                state = self.load_state() or {}
+                market_status = "OPEN" if dt_time(9, 15) <= current_t <= dt_time(15, 30) and now.weekday() < 5 else "CLOSED"
+                logger.info(
+                    "Strangle scheduler heartbeat [%s] | Market: %s | Today State: %s | Realized P&L: Rs %.2f",
+                    now.strftime("%Y-%m-%d %H:%M:%S"),
+                    market_status,
+                    state.get("status", "IDLE"),
+                    float(state.get("realized_pnl", 0.0))
+                )
+
+            # Check weekends and holidays
+            if not ignore_holidays:
+                is_holiday, reason = is_trading_holiday(check_date=today_d)
+                if is_holiday:
+                    if last_holiday_date != today_d:
+                        logger.info("Exchange is closed today (%s: %s). Scheduler waiting for next trading day.", today_d, reason)
+                        last_holiday_date = today_d
+                    time.sleep(idle_sleep_seconds)
+                    continue
+
+            # Morning 08:00 AM IST TOTP Login Renewal:
+            # Renew Zerodha access token once per day at or after 08:00 AM IST on trading days.
+            # Ensures all daily activities (10:00 AM entry, order fills, quotes) use freshly minted credentials.
+            if current_t >= dt_time(8, 0) and last_totp_login_date != today_d:
+                try:
+                    kite = self.perform_daily_morning_login(kite)
+                    last_totp_login_date = today_d
+                except Exception as e:
+                    logger.error("Failed daily 08:00 AM morning TOTP login: %s", e, exc_info=True)
+                    pass  # Non-trade error alert removed per policy
+
+            # Check today's state
+            state = self.load_state()
+            today_str = today_d.strftime("%Y-%m-%d")
+
+            # 1. If an active trade already exists for today, resume monitoring it!
+            if state is not None and state.get("date") == today_str and state.get("status") == "OPEN":
+                logger.info("Resuming active session from today (%s)...", today_str)
+                try:
+                    self.run_session(
+                        underlying=underlying,
+                        lots=lots,
+                        poll_seconds=poll_seconds,
+                        kite=kite,
+                        strategy_max_loss=strategy_max_loss,
+                        order_type=order_type,
+                        limit_buffer_pct=limit_buffer_pct,
+                        ignore_holidays=ignore_holidays,
+                        order_timeout=order_timeout
+                    )
+                except Exception as e:
+                    logger.exception("Error during active strangle session: %s", e)
+                continue
+
+            # 2. If today's session is already completed or aborted, wait for next trading day
+            if state is not None and state.get("date") == today_str and state.get("status") in ("COMPLETED", "ABORTED"):
+                time.sleep(idle_sleep_seconds)
+                continue
+
+            # 3. Market Hours Guard: Outside regular NSE trading hours (09:15 - 15:30 IST) or on weekends, sleep peacefully
+            is_market_hours = (dt_time(9, 15) <= current_t <= dt_time(15, 30)) and (now.weekday() < 5 or ignore_holidays)
+            if not is_market_hours:
+                time.sleep(idle_sleep_seconds)
+                continue
+
+            # 4. During Market Hours: Reconcile with broker positions in LIVE mode
+            mode = getattr(self.order_manager, "mode", "PAPER")
+            if mode == "LIVE" and kite is not None:
+                kite = self._ensure_kite_session(kite)
+                state = self.reconcile_with_broker(kite, state, underlying=underlying)
+                if state is not None and state.get("date") == today_str and state.get("status") == "OPEN":
+                    continue
+
+            # 5. If before 10:00 AM (e.g. 09:15-09:59 IST), wait for entry time
+            if current_t < dt_time(entry_h, entry_m):
+                time.sleep(idle_sleep_seconds)
+                continue
+
+            # 6. If at 10:00 AM (entry window: 10:00 - 10:05 IST on trading days):
+            if dt_time(entry_h, entry_m) <= current_t <= dt_time(entry_h, entry_m + 5):
+                logger.info("Triggering 10:00 AM Strangle entry for %s...", today_str)
+                try:
+                    kite = self._ensure_kite_session(kite)
+                    self.run_session(
+                        underlying=underlying,
+                        lots=lots,
+                        poll_seconds=poll_seconds,
+                        kite=kite,
+                        strategy_max_loss=strategy_max_loss,
+                        order_type=order_type,
+                        limit_buffer_pct=limit_buffer_pct,
+                        ignore_holidays=ignore_holidays,
+                        order_timeout=order_timeout
+                    )
+                except Exception as e:
+                    logger.exception("Error during 10:00 AM strangle session: %s", e)
+                    pass  # Non-trade error alert removed per policy
+                continue
+
+            # 5. Outside entry window & market closed (e.g. evening 18:33 IST): sleep
+            time.sleep(idle_sleep_seconds)

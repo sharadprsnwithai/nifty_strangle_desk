@@ -13,13 +13,16 @@ def _round_to_nse_tick(price: float, tick: float = 0.05) -> float:
 class OrderManager:
     """Manages order execution for both PAPER simulation and LIVE trading."""
 
-    def __init__(self, mode: str = "PAPER", kite: Optional[KiteConnect] = None):
+    def __init__(self, mode: str = "PAPER", kite: Optional[KiteConnect] = None, product: str = "MIS"):
         self.mode = mode.upper()
         if self.mode not in ("PAPER", "LIVE"):
             raise ValueError(f"Invalid mode: {self.mode}")
         self.kite = kite
         if self.mode == "LIVE" and not self.kite:
             raise ValueError("KiteConnect instance required for LIVE mode.")
+        self.product = product.upper()
+        if self.product not in ("MIS", "NRML", "CNC"):
+            raise ValueError(f"Invalid product type: {self.product}. Must be MIS, NRML, or CNC.")
         self._paper_orders: Dict[str, Dict[str, Any]] = {}
 
     def sell(
@@ -28,7 +31,8 @@ class OrderManager:
         quantity: int,
         price: float,
         order_type: str = "LIMIT",
-        buffer_pct: float = 0.05
+        buffer_pct: float = 0.05,
+        product: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Sells an option leg (entry).
@@ -60,19 +64,24 @@ class OrderManager:
                 "fill_price": price,
                 "filled_quantity": quantity,
                 "pending_quantity": 0,
+                "product": product or self.product,
                 "status": "COMPLETE"
             }
             self._paper_orders[order["order_id"]] = order.copy()
             return order
         
         # LIVE Mode
+        prod = (product or self.product).upper()
+        prod_val = getattr(self.kite, f"PRODUCT_{prod}", prod)
+        validity_val = getattr(self.kite, "VALIDITY_DAY", "DAY")
         params: Dict[str, Any] = {
             "variety": self.kite.VARIETY_REGULAR,
             "exchange": self.kite.EXCHANGE_NFO,
             "tradingsymbol": symbol,
             "transaction_type": self.kite.TRANSACTION_TYPE_SELL,
             "quantity": quantity,
-            "product": self.kite.PRODUCT_MIS,
+            "product": prod_val,
+            "validity": validity_val,
         }
 
         if order_type_norm == "LIMIT":
@@ -81,18 +90,24 @@ class OrderManager:
         else:
             params["order_type"] = self.kite.ORDER_TYPE_MARKET
 
-        order_id = self.kite.place_order(**params)
-        return {
-            "order_id": order_id,
-            "mode": "LIVE",
-            "symbol": symbol,
-            "transaction_type": "SELL",
-            "quantity": quantity,
-            "order_type": order_type_norm,
-            "limit_price": limit_price,
-            "fill_price": price,
-            "status": "SUBMITTED"
-        }
+        try:
+            logger.info("[LIVE] Submitting SELL order: %s x %d (OrderType: %s, LimitPrice: %s)", symbol, quantity, order_type_norm, limit_price)
+            order_id = self.kite.place_order(**params)
+            logger.info("[LIVE] SELL order placed successfully: %s x %d (Order ID: %s)", symbol, quantity, order_id)
+            return {
+                "order_id": order_id,
+                "mode": "LIVE",
+                "symbol": symbol,
+                "transaction_type": "SELL",
+                "quantity": quantity,
+                "order_type": order_type_norm,
+                "limit_price": limit_price,
+                "fill_price": price,
+                "status": "SUBMITTED"
+            }
+        except Exception as e:
+            logger.exception("[LIVE] Failed to place SELL order for %s (qty: %d, type: %s): %s", symbol, quantity, order_type_norm, e)
+            raise
 
     def buy_to_cover(
         self,
@@ -101,7 +116,8 @@ class OrderManager:
         price: float,
         reason: str = "EXIT",
         order_type: str = "LIMIT",
-        buffer_pct: float = 0.05
+        buffer_pct: float = 0.05,
+        product: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Buys back an open short option leg (exit on SL, target, or 3PM).
@@ -135,18 +151,23 @@ class OrderManager:
                 "filled_quantity": quantity,
                 "pending_quantity": 0,
                 "reason": reason,
+                "product": product or self.product,
                 "status": "COMPLETE"
             }
             self._paper_orders[order["order_id"]] = order.copy()
             return order
 
+        prod = (product or self.product).upper()
+        prod_val = getattr(self.kite, f"PRODUCT_{prod}", prod)
+        validity_val = getattr(self.kite, "VALIDITY_DAY", "DAY")
         params: Dict[str, Any] = {
             "variety": self.kite.VARIETY_REGULAR,
             "exchange": self.kite.EXCHANGE_NFO,
             "tradingsymbol": symbol,
             "transaction_type": self.kite.TRANSACTION_TYPE_BUY,
             "quantity": quantity,
-            "product": self.kite.PRODUCT_MIS,
+            "product": prod_val,
+            "validity": validity_val,
         }
 
         if order_type_norm == "LIMIT":
@@ -155,19 +176,25 @@ class OrderManager:
         else:
             params["order_type"] = self.kite.ORDER_TYPE_MARKET
 
-        order_id = self.kite.place_order(**params)
-        return {
-            "order_id": order_id,
-            "mode": "LIVE",
-            "symbol": symbol,
-            "transaction_type": "BUY",
-            "quantity": quantity,
-            "order_type": order_type_norm,
-            "limit_price": limit_price,
-            "fill_price": price,
-            "reason": reason,
-            "status": "SUBMITTED"
-        }
+        try:
+            logger.info("[LIVE] Submitting BUY-TO-COVER order: %s x %d (OrderType: %s, LimitPrice: %s, Reason: %s)", symbol, quantity, order_type_norm, limit_price, reason)
+            order_id = self.kite.place_order(**params)
+            logger.info("[LIVE] BUY-TO-COVER order placed successfully: %s x %d (Order ID: %s, Reason: %s)", symbol, quantity, order_id, reason)
+            return {
+                "order_id": order_id,
+                "mode": "LIVE",
+                "symbol": symbol,
+                "transaction_type": "BUY",
+                "quantity": quantity,
+                "order_type": order_type_norm,
+                "limit_price": limit_price,
+                "fill_price": price,
+                "reason": reason,
+                "status": "SUBMITTED"
+            }
+        except Exception as e:
+            logger.exception("[LIVE] Failed to place BUY-TO-COVER order for %s (qty: %d, reason: %s): %s", symbol, quantity, reason, e)
+            raise
 
     def get_order_status(self, order_id: str) -> Dict[str, Any]:
         """
@@ -223,7 +250,7 @@ class OrderManager:
                 "status_message": latest.get("status_message")
             }
         except Exception as e:
-            logger.error("[LIVE] Error fetching order status for %s: %s", order_id, e)
+            logger.exception("[LIVE] Error fetching order status for %s: %s", order_id, e)
             return {
                 "order_id": order_id,
                 "status": "ERROR",
@@ -249,5 +276,5 @@ class OrderManager:
             logger.info("[LIVE] Cancel request sent successfully for order: %s", order_id)
             return True
         except Exception as e:
-            logger.error("[LIVE] Failed to cancel order %s: %s", order_id, e)
+            logger.exception("[LIVE] Failed to cancel order %s: %s", order_id, e)
             return False

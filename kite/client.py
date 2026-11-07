@@ -36,6 +36,9 @@ def get_kite_client(config: Optional[KiteConfig] = None, force_login: bool = Fal
         raise RuntimeError("Failed to authenticate with Zerodha Kite using TOTP. Check credentials in .env.")
 
     kite.set_access_token(new_token)
-    profile = kite.profile()
-    logger.info(f"Successfully authenticated as {profile.get('user_name', cfg.user_id)} ({profile.get('user_id')})")
+    try:
+        profile = kite.profile()
+        logger.info(f"Successfully authenticated as {profile.get('user_name', cfg.user_id)} ({profile.get('user_id')})")
+    except Exception as e:
+        logger.warning("Could not fetch profile after fresh TOTP authentication (%s), but access token is set.", e)
     return kite

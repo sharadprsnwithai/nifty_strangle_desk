@@ -4,8 +4,15 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.log
+logs/*.log
+logs/*.log*
+!logs/.gitkeep
 .superpowers/
-data/trades_today.json
+data/*.json
+!data/positional_condor_state.json
 data/*.parquet
 data/*.csv
-
+data/cache_15m/
+data/cache_15m_1y/
+data/cache_15m_fno/
+!data/.gitkeep

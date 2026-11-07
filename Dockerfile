@@ -22,17 +22,14 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
-# Copy application source code
-COPY config.py main.py run_strategy.py run_backtest.py ./
-COPY kite/ ./kite/
-COPY strategy/ ./strategy/
-COPY notifications/ ./notifications/
+# Copy all project source code (secrets/state excluded via .dockerignore)
+COPY . .
 
 # Ensure virtual environment binaries are in PATH
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Create data directory for trade logs and state persistence
-RUN mkdir -p /app/data
+# Create data and logs directories for trade state and host event log persistence
+RUN mkdir -p /app/data /app/logs
 
 # Default entrypoint
 ENTRYPOINT ["python", "run_strategy.py"]

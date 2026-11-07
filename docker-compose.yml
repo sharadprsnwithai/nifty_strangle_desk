@@ -11,17 +11,98 @@ services:
     environment:
       - TZ=Asia/Kolkata
       - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "10"
     volumes:
-      # Mount data directory so trades_today.json state and logs persist across container restarts
+      # Mount data directory so trades_today.json state persists across container restarts
       - ./data:/app/data
+      # Mount logs directory so detailed event logs persist directly on the host machine
+      - ./logs:/app/logs
+      # Mount .env so generated Kite access tokens stay synchronized between host and container
+      - ./.env:/app/.env
+      # Code is baked into the image; rebuild to apply code changes: docker compose up -d --build
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Live Incubation (1 Lot, Rs 1k Max Loss per leg, Marketable Limit Orders):
-    command: ["--live", "--lots", "1", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "1000"]
+    # 1. Live Production (10 Lots, Rs 10k Portfolio Max Loss):
+    command: ["--live", "--lots", "10", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "10000"]
     #
-    # 2. Live Production (10 Lots, Rs 10k Max Loss per leg):
-    # command: ["--live", "--lots", "10", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "10000"]
+    # 2. Live Incubation (1 Lot, Rs 1k Portfolio Max Loss, Marketable Limit Orders):
+    # command: ["--live", "--lots", "1", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "1000"]
     #
     # 3. Paper Trading (Simulation):
     # command: ["--paper", "--lots", "10", "--poll", "5"]
+    # -----------------------------------------------------------------------------------
+
+  # ===================================================================================
+  # POSITIONAL CONDOR STRATEGY - DISABLED
+  # ===================================================================================
+  # positional-condor-desk:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: nifty_positional_condor
+  #   image: ${DOCKER_USER:-sharadprsn}/nifty_strangle_desk:latest
+  #   restart: unless-stopped
+  #   entrypoint: ["python", "run_positional_condor.py"]
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - TZ=Asia/Kolkata
+  #     - PYTHONUNBUFFERED=1
+  #     - LOG_LEVEL=${LOG_LEVEL:-INFO}
+  #     - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "10"
+  #   volumes:
+  #     - ./data:/app/data
+  #     - ./logs:/app/logs
+  #     - ./.env:/app/.env
+  #   command: ["--live", "--lots", "1", "--monthly-stop-loss", "0.03", "--monthly-target", "0.04", "--schedule-time", "15:20"]
+  # ===================================================================================
+
+  orb-desk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orb_breakout_desk
+    image: ${DOCKER_USER:-sharadprsn}/nifty_strangle_desk:latest
+    restart: unless-stopped
+    entrypoint: ["python", "run_orb.py"]
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Kolkata
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "10"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    # -----------------------------------------------------------------------------------
+    # Option 3 Desk (Static 30 Stocks Universe, Minimum Drawdown Risk-Parity Configuration):
+    # - Risk Parity: Fixed Rs 2,500 risk per trade (Quantity = int(2500 / SL_distance))
+    # - Portfolio Circuit Breaker: Hard halt at -Rs 10,000 daily loss
+    # - Max Trades Cap: 5 trades per day
+    # - Trade Lifecycle: 1:1 R target (50% profit booked, SL to Cost), 3:00 PM runner exit
+    # - Marketable LIMIT execution with 0.2% price buffer
+    #
+    # 1. Paper Trading Mode (Simulated Execution + Full Telegram Alerts):
+    command: ["--paper", "--sizing-mode", "LOTS", "--lots", "2", "--daily-loss", "50000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
+    #
+    # 2. Live Production Mode (Real Broker Order Execution via Kite Connect API + Telegram Alerts):
+    # command: ["--live", "--sizing-mode", "FIXED_RISK", "--risk", "2500", "--daily-loss", "10000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
     # -----------------------------------------------------------------------------------

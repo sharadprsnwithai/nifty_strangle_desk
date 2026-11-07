@@ -1,0 +1,14 @@
+{
+  "month": "2026-11",
+  "expiry": "2026-11-26",
+  "status": "IDLE",
+  "regime": "UNKNOWN",
+  "monthly_realized_pnl": 0.0,
+  "current_trade": null,
+  "last_rsi": null,
+  "last_regime": null,
+  "current_rsi": null,
+  "current_regime": null,
+  "last_evaluation_date": null,
+  "history": []
+}
