@@ -9,7 +9,7 @@ from typing import Optional, Union, List, Set
 
 DEFAULT_LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 DEFAULT_LOG_FILE = "strangle_desk.log"
-DEFAULT_RETENTION_DAYS = 10
+DEFAULT_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "10"))
 
 ACTIVE_LOG_NAMES: Set[str] = {
     "strangle_desk.log",

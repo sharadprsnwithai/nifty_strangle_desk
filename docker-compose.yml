@@ -12,6 +12,12 @@ services:
       - TZ=Asia/Kolkata
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "10"
     volumes:
       # Mount data directory so trades_today.json state persists across container restarts
       - ./data:/app/data
@@ -49,6 +55,12 @@ services:
   #     - TZ=Asia/Kolkata
   #     - PYTHONUNBUFFERED=1
   #     - LOG_LEVEL=${LOG_LEVEL:-INFO}
+  #     - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "10"
   #   volumes:
   #     - ./data:/app/data
   #     - ./logs:/app/logs
@@ -70,6 +82,12 @@ services:
       - TZ=Asia/Kolkata
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "10"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
