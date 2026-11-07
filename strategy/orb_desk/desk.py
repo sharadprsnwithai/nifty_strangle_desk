@@ -168,6 +168,19 @@ class ORBDesk:
                         "reasons": item.get("reasons", [])
                     }
 
+    def reset_for_new_day(self, new_date: Optional[date] = None):
+        """Resets daily session state across multi-day daemon runs."""
+        today = new_date or date.today()
+        self.today = str(today)
+        self.ib_formed = False
+        self.circuit_tripped = False
+        self.traded_stocks_today = set()
+        self.active_positions = []
+        self.armed_positions = []
+        self.closed_trades = []
+        self.stock_stats = {}
+        self.initialize_day(force=True)
+
     def initialize_day(self, force: bool = False):
         """
         Fetches Previous Day High (PDH) and Previous Day Low (PDL) for the 30 target stocks,
@@ -687,6 +700,12 @@ class ORBDesk:
         self._save_state()
         self._notify_circuit_breaker()
 
+    def _get_total_day_realized_pnl(self) -> float:
+        """Calculates total realized P&L for the day including closed trades and partial booked targets."""
+        closed_pnl = sum(t.get("realized_pnl_rs", 0.0) for t in self.closed_trades)
+        partial_pnl = sum(pos.get("half_booked_pnl", 0.0) for pos in self.active_positions)
+        return closed_pnl + partial_pnl
+
     # -------------------------------------------------------------------------
     # Rich Telegram Notifications
     # -------------------------------------------------------------------------
@@ -763,43 +782,50 @@ class ORBDesk:
         self.notifier.send_message(msg)
 
     def _notify_trail_be(self, pos: Dict[str, Any]):
+        total_day_pnl = self._get_total_day_realized_pnl()
         msg = (
             f"🎯 <b>1:1 Target Reached — Trailed to Breakeven!</b>\n\n"
             f"Stock: <b>{pos['symbol']}</b> ({pos['direction']})\n"
             f"Stop-Loss moved to: <b>₹{pos['entry_price']:.2f}</b> (Entry Price)\n"
-            f"🛡️ <i>Downside risk completely eliminated. Free trade running!</i>"
+            f"🛡️ <i>Downside risk completely eliminated. Free trade running!</i>\n\n"
+            f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
         )
         self.notifier.send_message(msg)
 
     def _notify_target_booked(self, pos: Dict[str, Any], exit_p: float, booked_pnl: float):
+        total_day_pnl = self._get_total_day_realized_pnl()
         msg = (
             f"💰 <b>Target 1 Hit — 50% Profit Booked!</b>\n\n"
             f"Stock: <b>{pos['symbol']}</b>\n"
             f"Booked 50% Qty ({pos['half_quantity']} shares) @ <b>₹{exit_p:.2f}</b>\n"
             f"Realized Gain: <b>+₹{booked_pnl:,.2f} (+0.5 R)</b>\n"
-            f"SL on remaining 50% trailed to Breakeven (₹{pos['entry_price']:.2f})."
+            f"SL on remaining 50% trailed to Breakeven (₹{pos['entry_price']:.2f}).\n\n"
+            f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
         )
         self.notifier.send_message(msg)
 
     def _notify_trade_exit(self, t: Dict[str, Any]):
         pnl = t["realized_pnl_rs"]
         pnl_emoji = "🟢" if pnl > 0 else ("⚪" if pnl == 0 else "🔴")
+        total_day_pnl = self._get_total_day_realized_pnl()
         msg = (
             f"{pnl_emoji} <b>ORB Trade Closed: {t['symbol']}</b>\n\n"
             f"Direction: <b>{t['direction']}</b> x {t['quantity']}\n"
             f"Exit Reason: <b>{t['exit_reason']}</b>\n"
             f"Entry: ₹{t['entry_price']:.2f} ➔ Exit: ₹{t['exit_price']:.2f}\n"
-            f"Realized P&L: <b>₹{pnl:+,.2f} ({t['r_multiple']:+,.2f} R)</b>\n"
-            f"Time: <b>{t['exit_time']}</b>"
+            f"Trade P&L: <b>₹{pnl:+,.2f} ({t['r_multiple']:+,.2f} R)</b>\n\n"
+            f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
         )
         self.notifier.send_message(msg)
 
     def _notify_circuit_breaker(self):
+        total_day_pnl = self._get_total_day_realized_pnl()
         msg = (
             f"🚨 <b>PORTFOLIO CIRCUIT BREAKER TRIPPED!</b>\n\n"
             f"Cumulative daily portfolio loss hit threshold (<b>-₹{self.config.daily_stop_loss_limit:,.0f}</b>).\n"
             f"All active positions have been immediately squared off at market.\n"
-            f"Trading desk is <b>HALTED</b> for the rest of today to protect capital."
+            f"Trading desk is <b>HALTED</b> for the rest of today to protect capital.\n\n"
+            f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
         )
         self.notifier.send_message(msg)
 

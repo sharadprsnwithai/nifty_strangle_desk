@@ -129,11 +129,20 @@ def main(args=None):
     # Main Automated Trading Loop
     logger.info("Entering live automated market loop (Polling every %d seconds)...", parsed.poll)
     last_scan_slot = None
+    active_date = datetime.now().date()
 
     try:
         while True:
             now = datetime.now()
+            today_date = now.date()
             current_time = now.time()
+
+            # Multi-day daemon rollover check
+            if today_date != active_date:
+                logger.info("New trading day detected (%s -> %s). Re-initializing ORB desk...", active_date, today_date)
+                desk.reset_for_new_day(today_date)
+                active_date = today_date
+                last_scan_slot = None
 
             # Off-market hours sleeping (before 09:15 or after 15:30)
             if current_time < dt_time(9, 15) or current_time > dt_time(15, 30):

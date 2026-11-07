@@ -159,6 +159,19 @@ class StrangleDesk:
                 )
             return False
 
+    @staticmethod
+    def _get_current_day_pnl(state: Dict[str, Any], qty: int) -> float:
+        """Computes current realized day P&L from closed strangle legs."""
+        ce_pnl = 0.0
+        pe_pnl = 0.0
+        ce = state.get("ce", {})
+        pe = state.get("pe", {})
+        if ce and ce.get("status") == "CLOSED" and ce.get("exit_price") is not None:
+            ce_pnl = (float(ce["entry_price"]) - float(ce["exit_price"])) * qty
+        if pe and pe.get("status") == "CLOSED" and pe.get("exit_price") is not None:
+            pe_pnl = (float(pe["entry_price"]) - float(pe["exit_price"])) * qty
+        return ce_pnl + pe_pnl
+
     def wait_for_orders_completion(
         self,
         order_ids: List[str],
@@ -760,8 +773,10 @@ class StrangleDesk:
                     state["status"] = "COMPLETED"
                     self.save_state(state)
                     if self.notifier:
+                        total_day_pnl = self._get_current_day_pnl(state, qty)
                         self.notifier.send_message(
-                            f"🏁 <b>15:00 Cutoff Exit</b>: Closed open legs (CE @ Rs {ce_ltp:.2f}, PE @ Rs {pe_ltp:.2f})"
+                            f"🏁 <b>15:00 Cutoff Exit</b>: Closed open legs (CE @ ₹{ce_ltp:.2f}, PE @ ₹{pe_ltp:.2f})\n\n"
+                            f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
                         )
                     break
 
@@ -821,8 +836,10 @@ class StrangleDesk:
                 if state["pe"].get("status") == "OPEN":
                     self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state)
                 if self.notifier:
+                    total_day_pnl = self._get_current_day_pnl(state, qty)
                     self.notifier.send_message(
-                        f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss Rs {abs(total_strategy_pnl):,.2f} >= Rs {strategy_max_loss:,.2f}. Exited all open legs!"
+                        f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{strategy_max_loss:,.2f}. Exited all open legs!\n\n"
+                        f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
                     )
 
 
@@ -835,12 +852,26 @@ class StrangleDesk:
                     logger.warning("CE Stop-Loss hit! LTP: %.2f >= SL: %.2f", ce_ltp, ce_sl)
                     if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state):
                         if self.notifier:
-                            self.notifier.send_message(f"🛑 <b>STOP LOSS HIT</b>: CE <code>{ce_sym}</code> exited @ Rs {ce_ltp:.2f} (SL: Rs {ce_sl:.2f})")
+                            ce_entry = float(state["ce"]["entry_price"])
+                            leg_pnl = (ce_entry - ce_ltp) * qty
+                            total_day_pnl = self._get_current_day_pnl(state, qty)
+                            self.notifier.send_message(
+                                f"🛑 <b>STOP LOSS HIT</b>: CE <code>{ce_sym}</code> exited @ ₹{ce_ltp:.2f} (SL: ₹{ce_sl:.2f})\n"
+                                f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
+                                f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
+                            )
                 elif ce_ltp <= ce_target:
                     logger.info("CE Decay Target reached! LTP: %.2f <= Target: %.2f", ce_ltp, ce_target)
                     if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state):
                         if self.notifier:
-                            self.notifier.send_message(f"🎯 <b>DECAY TARGET REACHED</b>: CE <code>{ce_sym}</code> exited @ Rs {ce_ltp:.2f} (Target: Rs {ce_target:.2f})")
+                            ce_entry = float(state["ce"]["entry_price"])
+                            leg_pnl = (ce_entry - ce_ltp) * qty
+                            total_day_pnl = self._get_current_day_pnl(state, qty)
+                            self.notifier.send_message(
+                                f"🎯 <b>DECAY TARGET REACHED</b>: CE <code>{ce_sym}</code> exited @ ₹{ce_ltp:.2f} (Target: ₹{ce_target:.2f})\n"
+                                f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
+                                f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
+                            )
 
             # Evaluate PE leg
             if state["pe"].get("status") == "OPEN":
@@ -851,12 +882,26 @@ class StrangleDesk:
                     logger.warning("PE Stop-Loss hit! LTP: %.2f >= SL: %.2f", pe_ltp, pe_sl)
                     if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state):
                         if self.notifier:
-                            self.notifier.send_message(f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (SL: Rs {pe_sl:.2f})")
+                            pe_entry = float(state["pe"]["entry_price"])
+                            leg_pnl = (pe_entry - pe_ltp) * qty
+                            total_day_pnl = self._get_current_day_pnl(state, qty)
+                            self.notifier.send_message(
+                                f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ ₹{pe_ltp:.2f} (SL: ₹{pe_sl:.2f})\n"
+                                f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
+                                f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
+                            )
                 elif pe_ltp <= pe_target:
                     logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f", pe_ltp, pe_target)
                     if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state):
                         if self.notifier:
-                            self.notifier.send_message(f"🎯 <b>DECAY TARGET REACHED</b>: PE <code>{pe_sym}</code> exited @ Rs {pe_ltp:.2f} (Target: Rs {pe_target:.2f})")
+                            pe_entry = float(state["pe"]["entry_price"])
+                            leg_pnl = (pe_entry - pe_ltp) * qty
+                            total_day_pnl = self._get_current_day_pnl(state, qty)
+                            self.notifier.send_message(
+                                f"🎯 <b>DECAY TARGET REACHED</b>: PE <code>{pe_sym}</code> exited @ ₹{pe_ltp:.2f} (Target: ₹{pe_target:.2f})\n"
+                                f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
+                                f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
+                            )
 
             # If both legs closed, complete session
             if state["ce"].get("status") == "CLOSED" and state["pe"].get("status") == "CLOSED":
@@ -867,10 +912,10 @@ class StrangleDesk:
                     pe_pnl = (state["pe"]["entry_price"] - (state["pe"]["exit_price"] or state["pe"]["entry_price"])) * qty
                     gross_pnl = ce_pnl + pe_pnl
                     summary_msg = (
-                        f"📊 <b>Strangle Session Completed</b>\n"
-                        f"• CE ({state['ce']['exit_reason']}): Rs {ce_pnl:+,.2f}\n"
-                        f"• PE ({state['pe']['exit_reason']}): Rs {pe_pnl:+,.2f}\n"
-                        f"• <b>Total Gross P&L</b>: <b>Rs {gross_pnl:+,.2f}</b>"
+                        f"📊 <b>Strangle Session Completed</b>\n\n"
+                        f"• CE ({state['ce']['exit_reason']}): ₹{ce_pnl:+,.2f}\n"
+                        f"• PE ({state['pe']['exit_reason']}): ₹{pe_pnl:+,.2f}\n\n"
+                        f"📊 <b>Total Day Realized P&L: ₹{gross_pnl:+,.2f}</b>"
                     )
                     self.notifier.send_message(summary_msg)
 

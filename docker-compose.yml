@@ -101,8 +101,47 @@ services:
     # - Marketable LIMIT execution with 0.2% price buffer
     #
     # 1. Paper Trading Mode (Simulated Execution + Full Telegram Alerts):
-    command: ["--paper", "--sizing-mode", "LOTS", "--lots", "2", "--daily-loss", "50000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
+    command: ["--paper", "--sizing-mode", "FIXED_RISK", "--risk", "2500", "--daily-loss", "10000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
     #
     # 2. Live Production Mode (Real Broker Order Execution via Kite Connect API + Telegram Alerts):
     # command: ["--live", "--sizing-mode", "FIXED_RISK", "--risk", "2500", "--daily-loss", "10000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
+    # -----------------------------------------------------------------------------------
+
+  silver-orb-desk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: silver_orb_desk
+    image: ${DOCKER_USER:-sharadprsn}/nifty_strangle_desk:latest
+    restart: unless-stopped
+    entrypoint: ["python", "run_silver_orb.py"]
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Kolkata
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "10"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    # -----------------------------------------------------------------------------------
+    # MCX Silver Mini 18:00 US Session Desk (2-Lot Tranche Scaling):
+    # - Contract: Auto-resolves near-month SILVERM (5 kg lot)
+    # - Setup: 17:45 - 18:00 reference range, 50 EMA trend filter on 15m
+    # - Risk: 2 Lots (10 kg), SL: 500 pts (Rs 5,000 risk)
+    # - Tranche: Lot 1 booked @ +800 pts (+Rs 4,000), Lot 2 trailed to Cost & rides to 22:45
+    # - Telegram Notifications: Strictly on Entry, SL, and Exit with Total Day P&L
+    #
+    # 1. Paper Trading Mode (Default):
+    command: ["--paper", "--lots", "2", "--sl", "500", "--target1", "800", "--order-type", "LIMIT", "--limit-buffer-pts", "15.0", "--poll", "5"]
+    #
+    # 2. Live Production Mode (When ready for real broker orders):
+    # command: ["--live", "--lots", "2", "--sl", "500", "--target1", "800", "--poll", "5"]
     # -----------------------------------------------------------------------------------

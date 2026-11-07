@@ -402,3 +402,29 @@ def test_orb_order_manager_limit_and_market_modes():
 
 
 
+
+
+def test_orb_desk_reset_for_new_day(tmp_path):
+    from unittest.mock import MagicMock
+    from datetime import date
+    kite_mock = MagicMock()
+    kite_mock.quote.return_value = {'NSE:NIFTY 50': {'ohlc': {'open': 24250.0}}}
+    cfg = ORBConfig(state_file=str(tmp_path / 'test_orb_state.json'))
+    om = ORBOrderManager(mode='PAPER')
+    desk = ORBDesk(kite=kite_mock, order_manager=om, config=cfg)
+
+    # Set state as if yesterday was traded
+    desk.ib_formed = True
+    desk.circuit_tripped = True
+    desk.traded_stocks_today.add('TATASTEEL')
+    desk.closed_trades.append({'symbol': 'TATASTEEL', 'realized_pnl_rs': 2500.0})
+
+    # Reset for tomorrow
+    tomorrow = date(2026, 11, 4)
+    desk.reset_for_new_day(tomorrow)
+
+    assert desk.today == '2026-11-04'
+    assert desk.ib_formed is False
+    assert desk.circuit_tripped is False
+    assert len(desk.traded_stocks_today) == 0
+    assert len(desk.closed_trades) == 0
