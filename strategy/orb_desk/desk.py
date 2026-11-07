@@ -10,11 +10,6 @@ from kiteconnect import KiteConnect
 
 from strategy.orb_desk.config import ORBConfig, TARGET_STOCKS, NIFTY_TOKEN, NIFTY_SYMBOL
 from strategy.orb_desk.order_manager import ORBOrderManager, _round_to_nse_tick
-from strategy.orb_desk.stock_selector import (
-    build_dynamic_watchlist,
-    screen_coiling_pattern_stocks,
-    get_fno_stock_metadata
-)
 from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger("orb.desk")
@@ -56,10 +51,8 @@ class ORBDesk:
         self.circuit_tripped: bool = False
         self.ib_formed: bool = False
 
-        # Dynamic stock selection state
+        # Target universe: Static 30 Stocks
         self.target_stocks: List[Dict[str, Any]] = list(TARGET_STOCKS)
-        self.pre_scanned_coiling: List[Dict[str, Any]] = []
-        self.dynamic_stocks_selected: bool = False
 
         self._load_state()
 
@@ -77,9 +70,7 @@ class ORBDesk:
             "armed_positions": self.armed_positions,
             "closed_trades": self.closed_trades,
             "stock_stats": self.stock_stats,
-            "target_stocks": self.target_stocks,
-            "pre_scanned_coiling": self.pre_scanned_coiling,
-            "dynamic_stocks_selected": self.dynamic_stocks_selected
+            "target_stocks": self.target_stocks
         }
         try:
             with open(self.state_file, "w") as f:
@@ -103,8 +94,6 @@ class ORBDesk:
                 self.closed_trades = data.get("closed_trades", [])
                 self.stock_stats = data.get("stock_stats", {})
                 self.target_stocks = data.get("target_stocks", list(TARGET_STOCKS))
-                self.pre_scanned_coiling = data.get("pre_scanned_coiling", [])
-                self.dynamic_stocks_selected = data.get("dynamic_stocks_selected", False)
                 logger.info(
                     "Restored daily state for %s: %d active, %d closed trades, %d target stocks.",
                     self.today,
@@ -179,52 +168,12 @@ class ORBDesk:
                         "reasons": item.get("reasons", [])
                     }
 
-    def select_dynamic_stocks(self, force: bool = False) -> List[Dict[str, Any]]:
-        """
-        Dynamically screens F&O universe for:
-          - Top N Gainers
-          - Top N Losers
-          - 3-day Coiling Pattern stocks (H3>H2>H1 and L3<L2<L1)
-        Updates self.target_stocks and fetches PDH/PDL for selected stocks.
-        """
-        if self.dynamic_stocks_selected and not force:
-            logger.info("Dynamic stocks already selected today (%d stocks).", len(self.target_stocks))
-            return self.target_stocks
-
-        # Pre-screen coiling stocks if enabled and not already done
-        if self.config.enable_coiling_filter and not self.pre_scanned_coiling:
-            fno_meta = get_fno_stock_metadata(self.kite)
-            symbols_data = [
-                {"symbol": sym, "token": v.get("nfo_token") or v.get("token"), "lot": v.get("lot_size", 1)}
-                for sym, v in fno_meta.items()
-            ]
-            self.pre_scanned_coiling = screen_coiling_pattern_stocks(self.kite, symbols_data, today_date=self.today)
-
-        watchlist = build_dynamic_watchlist(
-            kite=self.kite,
-            pre_scanned_coiling=self.pre_scanned_coiling,
-            top_gainers_n=self.config.top_gainers_n,
-            top_losers_n=self.config.top_losers_n,
-            today_date=self.today
-        )
-
-        if watchlist:
-            self.target_stocks = watchlist
-            self.dynamic_stocks_selected = True
-            logger.info("Dynamic stock selection active: %d stocks in watchlist.", len(self.target_stocks))
-            self._ensure_pdh_pdl_for_target_stocks(force=force)
-            self._save_state()
-        else:
-            logger.warning("Dynamic stock selection yielded no stocks. Retaining previous/fallback target stocks.")
-
-        return self.target_stocks
-
     def initialize_day(self, force: bool = False):
         """
-        Fetches Previous Day High (PDH) and Previous Day Low (PDL) for target stocks,
+        Fetches Previous Day High (PDH) and Previous Day Low (PDL) for the 30 target stocks,
         and retrieves NIFTY 50 Day Open.
         """
-        logger.info("Initializing ORB Desk for %s...", self.today)
+        logger.info("Initializing ORB Desk for %s (Static 30 Stocks)...", self.today)
 
         # Check NIFTY 50 Day Open
         try:
@@ -235,23 +184,7 @@ class ORBDesk:
         except Exception as e:
             logger.warning("Could not fetch NIFTY Day Open: %s", e)
 
-        if self.config.use_dynamic_stock_selection:
-            now_t = datetime.now().time()
-            if now_t >= dt_time(10, 15) or force:
-                self.select_dynamic_stocks(force=force)
-            else:
-                # Pre-screen coiling stocks in the morning so 10:15 is instantaneous
-                if self.config.enable_coiling_filter and not self.pre_scanned_coiling:
-                    fno_meta = get_fno_stock_metadata(self.kite)
-                    symbols_data = [
-                        {"symbol": sym, "token": v.get("nfo_token") or v.get("token"), "lot": v.get("lot_size", 1)}
-                        for sym, v in fno_meta.items()
-                    ]
-                    self.pre_scanned_coiling = screen_coiling_pattern_stocks(self.kite, symbols_data, today_date=self.today)
-                    self._save_state()
-        else:
-            self._ensure_pdh_pdl_for_target_stocks(force=force)
-
+        self._ensure_pdh_pdl_for_target_stocks(force=force)
         self._save_state()
         self._notify_desk_started()
 
@@ -260,12 +193,9 @@ class ORBDesk:
     # -------------------------------------------------------------------------
     def compute_initial_balance(self):
         """
-        Fetches 15-minute candles from 09:15 to 10:15 for target stocks
+        Fetches 15-minute candles from 09:15 to 10:15 for the 30 target stocks
         and records Initial Balance (IB High, IB Low).
         """
-        if self.config.use_dynamic_stock_selection and not self.dynamic_stocks_selected:
-            self.select_dynamic_stocks()
-
         logger.info("Computing 15-minute Initial Balance (09:15 - 10:15) for %d stocks...", len(self.target_stocks))
         now = datetime.now()
         today_start = datetime.combine(self.today, dt_time(9, 15))
@@ -761,12 +691,11 @@ class ORBDesk:
     # Rich Telegram Notifications
     # -------------------------------------------------------------------------
     def _notify_desk_started(self):
-        universe_type = "Dynamic F&O" if self.config.use_dynamic_stock_selection else "Static"
         msg = (
             f"🌅 <b>ORB Trading Desk Initialized</b>\n\n"
             f"📅 Date: <b>{self.today}</b>\n"
             f"⚙️ Mode: <b>{self.config.mode} TRADING</b>\n"
-            f"🎯 Universe: <b>{len(self.target_stocks)} Stocks ({universe_type})</b>\n"
+            f"🎯 Universe: <b>{len(self.target_stocks)} Stocks (Static 30 F&O)</b>\n"
             f"🛡️ Risk / Trade: <b>₹{self.config.fixed_risk_per_trade:,.0f}</b>\n"
             f"🛑 Daily Circuit Breaker: <b>₹{self.config.daily_stop_loss_limit:,.0f}</b>\n"
             f"📊 NIFTY Day Open: <b>{self.nifty_day_open or 'Pending'}</b>\n\n"

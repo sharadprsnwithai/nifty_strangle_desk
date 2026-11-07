@@ -45,8 +45,8 @@ class ORBConfig:
     # Sizing & Risk Guardrails (Option 3: Risk-Parity ₹2,500 Risk)
     fixed_risk_per_trade: float = 2500.0    # Fixed Rs Risk per trade
     max_trades_per_day: int = 5             # Maximum trades allowed in a single day
-    daily_stop_loss_limit: float = 10000.0  # Daily Portfolio Stop-Loss Circuit Breaker
-    sizing_mode: str = "FIXED_RISK"         # "FIXED_RISK" (default Option 3) or "LOTS"
+    daily_stop_loss_limit: float = 50000.0  # Daily Portfolio Stop-Loss Circuit Breaker (for 2 lots)
+    sizing_mode: str = "LOTS"               # "FIXED_RISK" or "LOTS" (2 lots production)
     lots: int = 2                           # Number of lots (used if sizing_mode="LOTS")
 
     # Strategy Filters
@@ -71,8 +71,5 @@ class ORBConfig:
     poll_interval_seconds: int = 5          # Position monitoring interval in seconds
     state_file: str = "data/orb_trades_today.json"
 
-    # Universe Selection (Static 30 High-Momentum F&O Stocks)
-    use_dynamic_stock_selection: bool = False  # Production standard: Static 30 Stocks Universe
-    top_gainers_n: int = 3                     # Optional dynamic screening parameter
-    top_losers_n: int = 3                      # Optional dynamic screening parameter
-    enable_coiling_filter: bool = True         # Optional dynamic screening parameter
+    # Universe: Strictly Static 30 High-Momentum F&O Stocks (Option 3 Desk)
+

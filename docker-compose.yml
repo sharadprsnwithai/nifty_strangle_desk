@@ -83,7 +83,7 @@ services:
     # - Marketable LIMIT execution with 0.2% price buffer
     #
     # 1. Paper Trading Mode (Simulated Execution + Full Telegram Alerts):
-    command: ["--paper", "--sizing-mode", "FIXED_RISK", "--risk", "2500", "--daily-loss", "10000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
+    command: ["--paper", "--sizing-mode", "LOTS", "--lots", "2", "--daily-loss", "50000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
     #
     # 2. Live Production Mode (Real Broker Order Execution via Kite Connect API + Telegram Alerts):
     # command: ["--live", "--sizing-mode", "FIXED_RISK", "--risk", "2500", "--daily-loss", "10000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]

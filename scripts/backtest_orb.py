@@ -24,14 +24,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import numpy as np
 from kite import get_kite_client
-from strategy.orb_desk.stock_selector import get_fno_stock_metadata, is_coiling_pattern
 from strategy.orb_desk.config import TARGET_STOCKS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("orb.dynamic_backtest")
+logger = logging.getLogger("orb.static_backtest")
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-CACHE_DIR = DATA_DIR / "cache_15m_fno"
+CACHE_DIR = DATA_DIR / "cache_15m"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 NIFTY_TOKEN = 256265
@@ -43,13 +42,10 @@ NIFTY_SYMBOL = "NSE:NIFTY 50"
 # ---------------------------------------------------------------------------
 def download_all_historical_data(kite, days: int = 90) -> None:
     """
-    Downloads 15-minute historical candles from Kite Connect for NIFTY and all F&O stocks.
+    Downloads 15-minute historical candles from Kite Connect for NIFTY and Static 30 F&O stocks.
     Caches each instrument to disk to ensure repeatable offline backtesting.
     """
-    logger.info("Discovering F&O stock universe metadata from Kite...")
-    fno_meta = get_fno_stock_metadata(kite)
-    logger.info("Found %d F&O stocks.", len(fno_meta))
-
+    logger.info("Downloading historical data for Static 30 Stocks...")
     to_d = datetime.now()
     from_d = to_d - timedelta(days=days)
 
@@ -66,21 +62,14 @@ def download_all_historical_data(kite, days: int = 90) -> None:
             logger.error("Failed to fetch NIFTY 50: %s", e)
         time.sleep(0.35)
 
-    # 2. Download all F&O stocks
-    # First, get NSE equity tokens from kite.instruments("NSE")
-    logger.info("Fetching NSE instruments to map underlying symbols to equity tokens...")
-    nse_instruments = kite.instruments("NSE")
-    nse_token_map = {
-        i["tradingsymbol"]: i["instrument_token"]
-        for i in nse_instruments
-        if i.get("segment") == "NSE" and i.get("instrument_type") == "EQ"
-    }
-
-    total_stocks = len(fno_meta)
+    # 2. Download Static 30 Stocks
+    total_stocks = len(TARGET_STOCKS)
     downloaded = 0
     skipped = 0
 
-    for idx, (sym, meta) in enumerate(fno_meta.items(), 1):
+    for idx, item in enumerate(TARGET_STOCKS, 1):
+        sym = item["symbol"]
+        token = item.get("token")
         clean_sym = sym.replace("&", "_")
         cache_file = CACHE_DIR / f"{clean_sym}_15m.csv"
 
@@ -88,26 +77,20 @@ def download_all_historical_data(kite, days: int = 90) -> None:
             skipped += 1
             continue
 
-        token = nse_token_map.get(sym) or meta.get("nfo_token")
-        if not token:
-            logger.warning("[%d/%d] No token found for %s", idx, total_stocks, sym)
-            continue
-
         try:
             res = kite.historical_data(token, from_date=from_d, to_date=to_d, interval="15minute")
             if res:
                 df = pd.DataFrame(res)
-                df["lot_size"] = meta.get("lot_size", 1)
+                df["lot_size"] = item.get("lot", 1)
                 df.to_csv(cache_file, index=False)
                 downloaded += 1
-                if downloaded % 20 == 0 or idx == total_stocks:
-                    logger.info("[%d/%d] Downloaded %d stocks so far (latest: %s, %d bars)", idx, total_stocks, downloaded, sym, len(df))
+                logger.info("[%d/%d] Downloaded %s (%d bars)", idx, total_stocks, sym, len(df))
             else:
                 logger.warning("[%d/%d] No candles returned for %s", idx, total_stocks, sym)
         except Exception as e:
             logger.warning("[%d/%d] Failed to fetch %s: %s", idx, total_stocks, sym, e)
 
-        time.sleep(0.35)  # Respect Kite rate limit
+        time.sleep(0.35)
 
     logger.info("Data download complete. Downloaded: %d, Cached/Skipped: %d, Total: %d", downloaded, skipped, total_stocks)
 
@@ -184,129 +167,13 @@ def preload_indexed_data() -> Tuple[Dict[date, Dict[str, Any]], Dict[str, Dict[s
 
 
 # ---------------------------------------------------------------------------
-# Daily Dynamic Screener Simulation
-# ---------------------------------------------------------------------------
-def screen_day_stocks_at_1015(
-    stock_data: Dict[str, Dict[str, Any]],
-    current_day: date,
-    trading_days: List[date],
-    day_idx: int,
-    top_n_gainers: int = 3,
-    top_n_losers: int = 3,
-    enable_coiling: bool = True
-) -> List[Dict[str, Any]]:
-    """
-    Simulates real-time 10:15 AM stock selection on historical day D:
-      1. Top N Gainers & Top N Losers at 10:15 AM:
-         % Change = (10:15 Close - PrevDay Close) / PrevDay Close * 100
-      2. 3-day contraction / coiling pattern:
-         H(D-3) > H(D-2) > H(D-1) and L(D-3) < L(D-2) < L(D-1)
-    """
-    if day_idx < 3:
-        return []
-
-    prev_day = trading_days[day_idx - 1]
-    prev_day_2 = trading_days[day_idx - 2]
-    prev_day_3 = trading_days[day_idx - 3]
-
-    stock_pct_changes = []
-    coiling_candidates = []
-
-    for sym, s_info in stock_data.items():
-        days_map = s_info["day_groups"]
-        if current_day not in days_map or prev_day not in days_map:
-            continue
-
-        today_bars = days_map[current_day]
-        prev_bars = days_map[prev_day]
-
-        if len(today_bars) < 4:  # Needs at least 4 bars for 09:15-10:15
-            continue
-
-        prev_close = float(prev_bars.iloc[-1]["close"])
-        bar_1015_close = float(today_bars.iloc[3]["close"])  # Candle 4 close at 10:15
-
-        if prev_close > 0:
-            pct_change = ((bar_1015_close - prev_close) / prev_close) * 100.0
-            stock_pct_changes.append({
-                "symbol": sym,
-                "pct_change": pct_change,
-                "lot": s_info["lot"]
-            })
-
-        # Check 3-day coiling pattern if previous 3 days exist
-        if enable_coiling and prev_day_2 in days_map and prev_day_3 in days_map:
-            d3_bars = days_map[prev_day_3]
-            d2_bars = days_map[prev_day_2]
-            d1_bars = prev_bars
-
-            c3 = {"high": float(d3_bars["high"].max()), "low": float(d3_bars["low"].min())}
-            c2 = {"high": float(d2_bars["high"].max()), "low": float(d2_bars["low"].min())}
-            c1 = {"high": float(d1_bars["high"].max()), "low": float(d1_bars["low"].min())}
-
-            if (c3["high"] > c2["high"] > c1["high"]) and (c3["low"] < c2["low"] < c1["low"]):
-                coiling_candidates.append({
-                    "symbol": sym,
-                    "lot": s_info["lot"],
-                    "reasons": ["COILING"]
-                })
-
-    if not stock_pct_changes:
-        return []
-
-    # Sort for Top Gainers & Losers
-    sorted_by_pct = sorted(stock_pct_changes, key=lambda x: x["pct_change"], reverse=True)
-    top_gainers = sorted_by_pct[:top_n_gainers]
-    top_losers = sorted_by_pct[-top_n_losers:]
-
-    # Deduplicate into combined watchlist map
-    watchlist_map: Dict[str, Dict[str, Any]] = {}
-
-    for g in top_gainers:
-        sym = g["symbol"]
-        watchlist_map[sym] = {
-            "symbol": sym,
-            "lot": g["lot"],
-            "pct_change": g["pct_change"],
-            "reasons": ["TOP_GAINER"]
-        }
-
-    for l in top_losers:
-        sym = l["symbol"]
-        if sym in watchlist_map:
-            watchlist_map[sym]["reasons"].append("TOP_LOSER")
-        else:
-            watchlist_map[sym] = {
-                "symbol": sym,
-                "lot": l["lot"],
-                "pct_change": l["pct_change"],
-                "reasons": ["TOP_LOSER"]
-            }
-
-    for c in coiling_candidates:
-        sym = c["symbol"]
-        if sym in watchlist_map:
-            if "COILING" not in watchlist_map[sym]["reasons"]:
-                watchlist_map[sym]["reasons"].append("COILING")
-        else:
-            watchlist_map[sym] = {
-                "symbol": sym,
-                "lot": c["lot"],
-                "pct_change": None,
-                "reasons": ["COILING"]
-            }
-
-    return list(watchlist_map.values())
-
-
-# ---------------------------------------------------------------------------
-# Core Portfolio Backtest Engine
+# Core Portfolio Backtest Engine (Static 30 Stocks Universe)
 # ---------------------------------------------------------------------------
 def run_orb_simulation(
     nifty_day_map: Dict[date, Dict[str, Any]],
     stock_data: Dict[str, Dict[str, Any]],
     trading_days: List[date],
-    use_dynamic_selection: bool = True,
+    use_dynamic_selection: bool = False,
     static_stock_symbols: Optional[List[str]] = None,
     fixed_risk_rs: float = 2500.0,
     sizing_mode: str = "FIXED_RISK",
@@ -334,10 +201,10 @@ def run_orb_simulation(
     armed_total = 0
     invalidated_total = 0
 
-    # Start from index 3 to have T-3, T-2, T-1 history
-    sim_days = trading_days[3:]
+    # Start from index 1 to have T-1 (prev day) history
+    sim_days = trading_days[1:]
 
-    for day_idx, d in enumerate(sim_days, 3):
+    for day_idx, d in enumerate(sim_days, 1):
         prev_day = trading_days[day_idx - 1]
         n_info = nifty_day_map.get(d)
         if not n_info:
@@ -346,21 +213,9 @@ def run_orb_simulation(
         n_day_open = n_info["day_open"]
         n_bars = n_info["bars"]
 
-        # 1. Determine Watchlist for Today
-        if use_dynamic_selection:
-            candidates_meta = screen_day_stocks_at_1015(
-                stock_data=stock_data,
-                current_day=d,
-                trading_days=trading_days,
-                day_idx=day_idx,
-                top_n_gainers=3,
-                top_n_losers=3,
-                enable_coiling=True
-            )
-        else:
-            # Static universe baseline from TARGET_STOCKS config
-            sym_list = static_stock_symbols or [s["symbol"] for s in TARGET_STOCKS]
-            candidates_meta = [{"symbol": s, "lot": stock_data[s]["lot"], "reasons": ["STATIC"]} for s in sym_list if s in stock_data]
+        # Watchlist: Static 30 Stocks
+        sym_list = static_stock_symbols or [s["symbol"] for s in TARGET_STOCKS]
+        candidates_meta = [{"symbol": s, "lot": stock_data[s]["lot"], "reasons": ["STATIC"]} for s in sym_list if s in stock_data]
 
         if not candidates_meta:
             continue
@@ -801,21 +656,7 @@ def run_backtest_suite(days: int = 90, sizing_mode: str = "FIXED_RISK", fixed_ri
     nifty_day_map, stock_data, trading_days = preload_indexed_data()
 
     logger.info("=" * 80)
-    logger.info("  RUNNING BACKTEST: DYNAMIC F&O SELECTION (Option 3 Canonical Desk)")
-    logger.info("=" * 80)
-
-    res_dynamic = run_orb_simulation(
-        nifty_day_map=nifty_day_map,
-        stock_data=stock_data,
-        trading_days=trading_days,
-        use_dynamic_selection=True,
-        sizing_mode=sizing_mode,
-        fixed_risk_rs=fixed_risk_rs,
-        lots=lots
-    )
-
-    logger.info("=" * 80)
-    logger.info("  RUNNING BACKTEST: BASELINE (Static 30 Stocks Universe)")
+    logger.info("  RUNNING BACKTEST: STATIC 30 STOCKS UNIVERSE (Option 3 Canonical Desk)")
     logger.info("=" * 80)
 
     res_static = run_orb_simulation(
@@ -828,124 +669,77 @@ def run_backtest_suite(days: int = 90, sizing_mode: str = "FIXED_RISK", fixed_ri
         lots=lots
     )
 
-    return res_dynamic, res_static, trading_days
+    return res_static, trading_days
 
 
-def print_comparison_report(res_dyn: Dict[str, Any], res_stat: Dict[str, Any], days: List[date], sizing_mode: str = "FIXED_RISK"):
-    print("\n" + "=" * 92)
-    print("      15-MINUTE ORB BACKTEST PERFORMANCE REPORT (OPTION 3 CANONICAL DESK)")
-    print("=" * 92)
-    print(f"Period: {days[0]} to {days[-1]} ({len(days)} trading days across 219 F&O Stocks)")
+def print_report(res_stat: Dict[str, Any], days: List[date], sizing_mode: str = "FIXED_RISK"):
+    print("\n" + "=" * 80)
+    print("      15-MINUTE ORB BACKTEST PERFORMANCE REPORT (STATIC 30 STOCKS)")
+    print("=" * 80)
+    print(f"Period: {days[0]} to {days[-1]} ({len(days)} trading days across Static 30 F&O Stocks)")
     print(f"Strategy: Armed Candle Confirmation | 50% Booked at 1:1 R | SL Trailed to Cost | 3:00 PM IST Exit")
     print(f"Sizing Mode: {sizing_mode} | Max 5 Trades/Day | Rs 10,000 Portfolio Circuit Breaker")
-    print("-" * 92)
-    print(f"{'Performance Metric':<35} | {'Dynamic F&O Selection':<24} | {'Static 30 Stocks':<24}")
-    print("-" * 92)
+    print("-" * 80)
 
-    pnl_dyn = res_dyn.get("total_pnl", 0.0)
-    pnl_stat = res_stat.get("total_pnl", 0.0)
-    trades_dyn = res_dyn.get("total_trades", 0)
-    trades_stat = res_stat.get("total_trades", 0)
-    wr_dyn = res_dyn.get("win_rate_pct", 0.0)
-    wr_stat = res_stat.get("win_rate_pct", 0.0)
-    pf_dyn = res_dyn.get("profit_factor", 0.0)
-    pf_stat = res_stat.get("profit_factor", 0.0)
-    dd_dyn = res_dyn.get("max_drawdown_rs", 0.0)
-    dd_stat = res_stat.get("max_drawdown_rs", 0.0)
-    ret_dd_dyn = res_dyn.get("return_to_dd", 0.0)
-    ret_dd_stat = res_stat.get("return_to_dd", 0.0)
-    cb_dyn = res_dyn.get("circuit_breaker_trips", 0)
-    cb_stat = res_stat.get("circuit_breaker_trips", 0)
-    armed_dyn = res_dyn.get("armed_total", 0)
-    armed_stat = res_stat.get("armed_total", 0)
-    inval_dyn = res_dyn.get("invalidated_total", 0)
-    inval_stat = res_stat.get("invalidated_total", 0)
+    pnl = res_stat.get("total_pnl", 0.0)
+    trades = res_stat.get("total_trades", 0)
+    wr = res_stat.get("win_rate_pct", 0.0)
+    pf = res_stat.get("profit_factor", 0.0)
+    dd = res_stat.get("max_drawdown_rs", 0.0)
+    ret_dd = res_stat.get("return_to_dd", 0.0)
+    cb = res_stat.get("circuit_breaker_trips", 0)
+    armed = res_stat.get("armed_total", 0)
+    inval = res_stat.get("invalidated_total", 0)
 
-    print(f"{'Total Realized P&L (Rs)':<35} | Rs {pnl_dyn:>17,.2f} | Rs {pnl_stat:>17,.2f}")
-    print(f"{'Total Trades Executed':<35} | {trades_dyn:>22} | {trades_stat:>22}")
-    print(f"{'Win Rate (%)':<35} | {wr_dyn:>21.1f}% | {wr_stat:>21.1f}%")
-    print(f"{'Profit Factor':<35} | {pf_dyn:>22.2f} | {pf_stat:>22.2f}")
-    print(f"{'Average P&L / Trade (Rs)':<35} | Rs {(pnl_dyn/trades_dyn if trades_dyn else 0):>17,.2f} | Rs {(pnl_stat/trades_stat if trades_stat else 0):>17,.2f}")
-    print(f"{'Max Portfolio Drawdown (Rs)':<35} | Rs {dd_dyn:>17,.2f} | Rs {dd_stat:>17,.2f}")
-    print(f"{'Return / Max Drawdown Ratio':<35} | {ret_dd_dyn:>21.2f}x | {ret_dd_stat:>21.2f}x")
-    print(f"{'Total Armed Setups':<35} | {armed_dyn:>22} | {armed_stat:>22}")
-    print(f"{'Invalidated (Avoided Traps)':<35} | {inval_dyn:>22} | {inval_stat:>22}")
-    print(f"{'Circuit Breaker Halts (Days)':<35} | {cb_dyn:>22} | {cb_stat:>22}")
-    print("-" * 92)
+    print(f"{'Total Realized P&L (Rs)':<35} : Rs {pnl:>14,.2f}")
+    print(f"{'Total Trades Executed':<35} : {trades:>14}")
+    print(f"{'Win Rate (%)':<35} : {wr:>13.1f}%")
+    print(f"{'Profit Factor':<35} : {pf:>14.2f}")
+    print(f"{'Average P&L / Trade (Rs)':<35} : Rs {(pnl/trades if trades else 0):>14,.2f}")
+    print(f"{'Max Portfolio Drawdown (Rs)':<35} : Rs {dd:>14,.2f}")
+    print(f"{'Return / Max Drawdown Ratio':<35} : {ret_dd:>13.2f}x")
+    print(f"{'Total Armed Setups':<35} : {armed:>14}")
+    print(f"{'Invalidated (Avoided Traps)':<35} : {inval:>14}")
+    print(f"{'Circuit Breaker Halts (Days)':<35} : {cb:>14}")
+    print("-" * 80)
 
     # Exit reason breakdown
-    print("\n" + "-" * 92)
+    print("\n" + "-" * 80)
     print("   EXIT REASON BREAKDOWN:")
-    print("-" * 92)
-    print(f"{'Exit Reason':<25} | {'Dynamic Trades':<15} | {'Dynamic P&L (Rs)':<18} | {'Static Trades':<15} | {'Static P&L (Rs)':<18}")
-    print("-" * 92)
-    all_reasons = set(res_dyn.get("exit_breakdown", {}).keys()) | set(res_stat.get("exit_breakdown", {}).keys())
-    for r in sorted(list(all_reasons)):
-        d_info = res_dyn.get("exit_breakdown", {}).get(r, {"count": 0, "sum_pnl": 0.0})
-        s_info = res_stat.get("exit_breakdown", {}).get(r, {"count": 0, "sum_pnl": 0.0})
-        print(f"{r:<25} | {d_info['count']:>15} | Rs {d_info['sum_pnl']:>14,.2f} | {s_info['count']:>15} | Rs {s_info['sum_pnl']:>14,.2f}")
-    print("-" * 92)
-
-    # Category breakdown for dynamic
-    reasons = res_dyn.get("reasons_breakdown", {})
-    if reasons:
-        print("\n" + "-" * 92)
-        print("   DYNAMIC SELECTION CATEGORY BREAKDOWN:")
-        print("-" * 92)
-        print(f"{'Category':<25} | {'Trades':<10} | {'Win Rate':<12} | {'Total P&L (Rs)':<18} | {'Avg P&L (Rs)':<15}")
-        print("-" * 92)
-        for cat, stat in reasons.items():
-            print(f"{cat:<25} | {stat['trades']:<10} | {stat['win_rate']:>9.1f}% | Rs {stat['pnl']:>12,.2f} | Rs {stat['avg_pnl']:>9,.2f}")
-        print("-" * 92)
+    print("-" * 80)
+    print(f"{'Exit Reason':<25} | {'Trades':<10} | {'Total P&L (Rs)':<18} | {'Avg P&L (Rs)':<15}")
+    print("-" * 80)
+    for r, info in sorted(res_stat.get("exit_breakdown", {}).items()):
+        print(f"{r:<25} | {info['count']:>10} | Rs {info['sum_pnl']:>14,.2f} | Rs {info['avg_pnl']:>11,.2f}")
+    print("-" * 80)
 
     # Save summary report
     report_data = {
-        "strategy": "OPTION_3_CANONICAL_ORB",
+        "strategy": "OPTION_3_STATIC_30_ORB",
         "sizing_mode": sizing_mode,
-        "dynamic": {
-            "total_pnl": pnl_dyn,
-            "total_trades": trades_dyn,
-            "win_rate": wr_dyn,
-            "profit_factor": pf_dyn,
-            "max_drawdown": dd_dyn,
-            "return_to_dd": ret_dd_dyn,
-            "armed_total": armed_dyn,
-            "invalidated_total": inval_dyn,
-            "circuit_breaker_trips": cb_dyn,
-            "exit_breakdown": res_dyn.get("exit_breakdown", {}),
-            "reasons_breakdown": reasons
-        },
-        "static": {
-            "total_pnl": pnl_stat,
-            "total_trades": trades_stat,
-            "win_rate": wr_stat,
-            "profit_factor": pf_stat,
-            "max_drawdown": dd_stat,
-            "return_to_dd": ret_dd_stat,
-            "armed_total": armed_stat,
-            "invalidated_total": inval_stat,
-            "circuit_breaker_trips": cb_stat,
+        "static_30": {
+            "total_pnl": pnl,
+            "total_trades": trades,
+            "win_rate": wr,
+            "profit_factor": pf,
+            "max_drawdown": dd,
+            "return_to_dd": ret_dd,
+            "armed_total": armed,
+            "invalidated_total": inval,
+            "circuit_breaker_trips": cb,
             "exit_breakdown": res_stat.get("exit_breakdown", {})
         }
     }
-    report_file = DATA_DIR / "dynamic_orb_backtest_report.json"
+    report_file = DATA_DIR / "orb_30_stocks_backtest_report.json"
     with open(report_file, "w") as f:
         json.dump(report_data, f, indent=2, default=str)
     print(f"\nSaved full structured report to: {report_file}")
-    print("=" * 92 + "\n")
+    print("=" * 80 + "\n")
 
 
 if __name__ == "__main__":
     days_to_test = 90
     if len(sys.argv) > 1 and sys.argv[1].isdigit():
         days_to_test = int(sys.argv[1])
-    res_dyn, res_stat, days = run_backtest_suite(days=days_to_test)
-    print_comparison_report(res_dyn, res_stat, days)
-
-
-if __name__ == "__main__":
-    days_to_test = 90
-    if len(sys.argv) > 1 and sys.argv[1].isdigit():
-        days_to_test = int(sys.argv[1])
-    res_dyn, res_stat, days = run_backtest_suite(days=days_to_test)
-    print_comparison_report(res_dyn, res_stat, days)
+    res_stat, days = run_backtest_suite(days=days_to_test)
+    print_report(res_stat, days)

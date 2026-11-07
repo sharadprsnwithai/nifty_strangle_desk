@@ -49,10 +49,6 @@ def parse_args(args=None):
     parser.add_argument("--exchange", choices=["NSE", "NFO"], default="NSE", help="Exchange segment (default: NSE)")
     parser.add_argument("--dry-run", action="store_true", help="Initialize desk, verify Kite and Telegram, and display setup status without looping")
     parser.add_argument("--once", action="store_true", help="Run single scan/monitor cycle and exit")
-    parser.add_argument("--dynamic-stocks", action="store_true", help="Enable dynamic F&O screening (default: False, runs Static 30 stocks universe)")
-    parser.add_argument("--top-gainers", type=int, default=3, help="Number of Top Gainers to screen if dynamic enabled (default: 3)")
-    parser.add_argument("--top-losers", type=int, default=3, help="Number of Top Losers to screen if dynamic enabled (default: 3)")
-    parser.add_argument("--no-coiling", action="store_true", help="Disable 3-day contraction / coiling pattern filter")
 
     return parser.parse_args(args)
 
@@ -84,11 +80,7 @@ def main(args=None):
         mode=mode,
         product=parsed.product,
         exchange=parsed.exchange,
-        poll_interval_seconds=parsed.poll,
-        use_dynamic_stock_selection=parsed.dynamic_stocks,
-        top_gainers_n=parsed.top_gainers,
-        top_losers_n=parsed.top_losers,
-        enable_coiling_filter=not parsed.no_coiling
+        poll_interval_seconds=parsed.poll
     )
 
     om = ORBOrderManager(
@@ -113,16 +105,13 @@ def main(args=None):
     if parsed.dry_run:
         logger.info("[DRY RUN] Initialized successfully. Inspecting status:")
         logger.info("  NIFTY 50 Day Open : %s", desk.nifty_day_open)
-        logger.info("  Stock Selection   : %s", "Dynamic F&O" if orb_cfg.use_dynamic_stock_selection else "Static")
-        logger.info("  Target Universe   : %d stocks", len(desk.target_stocks))
+        logger.info("  Target Universe   : %d stocks (Static 30 F&O)", len(desk.target_stocks))
         for item in desk.target_stocks:
             sym = item["symbol"]
             stat = desk.stock_stats.get(sym, {})
-            reasons = "+".join(item.get("reasons", [])) or "STATIC"
-            pct_str = f"{item['pct_change']:+.2f}%" if item.get("pct_change") is not None else "N/A"
             logger.info(
-                "    -> %-12s | Reasons: %-22s | Day Chg: %-8s | PDH: %s | PDL: %s",
-                sym, reasons, pct_str, stat.get("pdh"), stat.get("pdl")
+                "    -> %-12s | PDH: %s | PDL: %s",
+                sym, stat.get("pdh"), stat.get("pdl")
             )
         logger.info("  Active Positions  : %d", len(desk.active_positions))
         logger.info("  Closed Trades     : %d", len(desk.closed_trades))

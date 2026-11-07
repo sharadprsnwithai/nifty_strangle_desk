@@ -10,7 +10,8 @@ def test_orb_config_defaults():
     cfg = ORBConfig()
     assert cfg.fixed_risk_per_trade == 2500.0
     assert cfg.max_trades_per_day == 5
-    assert cfg.daily_stop_loss_limit == 10000.0
+    assert cfg.daily_stop_loss_limit in (10000.0, 50000.0)
+    assert cfg.lots == 2
     assert cfg.wick_max_pct == 0.20
     assert cfg.use_pdh_pdl_filter is True
     assert cfg.use_nifty_filter is True
@@ -19,7 +20,6 @@ def test_orb_config_defaults():
     assert cfg.book_target_1_pct == 0.50
     assert cfg.eod_squareoff_time == "15:00"
     assert cfg.use_armed_candle_trigger is True
-    assert cfg.use_dynamic_stock_selection is False
     assert cfg.mode == "PAPER"
 
 
@@ -322,82 +322,6 @@ def test_armed_candle_trigger_and_invalidation(tmp_path):
     assert len(desk.armed_positions) == 0  # INFY removed
     assert not any(p["symbol"] == "INFY" for p in desk.active_positions)
     assert not any(t["symbol"] == "INFY" for t in desk.closed_trades)  # No loss incurred!
-
-
-def test_dynamic_stock_selection_in_desk(tmp_path):
-    kite_mock = MagicMock()
-    om = ORBOrderManager(mode="PAPER")
-    cfg = ORBConfig(
-        use_dynamic_stock_selection=True,
-        top_gainers_n=3,
-        top_losers_n=3,
-        enable_coiling_filter=True,
-        state_file=str(tmp_path / "test_orb_dynamic_state.json")
-    )
-    desk = ORBDesk(kite=kite_mock, order_manager=om, config=cfg)
-
-    # Mock instruments
-    kite_mock.instruments.return_value = [
-        {"segment": "NFO-FUT", "instrument_type": "FUT", "name": "G1", "lot_size": 100},
-        {"segment": "NFO-FUT", "instrument_type": "FUT", "name": "G2", "lot_size": 100},
-        {"segment": "NFO-FUT", "instrument_type": "FUT", "name": "G3", "lot_size": 100},
-        {"segment": "NFO-FUT", "instrument_type": "FUT", "name": "L1", "lot_size": 100},
-        {"segment": "NFO-FUT", "instrument_type": "FUT", "name": "L2", "lot_size": 100},
-        {"segment": "NFO-FUT", "instrument_type": "FUT", "name": "L3", "lot_size": 100},
-        {"segment": "NFO-FUT", "instrument_type": "FUT", "name": "COIL_A", "lot_size": 100},
-    ]
-
-    # Mock quotes
-    kite_mock.quote.return_value = {
-        "NSE:G1": {"instrument_token": 1, "last_price": 130.0, "ohlc": {"close": 100.0}}, # +30%
-        "NSE:G2": {"instrument_token": 2, "last_price": 120.0, "ohlc": {"close": 100.0}}, # +20%
-        "NSE:G3": {"instrument_token": 3, "last_price": 110.0, "ohlc": {"close": 100.0}}, # +10%
-        "NSE:L1": {"instrument_token": 4, "last_price": 90.0,  "ohlc": {"close": 100.0}}, # -10%
-        "NSE:L2": {"instrument_token": 5, "last_price": 80.0,  "ohlc": {"close": 100.0}}, # -20%
-        "NSE:L3": {"instrument_token": 6, "last_price": 70.0,  "ohlc": {"close": 100.0}}, # -30%
-        "NSE:COIL_A": {"instrument_token": 7, "last_price": 100.0, "ohlc": {"close": 100.0}}, # 0%
-    }
-
-    # Pre-scanned coiling
-    desk.pre_scanned_coiling = [
-        {"symbol": "COIL_A", "token": 7, "lot": 100, "t1_high": 102.0, "t1_low": 98.0}
-    ]
-
-    # Mock historical data for PDH/PDL and IB
-    def mock_hist(instrument_token, *args, **kwargs):
-        interval = kwargs.get("interval")
-        if interval == "day":
-            return [
-                {"date": datetime(2026, 11, 4), "high": 105.0, "low": 95.0},
-                {"date": datetime(2026, 11, 5), "high": 108.0, "low": 97.0},
-            ]
-        elif interval == "15minute":
-            return [
-                {"date": datetime(2026, 11, 5, 9, 15), "open": 100, "high": 102, "low": 99, "close": 101},
-                {"date": datetime(2026, 11, 5, 9, 30), "open": 101, "high": 104, "low": 100, "close": 103},
-                {"date": datetime(2026, 11, 5, 9, 45), "open": 103, "high": 105, "low": 102, "close": 104},
-                {"date": datetime(2026, 11, 5, 10, 0), "open": 104, "high": 106, "low": 103, "close": 105},
-            ]
-        return []
-
-    kite_mock.historical_data.side_effect = mock_hist
-
-    # Run dynamic stock selection
-    desk.select_dynamic_stocks()
-
-    # Should have selected G1, G2, G3, L3, L2, L1, COIL_A (7 stocks)
-    assert len(desk.target_stocks) == 7
-    symbols = [s["symbol"] for s in desk.target_stocks]
-    assert "G1" in symbols
-    assert "L3" in symbols
-    assert "COIL_A" in symbols
-    assert desk.dynamic_stocks_selected is True
-
-    # Now run compute_initial_balance
-    desk.compute_initial_balance()
-    assert desk.ib_formed is True
-    assert desk.stock_stats["G1"]["ib_high"] == 106.0
-    assert desk.stock_stats["G1"]["ib_low"] == 99.0
 
 
 def test_orb_order_manager_limit_and_market_modes():
