@@ -115,7 +115,8 @@ def get_nse_fo_ban_list(
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
                     banned_symbols = {line.strip().upper() for line in f if line.strip()}
-            except Exception:
+            except Exception as fb_err:
+                logger.warning("Could not read fallback F&O ban cache %s: %s", cache_file, fb_err)
                 banned_symbols = set()
 
     return _apply_env_overrides(banned_symbols)

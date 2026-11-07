@@ -11,6 +11,7 @@ from kiteconnect import KiteConnect
 from strategy.orb_desk.config import ORBConfig, TARGET_STOCKS, NIFTY_TOKEN, NIFTY_SYMBOL
 from strategy.orb_desk.order_manager import ORBOrderManager, _round_to_nse_tick
 from strategy.fo_ban import get_nse_fo_ban_list, filter_banned_stocks
+from kite.client import ensure_kite_session
 from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger("orb.desk")
@@ -57,6 +58,19 @@ class ORBDesk:
         self.banned_stocks_today: List[str] = []
 
         self._load_state()
+
+    def _ensure_kite_session(self, kite: Optional[KiteConnect] = None, force_login: bool = False) -> Optional[KiteConnect]:
+        """Ensures an active, valid KiteConnect session, re-authenticating if expired."""
+        try:
+            active_kite = ensure_kite_session(kite or self.kite, force_login=force_login)
+            if active_kite:
+                self.kite = active_kite
+                if self.om and hasattr(self.om, "kite") and self.om.kite is not None:
+                    self.om.kite = active_kite
+            return active_kite
+        except Exception as e:
+            logger.error("Failed to re-authenticate Kite session for ORB Desk: %s", e, exc_info=True)
+            return self.kite
 
     # -------------------------------------------------------------------------
     # State Persistence
@@ -458,15 +472,20 @@ class ORBDesk:
         )
 
         # Place Entry Order
-        order_res = self.om.place_entry(
-            symbol=sym,
-            direction=direction,
-            quantity=qty,
-            entry_price=entry_price,
-            initial_sl=initial_sl,
-            target_2_5r=0.0
-        )
+        try:
+            order_res = self.om.place_entry(
+                symbol=sym,
+                direction=direction,
+                quantity=qty,
+                entry_price=entry_price,
+                initial_sl=initial_sl,
+                target_2_5r=0.0
+            )
+        except Exception as e:
+            logger.error("[ENTRY FAILED] Failed to place %s entry for %s: %s", direction, sym, e, exc_info=True)
+            return
 
+        order_id = order_res.get("order_id") if isinstance(order_res, dict) else str(order_res)
         pos_record = {
             "symbol": sym,
             "direction": direction,
@@ -480,7 +499,7 @@ class ORBDesk:
             "half_booked": False,
             "be_moved": False,
             "entry_time": datetime.now().strftime("%H:%M:%S"),
-            "order_id": order_res.get("order_id"),
+            "order_id": order_id,
             "wick_pct": cand["wick_ratio"] * 100
         }
 
@@ -523,8 +542,18 @@ class ORBDesk:
         try:
             quotes = self.kite.ltp(symbols_to_fetch)
         except Exception as e:
-            logger.error("Failed to fetch live quotes for positions: %s", e)
-            return
+            err_str = str(e).lower()
+            if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+                logger.warning("Token error during live quote polling (%s). Refreshing session...", e)
+                try:
+                    self.kite = self._ensure_kite_session(self.kite, force_login=True)
+                    quotes = self.kite.ltp(symbols_to_fetch)
+                except Exception as retry_err:
+                    logger.error("Failed to fetch live quotes after re-authentication: %s", retry_err, exc_info=True)
+                    return
+            else:
+                logger.error("Failed to fetch live quotes for positions: %s", e, exc_info=True)
+                return
 
         # ---------------------------------------------------------------------
         # 1. Process Armed Setups (Waiting for break of armed candle)
@@ -620,13 +649,16 @@ class ORBDesk:
                 half_booked_pnl = (t_1r - entry_p) * half_qty if direction == "LONG" else (entry_p - t_1r) * half_qty
                 pos["half_booked_pnl"] = half_booked_pnl
                 logger.info("50%% Booked at Target 1 on %s (+Rs %.2f). SL trailed to Cost (Rs %.2f)", sym, half_booked_pnl, entry_p)
-                self.om.place_exit(
-                    symbol=sym,
-                    direction=direction,
-                    quantity=half_qty,
-                    exit_price=t_1r,
-                    reason="TARGET_1R_BOOK_50%"
-                )
+                try:
+                    self.om.place_exit(
+                        symbol=sym,
+                        direction=direction,
+                        quantity=half_qty,
+                        exit_price=t_1r,
+                        reason="TARGET_1R_BOOK_50%"
+                    )
+                except Exception as exit_err:
+                    logger.error("Failed to place Target 1 exit order for %s: %s", sym, exit_err, exc_info=True)
                 self._notify_target_booked(pos, t_1r, half_booked_pnl)
 
             # C. Mandatory 3:00 PM IST Square-Off (Option 3 Canonical Runner Exit)
@@ -637,13 +669,16 @@ class ORBDesk:
 
             if pos_closed:
                 # Place exit order
-                self.om.place_exit(
-                    symbol=sym,
-                    direction=direction,
-                    quantity=rem_qty,
-                    exit_price=exit_price,
-                    reason=exit_reason
-                )
+                try:
+                    self.om.place_exit(
+                        symbol=sym,
+                        direction=direction,
+                        quantity=rem_qty,
+                        exit_price=exit_price,
+                        reason=exit_reason
+                    )
+                except Exception as exit_err:
+                    logger.error("Failed to place %s exit order for %s: %s", exit_reason, sym, exit_err, exc_info=True)
 
                 # Calculate final trade P&L
                 rem_pnl = (exit_price - entry_p) * rem_qty if direction == "LONG" else (entry_p - exit_price) * rem_qty
@@ -692,13 +727,16 @@ class ORBDesk:
             kite_key = f"NSE:{sym}"
             exit_price = float(quotes.get(kite_key, {}).get("last_price", pos["current_sl"]))
 
-            self.om.place_exit(
-                symbol=sym,
-                direction=direction,
-                quantity=rem_qty,
-                exit_price=exit_price,
-                reason="CIRCUIT_BREAKER_HALT"
-            )
+            try:
+                self.om.place_exit(
+                    symbol=sym,
+                    direction=direction,
+                    quantity=rem_qty,
+                    exit_price=exit_price,
+                    reason="CIRCUIT_BREAKER_HALT"
+                )
+            except Exception as exit_err:
+                logger.error("Failed to exit %s during circuit breaker squareoff: %s", sym, exit_err, exc_info=True)
 
             pnl = (exit_price - pos["entry_price"]) * rem_qty if direction == "LONG" else (pos["entry_price"] - exit_price) * rem_qty
             total_pnl = pnl + pos.get("half_booked_pnl", 0.0)

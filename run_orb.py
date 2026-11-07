@@ -133,50 +133,58 @@ def main(args=None):
 
     try:
         while True:
-            now = datetime.now()
-            today_date = now.date()
-            current_time = now.time()
+            try:
+                now = datetime.now()
+                today_date = now.date()
+                current_time = now.time()
 
-            # Multi-day daemon rollover check
-            if today_date != active_date:
-                logger.info("New trading day detected (%s -> %s). Re-initializing ORB desk...", active_date, today_date)
-                desk.reset_for_new_day(today_date)
-                active_date = today_date
-                last_scan_slot = None
+                # Multi-day daemon rollover check
+                if today_date != active_date:
+                    logger.info("New trading day detected (%s -> %s). Re-initializing ORB desk...", active_date, today_date)
+                    desk.reset_for_new_day(today_date)
+                    active_date = today_date
+                    last_scan_slot = None
 
-            # Off-market hours sleeping (before 09:15 or after 15:30)
-            if current_time < dt_time(9, 15) or current_time > dt_time(15, 30):
-                logger.debug("Off-market hours (%s). Sleeping...", now.strftime("%H:%M:%S"))
-                time.sleep(30)
-                continue
+                # Off-market hours sleeping (before 09:15 or after 15:30)
+                if current_time < dt_time(9, 15) or current_time > dt_time(15, 30):
+                    logger.debug("Off-market hours (%s). Sleeping...", now.strftime("%H:%M:%S"))
+                    time.sleep(30)
+                    continue
 
-            # Step 1: Compute Initial Balance at or after 10:15
-            if not desk.ib_formed and current_time >= dt_time(10, 15):
-                desk.compute_initial_balance()
+                # Step 1: Compute Initial Balance at or after 10:15
+                if not desk.ib_formed and current_time >= dt_time(10, 15):
+                    desk.compute_initial_balance()
 
-            # Step 2: Scan for breakouts on 15-minute candle completion (10:15 to 13:15)
-            # 15-min candles complete at :00, :15, :30, :45
-            slot_key = (now.date(), now.hour, now.minute // 15)
-            if desk.ib_formed and current_time <= dt_time(13, 15):
-                if (now.minute in [0, 15, 30, 45]) and (last_scan_slot != slot_key):
-                    last_scan_slot = slot_key
-                    logger.info("15-minute candle closed at %s. Scanning for breakouts...", now.strftime("%H:%M:%S"))
-                    desk.scan_and_enter_breakouts()
+                # Step 2: Scan for breakouts on 15-minute candle completion (10:15 to 13:15)
+                # 15-min candles complete at :00, :15, :30, :45
+                slot_key = (now.date(), now.hour, now.minute // 15)
+                if desk.ib_formed and current_time <= dt_time(13, 15):
+                    if (now.minute in [0, 15, 30, 45]) and (last_scan_slot != slot_key):
+                        last_scan_slot = slot_key
+                        logger.info("15-minute candle closed at %s. Scanning for breakouts...", now.strftime("%H:%M:%S"))
+                        desk.scan_and_enter_breakouts()
 
-            # Step 3: Continuously monitor active positions & check circuit breaker
-            desk.monitor_positions()
+                # Step 3: Continuously monitor active positions & check circuit breaker
+                desk.monitor_positions()
 
-            # Step 4: After 15:15 EOD square-off, sleep longer
-            if current_time >= dt_time(15, 20):
-                logger.info("Post 15:20. Daily session completed. Desk resting...")
-                time.sleep(60)
-            else:
+                # Step 4: After 15:15 EOD square-off, sleep longer
+                if current_time >= dt_time(15, 20):
+                    logger.info("Post 15:20. Daily session completed. Desk resting...")
+                    time.sleep(60)
+                else:
+                    time.sleep(parsed.poll)
+            except Exception as loop_err:
+                logger.exception("Unexpected error in ORB Desk monitoring loop: %s", loop_err)
                 time.sleep(parsed.poll)
 
     except KeyboardInterrupt:
         logger.info("Desk stopped by user (Ctrl+C). Saving state...")
         desk._save_state()
         return 0
+    except Exception as fatal_err:
+        logger.exception("Fatal unhandled error in ORB Desk: %s", fatal_err)
+        desk._save_state()
+        return 1
 
 
 if __name__ == "__main__":

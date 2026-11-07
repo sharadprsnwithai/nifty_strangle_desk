@@ -342,7 +342,11 @@ class SilverORBDesk:
 
             if hit_tgt1:
                 exit_price = tgt1
-                exit_res = self.order_manager.place_exit(sym, direction, 1, exit_price, reason="TARGET_1_HIT")
+                try:
+                    exit_res = self.order_manager.place_exit(sym, direction, 1, exit_price, reason="TARGET_1_HIT")
+                except Exception as exit_err:
+                    logger.error("Failed to place Target 1 exit order for %s: %s", sym, exit_err, exc_info=True)
+                    return
                 fill_p = float(exit_res.get("average_price") or exit_price) if isinstance(exit_res, dict) else exit_price
                 pts = (fill_p - entry) if direction == "LONG" else (entry - fill_p)
                 lot1_pnl = pts * self.config.point_value_per_lot
@@ -361,7 +365,11 @@ class SilverORBDesk:
             elif hit_sl_early:
                 # Both lots stopped out at initial SL
                 exit_price = current_sl
-                exit_res = self.order_manager.place_exit(sym, direction, trade["lots_total"], exit_price, reason="INITIAL_STOP_LOSS")
+                try:
+                    exit_res = self.order_manager.place_exit(sym, direction, trade["lots_total"], exit_price, reason="INITIAL_STOP_LOSS")
+                except Exception as exit_err:
+                    logger.error("Failed to place Stop Loss exit order for %s: %s", sym, exit_err, exc_info=True)
+                    return
                 fill_p = float(exit_res.get("average_price") or exit_price) if isinstance(exit_res, dict) else exit_price
                 loss_pts = (entry - fill_p) if direction == "LONG" else (fill_p - entry)
                 trade_loss = -loss_pts * self.config.point_value_per_lot * trade["lots_total"]
@@ -390,7 +398,11 @@ class SilverORBDesk:
             if hit_be_sl:
                 exit_price = current_sl
                 lot2_pnl = 0.0  # Stopped out flat at cost
-                self.order_manager.place_exit(sym, direction, 1, exit_price, reason="TRAILED_BREAKEVEN_EXIT")
+                try:
+                    self.order_manager.place_exit(sym, direction, 1, exit_price, reason="TRAILED_BREAKEVEN_EXIT")
+                except Exception as exit_err:
+                    logger.error("Failed to place Breakeven exit order for %s: %s", sym, exit_err, exc_info=True)
+                    return
                 trade["status"] = "CLOSED"
                 trade["lot2_closed"] = True
                 trade["lot2_exit_price"] = exit_price
@@ -404,7 +416,11 @@ class SilverORBDesk:
 
             elif hit_eod:
                 exit_price = current_ltp
-                exit_res = self.order_manager.place_exit(sym, direction, 1, exit_price, reason="SESSION_CUTOFF_EXIT")
+                try:
+                    exit_res = self.order_manager.place_exit(sym, direction, 1, exit_price, reason="SESSION_CUTOFF_EXIT")
+                except Exception as exit_err:
+                    logger.error("Failed to place Session Cutoff exit order for %s: %s", sym, exit_err, exc_info=True)
+                    return
                 fill_p = float(exit_res.get("average_price") or exit_price) if isinstance(exit_res, dict) else exit_price
                 pts = (fill_p - entry) if direction == "LONG" else (entry - fill_p)
                 lot2_pnl = pts * self.config.point_value_per_lot
@@ -490,14 +506,18 @@ class SilverORBDesk:
                         tgt1_p = entry_p + self.config.target1_pts if direction == "LONG" else entry_p - self.config.target1_pts
 
                         # Submit 2-lot entry order
-                        self.order_manager.place_entry(
-                            symbol=sym,
-                            direction=direction,
-                            quantity_lots=self.config.lots,
-                            entry_price=entry_p,
-                            initial_sl=sl_p,
-                            target_pts=self.config.target1_pts,
-                        )
+                        try:
+                            self.order_manager.place_entry(
+                                symbol=sym,
+                                direction=direction,
+                                quantity_lots=self.config.lots,
+                                entry_price=entry_p,
+                                initial_sl=sl_p,
+                                target_pts=self.config.target1_pts,
+                            )
+                        except Exception as entry_err:
+                            logger.error("Failed to place breakout entry for %s (%s): %s", sym, direction, entry_err, exc_info=True)
+                            return state
 
                         trade_record = {
                             "symbol": sym,

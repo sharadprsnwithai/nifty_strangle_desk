@@ -113,8 +113,16 @@ def main(args=None) -> int:
         logger.info("[ONCE] Cycle complete. Status: %s", res.get("status"))
         return 0
 
-    desk.run_daemon()
-    return 0
+    try:
+        desk.run_daemon()
+        return 0
+    except KeyboardInterrupt:
+        logger.info("Silver ORB Desk stopped by user (Ctrl+C). Saving state...")
+        desk.save_state(desk.load_state())
+        return 0
+    except Exception as fatal_err:
+        logger.exception("Fatal unhandled error in Silver ORB Desk: %s", fatal_err)
+        return 1
 
 
 if __name__ == "__main__":
