@@ -574,8 +574,7 @@ def test_strangle_desk_run_session_market_closed(tmp_path):
     assert "market is closed" in res["reason"]
     # Verify no orders were placed to Kite Connect
     om.sell.assert_not_called()
-    mock_notifier.send_message.assert_called_once()
-    assert "market is closed" in mock_notifier.send_message.call_args[0][0]
+    mock_notifier.send_message.assert_not_called()
 
 
 def test_strangle_desk_run_scheduler_loop(tmp_path):
@@ -599,8 +598,7 @@ def test_strangle_desk_run_scheduler_loop(tmp_path):
 
         mock_login.assert_called_once_with(mock_kite)
         mock_session.assert_called_once()
-        mock_notifier.send_message.assert_called_once()
-        assert "Daemon Started" in mock_notifier.send_message.call_args[0][0]
+        mock_notifier.send_message.assert_not_called()
 
 
 def test_strangle_desk_perform_daily_morning_login():
@@ -616,9 +614,7 @@ def test_strangle_desk_perform_daily_morning_login():
         assert res == mock_fresh_kite
         mock_get_client.assert_called_once_with(force_login=True)
         assert om.kite == mock_fresh_kite
-        mock_notifier.send_message.assert_called_once()
-        assert "Morning TOTP Login Successful" in mock_notifier.send_message.call_args[0][0]
-        assert "TC4648" in mock_notifier.send_message.call_args[0][0]
+        mock_notifier.send_message.assert_not_called()
 
 
 def test_run_strategy_cli_morning_login_flag():
@@ -755,7 +751,7 @@ def test_reconcile_with_broker_adopts_open_positions(tmp_path):
     assert state["pe"]["sl_price"] == 59.70
     assert state["pe"]["target_price"] == 7.96
     assert state_file.exists()
-    mock_notifier.send_message.assert_called_once()
+    mock_notifier.send_message.assert_not_called()
 
 
 def test_reconcile_with_broker_marks_closed_when_flat(tmp_path):

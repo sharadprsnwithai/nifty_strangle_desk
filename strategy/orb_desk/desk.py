@@ -691,6 +691,8 @@ class ORBDesk:
     # Rich Telegram Notifications
     # -------------------------------------------------------------------------
     def _notify_desk_started(self):
+        # Startup alert removed per policy (alerts only on entry, exit, sl)
+        return
         msg = (
             f"🌅 <b>ORB Trading Desk Initialized</b>\n\n"
             f"📅 Date: <b>{self.today}</b>\n"
@@ -704,6 +706,8 @@ class ORBDesk:
         self.notifier.send_message(msg)
 
     def _notify_ib_formed(self):
+        # Informational range alert removed per policy
+        return
         msg = (
             f"📊 <b>Initial Balance (IB) Established!</b>\n\n"
             f"Initial 1-hour range (09:15 - 10:15) calculated across {len(self.target_stocks)} stocks.\n"
@@ -713,6 +717,8 @@ class ORBDesk:
         self.notifier.send_message(msg)
 
     def _notify_stock_armed(self, cand: Dict[str, Any]):
+        # Candidate watch alert removed per policy
+        return
         direction_emoji = "🟡"
         breakout_type = "IB HIGH" if cand["direction"] == "LONG" else "IB LOW"
         trigger_desc = "above High" if cand["direction"] == "LONG" else "below Low"
@@ -731,6 +737,8 @@ class ORBDesk:
         self.notifier.send_message(msg)
 
     def _notify_armed_invalidated(self, cand: Dict[str, Any], ltp: float):
+        # Invalidation alert removed per policy
+        return
         msg = (
             f"⚠️ <b>ORB Setup Invalidated: {cand['symbol']}</b>\n\n"
             f"Direction: <b>{cand['direction']}</b>\n"
@@ -796,6 +804,8 @@ class ORBDesk:
         self.notifier.send_message(msg)
 
     def _notify_daily_summary(self):
+        # Daily summary alert removed per policy (alerts only on entry, exit, sl)
+        return
         total_pnl = sum(t["realized_pnl_rs"] for t in self.closed_trades)
         wins = [t for t in self.closed_trades if t["realized_pnl_rs"] > 0]
         losses = [t for t in self.closed_trades if t["realized_pnl_rs"] < 0]

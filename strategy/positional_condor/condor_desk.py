@@ -818,14 +818,7 @@ class PositionalDesk:
             "Starting Positional Condor Automated Daemon (Schedule: %s IST, Capital: Rs %s, Stop: %.1f%%, Target: %.1f%%)...",
             schedule_time, f"{self.total_capital:,.0f}", self.monthly_stop_pct * 100, self.monthly_target_pct * 100
         )
-        if self.notifier:
-            mode = getattr(self.order_manager, "mode", "PAPER")
-            self.notifier.send_message(
-                f"🤖 <b>NIFTY Positional Desk Automated Daemon Started [{mode}]</b>\n"
-                f"Schedule: <b>Daily at {schedule_time} IST</b>\n"
-                f"Lots: {self.lots} | Capital: Rs {self.total_capital:,.0f}\n"
-                f"Risk Bounds: Stop -{self.monthly_stop_pct*100:.1f}% | Target +{self.monthly_target_pct*100:.1f}%"
-            )
+        pass  # Daemon started notification removed per policy (alerts only on entry, exit, sl)
 
         target_h, target_m = map(int, schedule_time.split(":"))
         last_evaluated_date: Optional[date] = None

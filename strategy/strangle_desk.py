@@ -260,12 +260,7 @@ class StrangleDesk:
         except Exception as e:
             logger.warning("Could not fetch profile after morning login: %s", e)
 
-        if self.notifier:
-            self.notifier.send_message(
-                f"🔐 <b>Morning TOTP Login Successful</b>\n"
-                f"Fresh Kite access token acquired for <b>{user_desc}</b> at {datetime.now().strftime('%H:%M:%S')} IST.\n"
-                f"Credentials refreshed and ready for today's trading activity."
-            )
+        # Morning login notification removed per policy (alerts only on entry, exit, sl)
         return new_kite
 
     def reconcile_with_broker(
@@ -438,16 +433,7 @@ class StrangleDesk:
                     }
                     self.save_state(state)
 
-                    if self.notifier:
-                        self.notifier.send_message(
-                            f"🔄 <b>Broker Position Reconciled</b>\n"
-                            f"Adopted active NIFTY Strangle from Zerodha Kite:\n"
-                            f"• <b>CALL</b>: <code>{ce_leg['symbol']}</code> x {qty} @ Rs {ce_entry:.2f} [{ce_leg['product']}]\n"
-                            f"  SL: Rs {ce_sl:.2f} | Target: Rs {ce_tgt:.2f}\n"
-                            f"• <b>PUT</b>: <code>{pe_leg['symbol']}</code> x {qty} @ Rs {pe_entry:.2f} [{pe_leg['product']}]\n"
-                            f"  SL: Rs {pe_sl:.2f} | Target: Rs {pe_tgt:.2f}\n"
-                            f"Actively monitoring stop loss, decay target, and 15:00 square-off."
-                        )
+                    pass  # Reconciliation alert removed per policy (alerts only on entry, exit, sl)
 
             return state
         except Exception as e:
@@ -478,8 +464,7 @@ class StrangleDesk:
             is_holiday, reason = is_trading_holiday()
             if is_holiday:
                 logger.info("Exchange is closed today (%s). Skipping session.", reason)
-                if self.notifier:
-                    self.notifier.send_message(f"⏸ <b>Strangle Desk</b>: Exchange closed today ({reason}). Skipping session.")
+                # Exchange closed notification removed per policy
                 return {"status": "HOLIDAY", "reason": reason}
 
         # Market Hours Validation (prevent placing regular orders outside NSE trading hours)
@@ -492,8 +477,7 @@ class StrangleDesk:
                     f"Current time: {now_time.strftime('%H:%M:%S')} IST. Regular trading hours are 09:15 - 15:30 IST."
                 )
                 logger.warning(err_msg)
-                if self.notifier:
-                    self.notifier.send_message(f"⚠️ <b>Strangle Desk Warning</b>: {err_msg}")
+                # Market closed warning removed per policy
                 return {"status": "MARKET_CLOSED", "reason": err_msg}
 
         state = self.load_state()
@@ -934,14 +918,7 @@ class StrangleDesk:
             "Starting 10:00 AM Strangle Desk Daemon [%s] (Lots: %d, Entry: %s IST, Cutoff: %s IST)...",
             mode, lots, entry_time_str, exit_time_str
         )
-        if self.notifier:
-            risk_desc = f"Portfolio Max Loss: Rs {strategy_max_loss:,.0f}" if strategy_max_loss is not None else "None"
-            self.notifier.send_message(
-                f"🤖 <b>10:00 AM Strangle Desk Daemon Started [{mode}]</b>\n"
-                f"Schedule: <b>Daily Entry at {entry_time_str} IST</b> | Exit at {exit_time_str} IST\n"
-                f"Lots: {lots} | {risk_desc}\n"
-                f"Status: Waiting for market session..."
-            )
+        # Daemon started notification removed per policy (alerts only on entry, exit, sl)
 
         entry_h, entry_m = map(int, entry_time_str.split(":"))
         last_heartbeat_hour: int = -1
@@ -991,8 +968,7 @@ class StrangleDesk:
                     last_totp_login_date = today_d
                 except Exception as e:
                     logger.error("Failed daily 08:00 AM morning TOTP login: %s", e, exc_info=True)
-                    if self.notifier:
-                        self.notifier.send_message(f"⚠️ <b>Morning TOTP Login Failed (08:00 IST)</b>: {e}")
+                    pass  # Non-trade error alert removed per policy
 
             # Check today's state
             state = self.load_state()
@@ -1059,8 +1035,7 @@ class StrangleDesk:
                     )
                 except Exception as e:
                     logger.exception("Error during 10:00 AM strangle session: %s", e)
-                    if self.notifier:
-                        self.notifier.send_message(f"⚠️ <b>Strangle Desk Error</b>: Session failed on {today_str}: {e}")
+                    pass  # Non-trade error alert removed per policy
                 continue
 
             # 5. Outside entry window & market closed (e.g. evening 18:33 IST): sleep
