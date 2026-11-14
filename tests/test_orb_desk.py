@@ -423,8 +423,16 @@ def test_orb_desk_reset_for_new_day(tmp_path):
     tomorrow = date(2026, 11, 4)
     desk.reset_for_new_day(tomorrow)
 
-    assert desk.today == '2026-11-04'
+    assert desk.today == date(2026, 11, 4) or str(desk.today) == '2026-11-04'
     assert desk.ib_formed is False
     assert desk.circuit_tripped is False
     assert len(desk.traded_stocks_today) == 0
     assert len(desk.closed_trades) == 0
+
+    # Verify compute_initial_balance runs without TypeError when self.today is date or str
+    kite_mock.historical_data.return_value = []
+    desk.compute_initial_balance()  # Should not raise TypeError: combine() argument 1 must be datetime.date, not str
+
+    # Also test with a string today value
+    desk.today = "2026-11-04"
+    desk.compute_initial_balance()  # Should gracefully handle string representation too

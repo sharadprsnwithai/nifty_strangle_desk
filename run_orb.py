@@ -59,8 +59,12 @@ def main(args=None):
     logger.info("=" * 75)
     logger.info("  STARTING SHARAD'S 15-MINUTE ORB TRADING DESK [%s MODE]", mode)
     logger.info("  Strategy: Option 3 Canonical ORB Desk (Armed Candle Confirmation Break)")
-    logger.info("  Risk Guardrails: Fixed Rs %.0f Risk | Max %d Trades/Day | Rs %.0f Daily SL", parsed.risk, parsed.max_trades, parsed.daily_loss)
-    logger.info("  Universe: %d Stocks | Sizing: Risk Parity Equity MIS", len(TARGET_STOCKS))
+    if parsed.sizing_mode == "LOTS":
+        logger.info("  Risk Guardrails: %d Lots | Max %d Trades/Day | Rs %.0f Daily SL", parsed.lots, parsed.max_trades, parsed.daily_loss)
+        logger.info("  Universe: %d Stocks | Sizing: %d Lots F&O", len(TARGET_STOCKS), parsed.lots)
+    else:
+        logger.info("  Risk Guardrails: Fixed Rs %.0f Risk | Max %d Trades/Day | Rs %.0f Daily SL", parsed.risk, parsed.max_trades, parsed.daily_loss)
+        logger.info("  Universe: %d Stocks | Sizing: Risk Parity Equity MIS", len(TARGET_STOCKS))
     logger.info("  Execution: %s Orders (Buffer: %.2f%%) | Mode: %s", parsed.order_type, parsed.limit_buffer_pct * 100.0, mode)
     logger.info("=" * 75)
 

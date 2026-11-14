@@ -17,6 +17,20 @@ from notifications.telegram import TelegramNotifier
 logger = logging.getLogger("orb.desk")
 
 
+def _normalize_date(d: Any) -> date:
+    """Safely normalizes date from datetime, date, or ISO string."""
+    if isinstance(d, datetime):
+        return d.date()
+    if isinstance(d, date):
+        return d
+    if isinstance(d, str):
+        try:
+            return datetime.strptime(d, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    return date.today()
+
+
 class ORBDesk:
     """
     15-Minute Opening Range Breakout (ORB) Automated Desk.
@@ -146,9 +160,10 @@ class ORBDesk:
                     to_date=end_dt.date(),
                     interval="day"
                 )
+                today_d = _normalize_date(self.today)
                 completed = [
                     c for c in hist
-                    if (c["date"].date() if isinstance(c["date"], datetime) else c["date"]) < self.today
+                    if (c["date"].date() if isinstance(c["date"], datetime) else c["date"]) < today_d
                 ]
                 if completed:
                     prev_candle = completed[-1]
@@ -190,7 +205,7 @@ class ORBDesk:
     def reset_for_new_day(self, new_date: Optional[date] = None):
         """Resets daily session state across multi-day daemon runs."""
         today = new_date or date.today()
-        self.today = str(today)
+        self.today = _normalize_date(today)
         self.ib_formed = False
         self.circuit_tripped = False
         self.traded_stocks_today = set()
@@ -209,7 +224,7 @@ class ORBDesk:
         logger.info("Initializing ORB Desk for %s (Static 30 Stocks)...", self.today)
 
         # Apply NSE F&O Ban Filter
-        check_d = datetime.strptime(self.today, "%Y-%m-%d").date() if isinstance(self.today, str) else self.today
+        check_d = _normalize_date(self.today)
         banned_set = get_nse_fo_ban_list(check_date=check_d)
         allowed, excluded = filter_banned_stocks(TARGET_STOCKS, banned_set)
         self.target_stocks = allowed
@@ -245,7 +260,7 @@ class ORBDesk:
         """
         logger.info("Computing 15-minute Initial Balance (09:15 - 10:15) for %d stocks...", len(self.target_stocks))
         now = datetime.now()
-        today_start = datetime.combine(self.today, dt_time(9, 15))
+        today_start = datetime.combine(_normalize_date(self.today), dt_time(9, 15))
 
         for item in self.target_stocks:
             sym = item["symbol"]
@@ -316,7 +331,7 @@ class ORBDesk:
             logger.warning("Could not check NIFTY bias: %s", e)
 
         now = datetime.now()
-        today_start = datetime.combine(self.today, dt_time(9, 15))
+        today_start = datetime.combine(_normalize_date(self.today), dt_time(9, 15))
         candidates = []
 
         # Collect current 15-min candles for candidates
