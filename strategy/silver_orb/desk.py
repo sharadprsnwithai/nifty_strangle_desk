@@ -105,10 +105,16 @@ class SilverORBDesk:
         """Initializes or resumes daily trading state."""
         today = today_d or date.today()
         today_str = today.strftime("%Y-%m-%d")
+
+        # In-memory check: if already loaded and initialized for today, return immediately
+        if self.state and self.state.get("date") == today_str:
+            return self.state
+
         existing_state = self.load_state()
 
         if existing_state and existing_state.get("date") == today_str:
             logger.info("Resuming existing Silver ORB state for %s", today_str)
+            self.state = existing_state
             return existing_state
 
         # Resolve active near-month contract

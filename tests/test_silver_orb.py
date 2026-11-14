@@ -72,6 +72,12 @@ def test_silver_desk_state_persistence(tmp_path):
     assert loaded["date"] == "2026-11-07"
     assert loaded["realized_pnl_rs"] == 0.0
 
+    # Verify repeated calls for the same day return in-memory state without redundant disk loads
+    with patch.object(desk, "load_state") as mock_load:
+        state_again = desk.initialize_day(today_d=date(2026, 11, 7))
+        mock_load.assert_not_called()
+        assert state_again == state
+
 
 def test_evaluate_breakout_signal():
     cfg = SilverORBConfig(use_trend_filter=True)

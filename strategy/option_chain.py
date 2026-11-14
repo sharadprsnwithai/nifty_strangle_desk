@@ -48,11 +48,11 @@ def resolve_target_expiry(
     # 0 DTE Rule: If today is expiry day, take next week's expiry
     if upcoming[0] == today:
         if len(upcoming) > 1:
-            logger.info("Today is Expiry Day (0 DTE). Selecting Next Week's expiry: %s", upcoming[1])
+            logger.debug("Today is Expiry Day (0 DTE). Selecting Next Week's expiry: %s", upcoming[1])
             return upcoming[1]
         return upcoming[0]
 
-    logger.info("Selecting Current Week's expiry: %s", upcoming[0])
+    logger.debug("Selecting Current Week's expiry: %s", upcoming[0])
     return upcoming[0]
 
 
