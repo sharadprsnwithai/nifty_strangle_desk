@@ -139,9 +139,9 @@ services:
     # - Tranche: Lot 1 booked @ +800 pts (+Rs 4,000), Lot 2 trailed to Cost & rides to 22:45
     # - Telegram Notifications: Strictly on Entry, SL, and Exit with Total Day P&L
     #
-    # 1. Paper Trading Mode (Default):
-    command: ["--paper", "--lots", "2", "--sl", "500", "--target1", "800", "--order-type", "LIMIT", "--limit-buffer-pts", "15.0", "--poll", "5"]
+    # 1. Paper Trading Mode:
+    # command: ["--paper", "--lots", "2", "--sl", "500", "--target1", "800", "--order-type", "LIMIT", "--limit-buffer-pts", "15.0", "--poll", "5"]
     #
-    # 2. Live Production Mode (When ready for real broker orders):
-    # command: ["--live", "--lots", "2", "--sl", "500", "--target1", "800", "--poll", "5"]
+    # 2. Live Production Mode (Real Broker Order Execution via Kite Connect API + Telegram Alerts):
+    command: ["--live", "--lots", "2", "--sl", "500", "--target1", "800", "--order-type", "LIMIT", "--limit-buffer-pts", "15.0", "--poll", "5"]
     # -----------------------------------------------------------------------------------

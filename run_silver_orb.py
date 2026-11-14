@@ -32,10 +32,10 @@ def parse_args(args=None):
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
-        "--live", action="store_true", help="Execute real LIVE orders via Kite Connect"
+        "--live", action="store_true", help="Execute real LIVE orders via Kite Connect (default)"
     )
     mode_group.add_argument(
-        "--paper", action="store_true", help="Run simulated PAPER trading (default)"
+        "--paper", action="store_true", help="Run simulated PAPER trading"
     )
 
     parser.add_argument("--lots", type=int, default=2, help="Number of Silver Mini lots (default: 2)")
@@ -57,7 +57,15 @@ def parse_args(args=None):
 def main(args=None) -> int:
     parsed = parse_args(args)
     setup_logging(log_dir=parsed.log_dir, log_level=parsed.log_level, log_filename="silver_orb_desk.log")
-    mode = "LIVE" if parsed.live else "PAPER"
+    env_mode = os.getenv("SILVER_MODE", "").strip().upper()
+    if parsed.paper:
+        mode = "PAPER"
+    elif parsed.live:
+        mode = "LIVE"
+    elif env_mode in ("LIVE", "PAPER"):
+        mode = env_mode
+    else:
+        mode = "LIVE"
 
     logger.info("=" * 75)
     logger.info("  STARTING MCX SILVER MINI 18:00 US SESSION DESK [%s MODE]", mode)
