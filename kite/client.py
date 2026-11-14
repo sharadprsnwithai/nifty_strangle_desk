@@ -7,6 +7,7 @@ from kite.auth import login_with_totp
 
 logger = logging.getLogger("kite.client")
 
+
 def get_kite_client(config: Optional[KiteConfig] = None, force_login: bool = False) -> KiteConnect:
     """
     Initializes and authenticates a KiteConnect client session.
@@ -42,3 +43,24 @@ def get_kite_client(config: Optional[KiteConfig] = None, force_login: bool = Fal
     except Exception as e:
         logger.warning("Could not fetch profile after fresh TOTP authentication (%s), but access token is set.", e)
     return kite
+
+
+def ensure_kite_session(kite: Optional[KiteConnect] = None, force_login: bool = False) -> KiteConnect:
+    """
+    Validates active KiteConnect session by verifying connectivity with kite.profile().
+    If expired, invalid, or force_login=True, initiates headless TOTP login
+    and returns an authenticated KiteConnect instance.
+    """
+    if kite is not None and not force_login:
+        try:
+            kite.profile()
+            return kite
+        except Exception as e:
+            err_str = str(e).lower()
+            if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+                logger.warning("Kite session token is expired or invalidated (%s). Refreshing...", e)
+            else:
+                logger.warning("Kite profile check encountered unexpected error (%s). Refreshing session...", e)
+
+    logger.info("Acquiring fresh Kite session via automated TOTP login...")
+    return get_kite_client(force_login=True)

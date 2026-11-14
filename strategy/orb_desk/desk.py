@@ -10,6 +10,8 @@ from kiteconnect import KiteConnect
 
 from strategy.orb_desk.config import ORBConfig, TARGET_STOCKS, NIFTY_TOKEN, NIFTY_SYMBOL
 from strategy.orb_desk.order_manager import ORBOrderManager, _round_to_nse_tick
+from strategy.fo_ban import get_nse_fo_ban_list, filter_banned_stocks
+from kite.client import ensure_kite_session
 from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger("orb.desk")
@@ -53,8 +55,22 @@ class ORBDesk:
 
         # Target universe: Static 30 Stocks
         self.target_stocks: List[Dict[str, Any]] = list(TARGET_STOCKS)
+        self.banned_stocks_today: List[str] = []
 
         self._load_state()
+
+    def _ensure_kite_session(self, kite: Optional[KiteConnect] = None, force_login: bool = False) -> Optional[KiteConnect]:
+        """Ensures an active, valid KiteConnect session, re-authenticating if expired."""
+        try:
+            active_kite = ensure_kite_session(kite or self.kite, force_login=force_login)
+            if active_kite:
+                self.kite = active_kite
+                if self.om and hasattr(self.om, "kite") and self.om.kite is not None:
+                    self.om.kite = active_kite
+            return active_kite
+        except Exception as e:
+            logger.error("Failed to re-authenticate Kite session for ORB Desk: %s", e, exc_info=True)
+            return self.kite
 
     # -------------------------------------------------------------------------
     # State Persistence
@@ -70,7 +86,8 @@ class ORBDesk:
             "armed_positions": self.armed_positions,
             "closed_trades": self.closed_trades,
             "stock_stats": self.stock_stats,
-            "target_stocks": self.target_stocks
+            "target_stocks": self.target_stocks,
+            "banned_stocks_today": self.banned_stocks_today
         }
         try:
             with open(self.state_file, "w") as f:
@@ -94,12 +111,14 @@ class ORBDesk:
                 self.closed_trades = data.get("closed_trades", [])
                 self.stock_stats = data.get("stock_stats", {})
                 self.target_stocks = data.get("target_stocks", list(TARGET_STOCKS))
+                self.banned_stocks_today = data.get("banned_stocks_today", [])
                 logger.info(
-                    "Restored daily state for %s: %d active, %d closed trades, %d target stocks.",
+                    "Restored daily state for %s: %d active, %d closed trades, %d target stocks, %d banned.",
                     self.today,
                     len(self.active_positions),
                     len(self.closed_trades),
-                    len(self.target_stocks)
+                    len(self.target_stocks),
+                    len(self.banned_stocks_today)
                 )
         except Exception as e:
             logger.warning("Could not read previous ORB state file: %s", e)
@@ -168,12 +187,40 @@ class ORBDesk:
                         "reasons": item.get("reasons", [])
                     }
 
+    def reset_for_new_day(self, new_date: Optional[date] = None):
+        """Resets daily session state across multi-day daemon runs."""
+        today = new_date or date.today()
+        self.today = str(today)
+        self.ib_formed = False
+        self.circuit_tripped = False
+        self.traded_stocks_today = set()
+        self.active_positions = []
+        self.armed_positions = []
+        self.closed_trades = []
+        self.stock_stats = {}
+        self.banned_stocks_today = []
+        self.initialize_day(force=True)
+
     def initialize_day(self, force: bool = False):
         """
-        Fetches Previous Day High (PDH) and Previous Day Low (PDL) for the 30 target stocks,
-        and retrieves NIFTY 50 Day Open.
+        Filters out any F&O banned stocks, fetches Previous Day High (PDH) and 
+        Previous Day Low (PDL) for active universe stocks, and retrieves NIFTY 50 Day Open.
         """
         logger.info("Initializing ORB Desk for %s (Static 30 Stocks)...", self.today)
+
+        # Apply NSE F&O Ban Filter
+        check_d = datetime.strptime(self.today, "%Y-%m-%d").date() if isinstance(self.today, str) else self.today
+        banned_set = get_nse_fo_ban_list(check_date=check_d)
+        allowed, excluded = filter_banned_stocks(TARGET_STOCKS, banned_set)
+        self.target_stocks = allowed
+        self.banned_stocks_today = excluded
+        if excluded:
+            logger.warning(
+                "F&O Ban Filter: Excluded %d stocks from trading universe today (%s). Active universe: %d stocks.",
+                len(excluded), ", ".join(excluded), len(self.target_stocks)
+            )
+        else:
+            logger.info("F&O Ban Filter: All %d universe stocks cleared (0 in ban list).", len(self.target_stocks))
 
         # Check NIFTY 50 Day Open
         try:
@@ -425,15 +472,20 @@ class ORBDesk:
         )
 
         # Place Entry Order
-        order_res = self.om.place_entry(
-            symbol=sym,
-            direction=direction,
-            quantity=qty,
-            entry_price=entry_price,
-            initial_sl=initial_sl,
-            target_2_5r=0.0
-        )
+        try:
+            order_res = self.om.place_entry(
+                symbol=sym,
+                direction=direction,
+                quantity=qty,
+                entry_price=entry_price,
+                initial_sl=initial_sl,
+                target_2_5r=0.0
+            )
+        except Exception as e:
+            logger.error("[ENTRY FAILED] Failed to place %s entry for %s: %s", direction, sym, e, exc_info=True)
+            return
 
+        order_id = order_res.get("order_id") if isinstance(order_res, dict) else str(order_res)
         pos_record = {
             "symbol": sym,
             "direction": direction,
@@ -447,7 +499,7 @@ class ORBDesk:
             "half_booked": False,
             "be_moved": False,
             "entry_time": datetime.now().strftime("%H:%M:%S"),
-            "order_id": order_res.get("order_id"),
+            "order_id": order_id,
             "wick_pct": cand["wick_ratio"] * 100
         }
 
@@ -490,8 +542,18 @@ class ORBDesk:
         try:
             quotes = self.kite.ltp(symbols_to_fetch)
         except Exception as e:
-            logger.error("Failed to fetch live quotes for positions: %s", e)
-            return
+            err_str = str(e).lower()
+            if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+                logger.warning("Token error during live quote polling (%s). Refreshing session...", e)
+                try:
+                    self.kite = self._ensure_kite_session(self.kite, force_login=True)
+                    quotes = self.kite.ltp(symbols_to_fetch)
+                except Exception as retry_err:
+                    logger.error("Failed to fetch live quotes after re-authentication: %s", retry_err, exc_info=True)
+                    return
+            else:
+                logger.error("Failed to fetch live quotes for positions: %s", e, exc_info=True)
+                return
 
         # ---------------------------------------------------------------------
         # 1. Process Armed Setups (Waiting for break of armed candle)
@@ -587,13 +649,16 @@ class ORBDesk:
                 half_booked_pnl = (t_1r - entry_p) * half_qty if direction == "LONG" else (entry_p - t_1r) * half_qty
                 pos["half_booked_pnl"] = half_booked_pnl
                 logger.info("50%% Booked at Target 1 on %s (+Rs %.2f). SL trailed to Cost (Rs %.2f)", sym, half_booked_pnl, entry_p)
-                self.om.place_exit(
-                    symbol=sym,
-                    direction=direction,
-                    quantity=half_qty,
-                    exit_price=t_1r,
-                    reason="TARGET_1R_BOOK_50%"
-                )
+                try:
+                    self.om.place_exit(
+                        symbol=sym,
+                        direction=direction,
+                        quantity=half_qty,
+                        exit_price=t_1r,
+                        reason="TARGET_1R_BOOK_50%"
+                    )
+                except Exception as exit_err:
+                    logger.error("Failed to place Target 1 exit order for %s: %s", sym, exit_err, exc_info=True)
                 self._notify_target_booked(pos, t_1r, half_booked_pnl)
 
             # C. Mandatory 3:00 PM IST Square-Off (Option 3 Canonical Runner Exit)
@@ -604,13 +669,16 @@ class ORBDesk:
 
             if pos_closed:
                 # Place exit order
-                self.om.place_exit(
-                    symbol=sym,
-                    direction=direction,
-                    quantity=rem_qty,
-                    exit_price=exit_price,
-                    reason=exit_reason
-                )
+                try:
+                    self.om.place_exit(
+                        symbol=sym,
+                        direction=direction,
+                        quantity=rem_qty,
+                        exit_price=exit_price,
+                        reason=exit_reason
+                    )
+                except Exception as exit_err:
+                    logger.error("Failed to place %s exit order for %s: %s", exit_reason, sym, exit_err, exc_info=True)
 
                 # Calculate final trade P&L
                 rem_pnl = (exit_price - entry_p) * rem_qty if direction == "LONG" else (entry_p - exit_price) * rem_qty
@@ -659,13 +727,16 @@ class ORBDesk:
             kite_key = f"NSE:{sym}"
             exit_price = float(quotes.get(kite_key, {}).get("last_price", pos["current_sl"]))
 
-            self.om.place_exit(
-                symbol=sym,
-                direction=direction,
-                quantity=rem_qty,
-                exit_price=exit_price,
-                reason="CIRCUIT_BREAKER_HALT"
-            )
+            try:
+                self.om.place_exit(
+                    symbol=sym,
+                    direction=direction,
+                    quantity=rem_qty,
+                    exit_price=exit_price,
+                    reason="CIRCUIT_BREAKER_HALT"
+                )
+            except Exception as exit_err:
+                logger.error("Failed to exit %s during circuit breaker squareoff: %s", sym, exit_err, exc_info=True)
 
             pnl = (exit_price - pos["entry_price"]) * rem_qty if direction == "LONG" else (pos["entry_price"] - exit_price) * rem_qty
             total_pnl = pnl + pos.get("half_booked_pnl", 0.0)
@@ -686,6 +757,12 @@ class ORBDesk:
         self.active_positions = []
         self._save_state()
         self._notify_circuit_breaker()
+
+    def _get_total_day_realized_pnl(self) -> float:
+        """Calculates total realized P&L for the day including closed trades and partial booked targets."""
+        closed_pnl = sum(t.get("realized_pnl_rs", 0.0) for t in self.closed_trades)
+        partial_pnl = sum(pos.get("half_booked_pnl", 0.0) for pos in self.active_positions)
+        return closed_pnl + partial_pnl
 
     # -------------------------------------------------------------------------
     # Rich Telegram Notifications
@@ -763,43 +840,50 @@ class ORBDesk:
         self.notifier.send_message(msg)
 
     def _notify_trail_be(self, pos: Dict[str, Any]):
+        total_day_pnl = self._get_total_day_realized_pnl()
         msg = (
             f"🎯 <b>1:1 Target Reached — Trailed to Breakeven!</b>\n\n"
             f"Stock: <b>{pos['symbol']}</b> ({pos['direction']})\n"
             f"Stop-Loss moved to: <b>₹{pos['entry_price']:.2f}</b> (Entry Price)\n"
-            f"🛡️ <i>Downside risk completely eliminated. Free trade running!</i>"
+            f"🛡️ <i>Downside risk completely eliminated. Free trade running!</i>\n\n"
+            f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
         )
         self.notifier.send_message(msg)
 
     def _notify_target_booked(self, pos: Dict[str, Any], exit_p: float, booked_pnl: float):
+        total_day_pnl = self._get_total_day_realized_pnl()
         msg = (
             f"💰 <b>Target 1 Hit — 50% Profit Booked!</b>\n\n"
             f"Stock: <b>{pos['symbol']}</b>\n"
             f"Booked 50% Qty ({pos['half_quantity']} shares) @ <b>₹{exit_p:.2f}</b>\n"
             f"Realized Gain: <b>+₹{booked_pnl:,.2f} (+0.5 R)</b>\n"
-            f"SL on remaining 50% trailed to Breakeven (₹{pos['entry_price']:.2f})."
+            f"SL on remaining 50% trailed to Breakeven (₹{pos['entry_price']:.2f}).\n\n"
+            f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
         )
         self.notifier.send_message(msg)
 
     def _notify_trade_exit(self, t: Dict[str, Any]):
         pnl = t["realized_pnl_rs"]
         pnl_emoji = "🟢" if pnl > 0 else ("⚪" if pnl == 0 else "🔴")
+        total_day_pnl = self._get_total_day_realized_pnl()
         msg = (
             f"{pnl_emoji} <b>ORB Trade Closed: {t['symbol']}</b>\n\n"
             f"Direction: <b>{t['direction']}</b> x {t['quantity']}\n"
             f"Exit Reason: <b>{t['exit_reason']}</b>\n"
             f"Entry: ₹{t['entry_price']:.2f} ➔ Exit: ₹{t['exit_price']:.2f}\n"
-            f"Realized P&L: <b>₹{pnl:+,.2f} ({t['r_multiple']:+,.2f} R)</b>\n"
-            f"Time: <b>{t['exit_time']}</b>"
+            f"Trade P&L: <b>₹{pnl:+,.2f} ({t['r_multiple']:+,.2f} R)</b>\n\n"
+            f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
         )
         self.notifier.send_message(msg)
 
     def _notify_circuit_breaker(self):
+        total_day_pnl = self._get_total_day_realized_pnl()
         msg = (
             f"🚨 <b>PORTFOLIO CIRCUIT BREAKER TRIPPED!</b>\n\n"
             f"Cumulative daily portfolio loss hit threshold (<b>-₹{self.config.daily_stop_loss_limit:,.0f}</b>).\n"
             f"All active positions have been immediately squared off at market.\n"
-            f"Trading desk is <b>HALTED</b> for the rest of today to protect capital."
+            f"Trading desk is <b>HALTED</b> for the rest of today to protect capital.\n\n"
+            f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
         )
         self.notifier.send_message(msg)
 

@@ -185,11 +185,17 @@ The desk is fully containerized with Indian Standard Time (`Asia/Kolkata`) pre-c
 
    # orb-desk (15-Minute ORB Desk Option 3 Canonical):
    command: ["--live", "--risk", "2500", "--max-trades", "5", "--daily-loss", "10000", "--poll", "5"]
+
+   # silver-orb-desk (MCX Silver Mini 18:00 US Session Desk):
+   command: ["--live", "--lots", "2", "--sl", "500", "--target1", "800", "--order-type", "LIMIT", "--limit-buffer-pts", "15.0", "--poll", "5"]
    ```
 
 2. **Start the Containers**:
    ```bash
-   # Start Positional Condor Desk daemon in background
+   # Start Silver Mini ORB Desk daemon in Live mode
+   docker compose up silver-orb-desk -d --build
+
+   # Or start Positional Condor Desk daemon in background
    docker compose up positional-condor-desk -d --build
 
    # Or start 15-Minute ORB Desk

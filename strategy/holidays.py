@@ -26,6 +26,15 @@ NSE_HOLIDAYS_2026: Dict[date, str] = {
     date(2026, 12, 25): "Christmas",
 }
 
+# MCX Full Trading Holidays for 2026 (Both Morning and Evening Sessions Closed)
+MCX_FULL_HOLIDAYS_2026: Dict[date, str] = {
+    date(2026, 1, 26): "Republic Day",
+    date(2026, 4, 3): "Good Friday",
+    date(2026, 8, 15): "Independence Day",
+    date(2026, 10, 2): "Mahatma Gandhi Jayanti",
+    date(2026, 12, 25): "Christmas",
+}
+
 
 def is_trading_holiday(check_date: Optional[date] = None) -> Tuple[bool, Optional[str]]:
     """
@@ -49,5 +58,39 @@ def is_trading_holiday(check_date: Optional[date] = None) -> Tuple[bool, Optiona
     # Official NSE holiday check
     if check_date in NSE_HOLIDAYS_2026:
         return True, f"NSE Holiday: {NSE_HOLIDAYS_2026[check_date]}"
+
+    return False, None
+
+
+def is_mcx_trading_holiday(check_date: Optional[date] = None, session: str = "EVENING") -> Tuple[bool, Optional[str]]:
+    """
+    Checks if a given date is a non-trading day on MCX for the specified session (MORNING or EVENING).
+    MCX Evening Session (17:00 - 23:30/23:55 IST) is OPEN on most national holidays,
+    closing ONLY on weekends and official full holidays (Republic Day, Good Friday,
+    Independence Day, Gandhi Jayanti, Christmas).
+    
+    Returns:
+        (is_holiday: bool, reason: Optional[str])
+    """
+    if check_date is None:
+        check_date = datetime.now().date()
+    elif isinstance(check_date, datetime):
+        check_date = check_date.date()
+
+    # Weekend check (MCX is closed on Saturday and Sunday)
+    weekday = check_date.weekday()
+    if weekday == 5:
+        return True, "Weekend (Saturday)"
+    if weekday == 6:
+        return True, "Weekend (Sunday)"
+
+    if session.upper() == "EVENING":
+        if check_date in MCX_FULL_HOLIDAYS_2026:
+            return True, f"MCX Full Holiday: {MCX_FULL_HOLIDAYS_2026[check_date]}"
+        return False, None
+
+    # Morning session check (closed on all standard holidays)
+    if check_date in NSE_HOLIDAYS_2026:
+        return True, f"MCX Morning Holiday: {NSE_HOLIDAYS_2026[check_date]}"
 
     return False, None
