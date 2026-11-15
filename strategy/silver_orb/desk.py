@@ -175,14 +175,17 @@ class SilverORBDesk:
         exit_p = trade["lot1_exit_price"]
         lot1_gain = trade["lot1_pnl_rs"]
         entry = trade["entry_price"]
+        total_lots = trade.get("lots_total", self.config.lots)
+        lot1_lots = max(1, total_lots // 2)
+        lot2_lots = total_lots - lot1_lots
 
         msg = (
             f"🎯 <b>SILVER MINI TARGET 1 HIT [{mode}]</b>\n\n"
             f"Contract: <code>{sym}</code> ({direction})\n"
-            f"Lot 1 Exited: <b>1 Lot @ ₹{exit_p:,.1f}</b> (+{self.config.target1_pts:.0f} pts)\n"
+            f"Tranche 1 Exited: <b>{lot1_lots} {'Lot' if lot1_lots == 1 else 'Lots'} @ ₹{exit_p:,.1f}</b> (+{self.config.target1_pts:.0f} pts)\n"
             f"Booked P&L: <b>+₹{lot1_gain:+,.2f}</b>\n\n"
-            f"🛡️ <b>Action: Lot 2 Stop Loss Trailed to Cost (₹{entry:,.1f})!</b>\n"
-            f"Runner Lot 2 is now 100% Risk-Free.\n\n"
+            f"🛡️ <b>Action: Runner ({lot2_lots} {'Lot' if lot2_lots == 1 else 'Lots'}) Stop Loss Trailed to Cost (₹{entry:,.1f})!</b>\n"
+            f"Runner is now 100% Risk-Free.\n\n"
             f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
         )
         self.notifier.send_message(msg)
@@ -211,11 +214,14 @@ class SilverORBDesk:
         direction = trade["direction"]
         exit_p = trade["lot2_exit_price"]
         lot2_gain = trade["lot2_pnl_rs"]
+        total_lots = trade.get("lots_total", self.config.lots)
+        lot1_lots = max(1, total_lots // 2)
+        lot2_lots = total_lots - lot1_lots
 
         msg = (
             f"🏁 <b>SILVER MINI RUNNER EXITED [{mode}]</b>\n\n"
             f"Contract: <code>{sym}</code> ({direction})\n"
-            f"Lot 2 Exited: <b>1 Lot @ ₹{exit_p:,.1f}</b>\n"
+            f"Runner Exited: <b>{lot2_lots} {'Lot' if lot2_lots == 1 else 'Lots'} @ ₹{exit_p:,.1f}</b>\n"
             f"Exit Reason: <b>{reason}</b>\n"
             f"Runner P&L: <b>₹{lot2_gain:+,.2f}</b>\n"
             f"Trade Total P&L: <b>₹{trade['lot1_pnl_rs'] + lot2_gain:+,.2f}</b>\n\n"
@@ -340,6 +346,9 @@ class SilverORBDesk:
         current_sl = float(trade["current_sl"])
         tgt1 = float(trade["target1_price"])
         sym = trade["symbol"]
+        total_lots = trade.get("lots_total", self.config.lots)
+        lot1_lots = max(1, total_lots // 2)
+        lot2_lots = total_lots - lot1_lots
 
         # Case 1: Lot 1 Target 1 Hit (+800 pts)
         if not trade["lot1_closed"]:
@@ -349,22 +358,22 @@ class SilverORBDesk:
             if hit_tgt1:
                 exit_price = tgt1
                 try:
-                    exit_res = self.order_manager.place_exit(sym, direction, 1, exit_price, reason="TARGET_1_HIT")
+                    exit_res = self.order_manager.place_exit(sym, direction, lot1_lots, exit_price, reason="TARGET_1_HIT")
                 except Exception as exit_err:
                     logger.error("Failed to place Target 1 exit order for %s: %s", sym, exit_err, exc_info=True)
                     return
                 fill_p = float(exit_res.get("average_price") or exit_price) if isinstance(exit_res, dict) else exit_price
                 pts = (fill_p - entry) if direction == "LONG" else (entry - fill_p)
-                lot1_pnl = pts * self.config.point_value_per_lot
+                lot1_pnl = pts * self.config.point_value_per_lot * lot1_lots
                 trade["lot1_closed"] = True
                 trade["lot1_exit_price"] = fill_p
                 trade["lot1_pnl_rs"] = lot1_pnl
-                trade["lots_open"] = 1
+                trade["lots_open"] = lot2_lots
                 trade["current_sl"] = entry  # Trailed to Breakeven
                 trade["be_moved"] = True
                 state["realized_pnl_rs"] += lot1_pnl
                 self.save_state(state)
-                logger.info("Lot 1 Target 1 HIT: +Rs %.2f. Lot 2 SL moved to Breakeven @ Rs %.1f", lot1_pnl, entry)
+                logger.info("Tranche 1 Target 1 HIT (%d lots): +Rs %.2f. Runner (%d lots) SL moved to Breakeven @ Rs %.1f", lot1_lots, lot1_pnl, lot2_lots, entry)
                 self._notify_target1(trade, state["realized_pnl_rs"])
                 return
 
@@ -384,13 +393,13 @@ class SilverORBDesk:
                 trade["lot2_closed"] = True
                 trade["lot1_exit_price"] = fill_p
                 trade["lot2_exit_price"] = fill_p
-                trade["lot1_pnl_rs"] = -loss_pts * self.config.point_value_per_lot
-                trade["lot2_pnl_rs"] = -loss_pts * self.config.point_value_per_lot
+                trade["lot1_pnl_rs"] = -loss_pts * self.config.point_value_per_lot * lot1_lots
+                trade["lot2_pnl_rs"] = -loss_pts * self.config.point_value_per_lot * lot2_lots
                 trade["lots_open"] = 0
                 state["status"] = "COMPLETED"
                 state["realized_pnl_rs"] += trade_loss
                 self.save_state(state)
-                logger.warning("Stop loss hit on both lots @ Rs %.1f (Loss: Rs %.2f)", fill_p, trade_loss)
+                logger.warning("Stop loss hit on all %d lots @ Rs %.1f (Loss: Rs %.2f)", trade["lots_total"], fill_p, trade_loss)
                 self._notify_sl(trade, fill_p, trade_loss, state["realized_pnl_rs"])
                 return
 
@@ -405,7 +414,7 @@ class SilverORBDesk:
                 exit_price = current_sl
                 lot2_pnl = 0.0  # Stopped out flat at cost
                 try:
-                    self.order_manager.place_exit(sym, direction, 1, exit_price, reason="TRAILED_BREAKEVEN_EXIT")
+                    self.order_manager.place_exit(sym, direction, lot2_lots, exit_price, reason="TRAILED_BREAKEVEN_EXIT")
                 except Exception as exit_err:
                     logger.error("Failed to place Breakeven exit order for %s: %s", sym, exit_err, exc_info=True)
                     return
@@ -416,20 +425,20 @@ class SilverORBDesk:
                 trade["lots_open"] = 0
                 state["status"] = "COMPLETED"
                 self.save_state(state)
-                logger.info("Runner Lot 2 stopped out at Breakeven (Rs %.1f). Trade completed.", exit_price)
+                logger.info("Runner (%d lots) stopped out at Breakeven (Rs %.1f). Trade completed.", lot2_lots, exit_price)
                 self._notify_runner_exit(trade, "TRAILED_BREAKEVEN_EXIT", state["realized_pnl_rs"])
                 return
 
             elif hit_eod:
                 exit_price = current_ltp
                 try:
-                    exit_res = self.order_manager.place_exit(sym, direction, 1, exit_price, reason="SESSION_CUTOFF_EXIT")
+                    exit_res = self.order_manager.place_exit(sym, direction, lot2_lots, exit_price, reason="SESSION_CUTOFF_EXIT")
                 except Exception as exit_err:
                     logger.error("Failed to place Session Cutoff exit order for %s: %s", sym, exit_err, exc_info=True)
                     return
                 fill_p = float(exit_res.get("average_price") or exit_price) if isinstance(exit_res, dict) else exit_price
                 pts = (fill_p - entry) if direction == "LONG" else (entry - fill_p)
-                lot2_pnl = pts * self.config.point_value_per_lot
+                lot2_pnl = pts * self.config.point_value_per_lot * lot2_lots
                 trade["status"] = "CLOSED"
                 trade["lot2_closed"] = True
                 trade["lot2_exit_price"] = fill_p
@@ -438,7 +447,7 @@ class SilverORBDesk:
                 state["status"] = "COMPLETED"
                 state["realized_pnl_rs"] += lot2_pnl
                 self.save_state(state)
-                logger.info("Runner Lot 2 squared off at EOD (22:45 IST) @ Rs %.1f (P&L: Rs %.2f)", fill_p, lot2_pnl)
+                logger.info("Runner (%d lots) squared off at EOD (22:45 IST) @ Rs %.1f (P&L: Rs %.2f)", lot2_lots, fill_p, lot2_pnl)
                 self._notify_runner_exit(trade, "SESSION_CUTOFF_EXIT", state["realized_pnl_rs"])
                 return
 

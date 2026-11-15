@@ -117,11 +117,14 @@ def test_order_manager_mode_validation():
 
 
 def test_option_chain_normalize_today_date():
+    today = datetime.now().date()
     instruments = [
         {"name": "NIFTY", "instrument_type": "CE", "expiry": "2026-11-05"},
         {"name": "NIFTY", "instrument_type": "PE", "expiry": "2026-11-05"},
         {"name": "NIFTY", "instrument_type": "CE", "expiry": "2026-11-12"},
         {"name": "NIFTY", "instrument_type": "PE", "expiry": "2026-11-12"},
+        {"name": "NIFTY", "instrument_type": "CE", "expiry": (today + timedelta(days=7)).strftime("%Y-%m-%d")},
+        {"name": "NIFTY", "instrument_type": "PE", "expiry": (today + timedelta(days=7)).strftime("%Y-%m-%d")},
     ]
     # Pass datetime
     exp = resolve_target_expiry(instruments, today_date=datetime(2026, 11, 2, 10, 0))

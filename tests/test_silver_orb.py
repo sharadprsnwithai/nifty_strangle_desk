@@ -290,3 +290,59 @@ def test_silver_order_manager_live_limit_orders():
     assert exit_kwargs["order_type"] == mock_kite.ORDER_TYPE_LIMIT
     assert exit_kwargs["price"] == 185785.0  # 185800 - 15 buffer
 
+
+def test_4lot_tranche_scaling(tmp_path):
+    state_file = tmp_path / "silver_state.json"
+    notifier_mock = MagicMock()
+    om = SilverOrderManager(mode="PAPER")
+    cfg = SilverORBConfig(state_file=str(state_file), lots=4, initial_sl_pts=500.0, target1_pts=800.0)
+    desk = SilverORBDesk(config=cfg, kite=None, order_manager=om, notifier=notifier_mock)
+
+    # Initialize state with active LONG trade entered with 4 lots at 185,000
+    desk.state = {
+        "date": "2026-11-07",
+        "status": "ACTIVE_TRADE",
+        "contract": {"tradingsymbol": "SILVERM26NOVFUT", "instrument_token": 123},
+        "realized_pnl_rs": 0.0,
+        "trade": {
+            "symbol": "SILVERM26NOVFUT",
+            "direction": "LONG",
+            "entry_price": 185000.0,
+            "initial_sl": 184500.0,
+            "current_sl": 184500.0,
+            "target1_price": 185800.0,
+            "lots_total": 4,
+            "lots_open": 4,
+            "lot1_closed": False,
+            "lot1_exit_price": None,
+            "lot1_pnl_rs": 0.0,
+            "lot2_closed": False,
+            "lot2_exit_price": None,
+            "lot2_pnl_rs": 0.0,
+            "be_moved": False,
+            "status": "OPEN",
+        },
+    }
+    desk.save_state(desk.state)
+
+    # Step 1: Hits Target 1 (+800 pts) -> 2 lots exited at target, 2 lots runner trailed to BE
+    desk.monitor_active_trade(current_ltp=185850.0, current_time=dt_time(18, 45))
+    trade = desk.state["trade"]
+    assert trade["lot1_closed"] is True
+    # 2 lots * 800 pts * Rs 5 = Rs 8,000
+    assert trade["lot1_pnl_rs"] == 8000.0
+    assert trade["lots_open"] == 2
+    assert trade["current_sl"] == 185000.0  # Trailed to Breakeven
+    assert trade["be_moved"] is True
+    assert desk.state["realized_pnl_rs"] == 8000.0
+
+    # Step 2: Session close at 22:45 -> 2 lots runner squared off at 186,000 (+1,000 pts)
+    desk.monitor_active_trade(current_ltp=186000.0, current_time=dt_time(22, 45))
+    trade = desk.state["trade"]
+    assert trade["lot2_closed"] is True
+    # 2 lots * 1000 pts * Rs 5 = Rs 10,000
+    assert trade["lot2_pnl_rs"] == 10000.0
+    assert trade["lots_open"] == 0
+    assert desk.state["realized_pnl_rs"] == 18000.0  # 8k + 10k = 18k!
+
+

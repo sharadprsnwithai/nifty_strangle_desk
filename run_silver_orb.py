@@ -67,10 +67,12 @@ def main(args=None) -> int:
     else:
         mode = "LIVE"
 
+    t1_lots = max(1, parsed.lots // 2)
+    t2_lots = parsed.lots - t1_lots
     logger.info("=" * 75)
     logger.info("  STARTING MCX SILVER MINI 18:00 US SESSION DESK [%s MODE]", mode)
-    logger.info("  Lots: %d (10 kg total) | Initial SL: %.0f pts | Lot 1 Target: %.0f pts", parsed.lots, parsed.sl, parsed.target1)
-    logger.info("  Plan: Book Lot 1 @ +%.0f pts & Move SL to Cost; Runner Lot 2 rides to 22:45 IST", parsed.target1)
+    logger.info("  Lots: %d (%d kg total) | Initial SL: %.0f pts | Tranche 1 Target: %.0f pts", parsed.lots, parsed.lots * 5, parsed.sl, parsed.target1)
+    logger.info("  Plan: Book Tranche 1 (%d lots) @ +%.0f pts & Move SL to Cost; Runner Tranche 2 (%d lots) rides to 22:45 IST", t1_lots, parsed.target1, t2_lots)
     logger.info("=" * 75)
 
     config = load_config()
