@@ -916,3 +916,105 @@ def test_run_scheduler_skips_reconciliation_outside_market_hours(tmp_path):
     mock_kite.positions.assert_not_called()
     mock_kite.instruments.assert_not_called()
     mock_sleep.assert_called_once_with(15)
+
+
+def test_check_available_equity_margin(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    mock_om = MagicMock()
+    mock_kite = MagicMock()
+    mock_om.kite = mock_kite
+    mock_om.mode = "LIVE"
+    desk = StrangleDesk(order_manager=mock_om, state_file=state_file)
+
+    # 1. OK status
+    mock_kite.margins.return_value = {
+        "enabled": True,
+        "available": {"live_balance": 350000.0, "cash": 300000.0},
+        "net": 350000.0
+    }
+    margin = desk.check_available_equity_margin()
+    assert margin["status"] == "OK"
+    assert margin["available_cash"] == 350000.0
+
+    # 2. Disabled status
+    mock_kite.margins.return_value = {"enabled": False, "net": 0.0}
+    margin_dis = desk.check_available_equity_margin()
+    assert margin_dis["status"] == "DISABLED"
+
+
+def test_insufficient_equity_margin_aborts_entry(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    mock_om = MagicMock()
+    mock_kite = MagicMock()
+    mock_om.kite = mock_kite
+    mock_om.mode = "LIVE"
+    desk = StrangleDesk(order_manager=mock_om, state_file=state_file)
+
+    mock_kite.profile.return_value = {"user_id": "TC4648"}
+    mock_kite.positions.return_value = {"net": []}
+    mock_kite.margins.return_value = {
+        "enabled": True,
+        "available": {"live_balance": 50000.0},
+        "net": 50000.0
+    }
+
+    with patch("strategy.strangle_desk.is_trading_holiday", return_value=(False, "")), \
+         patch("strategy.strangle_desk.find_strangle_strikes") as mock_find:
+        mock_find.return_value = {
+            "expiry": "2026-11-09",
+            "total_lots": 2,
+            "total_quantity": 130,
+            "ce": {"symbol": "NIFTY26N0924300CE", "ltp": 30.5, "sl_price": 45.75, "target_price": 6.1},
+            "pe": {"symbol": "NIFTY26N0923800PE", "ltp": 31.0, "sl_price": 46.5, "target_price": 6.2},
+        }
+        # 2 lots require ~260,000, but only 50,000 is available
+        res = desk.run_session(lots=2, kite=mock_kite, execute_once=True, ignore_holidays=True)
+        assert res["status"] == "ABORTED"
+        assert "Insufficient equity margin" in res["reason"]
+        mock_om.sell.assert_not_called()
+
+
+def test_safe_exit_leg_live_verification(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    mock_om = MagicMock()
+    mock_om.mode = "LIVE"
+    desk = StrangleDesk(order_manager=mock_om, state_file=state_file)
+
+    state = {
+        "date": "2026-11-16",
+        "status": "OPEN",
+        "ce": {"symbol": "NIFTY26N1624300CE", "status": "OPEN", "entry_price": 30.0},
+        "pe": {"symbol": "NIFTY26N1623800PE", "status": "OPEN", "entry_price": 30.0}
+    }
+
+    # 1. Complete fill
+    mock_om.buy_to_cover.return_value = {"order_id": "ORD_EXIT_1", "status": "SUBMITTED"}
+    with patch.object(desk, "wait_for_order_completion") as mock_wait:
+        mock_wait.return_value = {"status": "COMPLETE", "average_price": 45.5}
+        ok = desk._safe_exit_leg("ce", "NIFTY26N1624300CE", 65, 45.0, "STOP_LOSS", "LIMIT", 0.05, state)
+        assert ok is True
+        assert state["ce"]["status"] == "CLOSED"
+        assert state["ce"]["exit_price"] == 45.5
+
+    # 2. Rejected order
+    state["pe"]["status"] = "OPEN"
+    mock_om.buy_to_cover.return_value = {"order_id": "ORD_EXIT_2", "status": "SUBMITTED"}
+    with patch.object(desk, "wait_for_order_completion") as mock_wait:
+        mock_wait.return_value = {"status": "REJECTED", "status_message": "RMS: Margin exceeded"}
+        ok = desk._safe_exit_leg("pe", "NIFTY26N1623800PE", 65, 45.0, "STOP_LOSS", "LIMIT", 0.05, state)
+        assert ok is False
+        assert state["pe"]["status"] == "OPEN"
+
+    # 3. Timeout order cancels resting order
+    mock_om.buy_to_cover.return_value = {"order_id": "ORD_EXIT_3", "status": "SUBMITTED"}
+    with patch.object(desk, "wait_for_order_completion") as mock_wait:
+        # First call (10s wait) returns OPEN, second call (after cancel) returns CANCELLED
+        mock_wait.side_effect = [
+            {"status": "OPEN", "pending_quantity": 65},
+            {"status": "CANCELLED", "filled_quantity": 0}
+        ]
+        ok = desk._safe_exit_leg("pe", "NIFTY26N1623800PE", 65, 45.0, "STOP_LOSS", "LIMIT", 0.05, state)
+        assert ok is False
+        assert state["pe"]["status"] == "OPEN"
+        mock_om.cancel_order.assert_called_with("ORD_EXIT_3")
+

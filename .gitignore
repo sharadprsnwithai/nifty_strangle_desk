@@ -18,3 +18,5 @@ data/cache_15m_fno/
 data/cache_*/
 !data/.gitkeep
 data/*.txt
+*.lock
+data/*.lock

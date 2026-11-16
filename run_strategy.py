@@ -32,7 +32,7 @@ def run_strategy_cli(args=None) -> int:
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--live", action="store_true", help="Execute real LIVE orders via Kite Connect")
     mode_group.add_argument("--paper", action="store_true", help="Run simulated PAPER trading (default)")
-    parser.add_argument("--lots", type=int, default=10, help="Number of lots (default: 10)")
+    parser.add_argument("--lots", type=int, default=int(os.getenv("STRANGLE_LOTS", "10")), help="Number of lots (default: 10, or STRANGLE_LOTS env var)")
     parser.add_argument("--poll", type=int, default=5, help="Monitoring poll interval in seconds (default: 5)")
     parser.add_argument("--strategy-max-loss", "--max-loss", type=float, default=10000.0, dest="strategy_max_loss", help="Strategy total loss exit in Rs across all legs (default: 10000.0)")
     parser.add_argument("--order-type", choices=["LIMIT", "MARKET"], default="LIMIT", help="Order execution type (default: LIMIT)")

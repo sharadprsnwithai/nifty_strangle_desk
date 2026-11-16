@@ -23,8 +23,8 @@ class SilverOrderManager:
         kite: Optional[KiteConnect] = None,
         exchange: str = "MCX",
         product: str = "MIS",
-        order_type: str = "LIMIT",
-        limit_buffer_pts: float = 15.0,
+        order_type: str = "MARKET",
+        limit_buffer_pts: float = 50.0,
     ):
         self.mode = mode.upper()
         if self.mode not in ("PAPER", "LIVE"):
@@ -103,11 +103,12 @@ class SilverOrderManager:
                 order_type=kite_order_type,
                 price=limit_p,
             )
-            logger.info("[LIVE] Submitted entry order %s for %s (%s, OrderType: %s, Price: %s)", order_id, symbol, transaction_type, self.order_type, limit_p)
+            logger.info("[LIVE] Submitted entry order %s for %s (%s, OrderType: %s, Price: %s)", order_id, symbol, transaction_type, self.order_type, limit_p or "MARKET")
 
             # Await and verify execution fill status
             avg_price = order_price
             order_status = "SUBMITTED"
+            filled_qty = 0
             try:
                 for _ in range(6):
                     time.sleep(0.5)
@@ -115,25 +116,48 @@ class SilverOrderManager:
                     if history:
                         last_status = history[-1]
                         order_status = last_status.get("status")
+                        filled_qty = int(last_status.get("filled_quantity", 0))
                         if order_status == "COMPLETE":
                             avg_price = float(last_status.get("average_price") or order_price)
                             break
                         elif order_status in ("REJECTED", "CANCELLED"):
                             reject_reason = last_status.get("status_message", "Order rejected by broker")
                             logger.error("[LIVE] Entry order %s was %s: %s", order_id, order_status, reject_reason)
+                            if filled_qty > 0:
+                                avg_price = float(last_status.get("average_price") or order_price)
+                                order_status = "PARTIAL"
+                                break
                             raise RuntimeError(f"Entry order {order_id} {order_status}: {reject_reason}")
             except RuntimeError:
                 raise
             except Exception as hist_err:
                 logger.warning("Could not fetch execution status for entry order %s (%s)", order_id, hist_err)
 
+            if order_status != "COMPLETE" and order_status != "PARTIAL":
+                if filled_qty > 0:
+                    avg_price = float(last_status.get("average_price") or avg_price)
+                    logger.warning("[LIVE] Entry order %s partially filled (%d/%d lots). Cancelling remainder...", order_id, filled_qty, quantity_lots)
+                    try:
+                        self.kite.cancel_order(variety=kite_variety, order_id=order_id)
+                    except Exception as cancel_err:
+                        logger.error("[LIVE] Error cancelling remainder for %s: %s", order_id, cancel_err)
+                    order_status = "PARTIAL"
+                else:
+                    try:
+                        logger.warning("[LIVE] Entry order %s not filled after timeout (status: %s). Cancelling order...", order_id, order_status)
+                        self.kite.cancel_order(variety=kite_variety, order_id=order_id)
+                    except Exception as cancel_err:
+                        logger.error("[LIVE] Failed to cancel unfilled entry order %s: %s", order_id, cancel_err)
+                    raise RuntimeError(f"Entry order {order_id} failed to fill within timeout (status: {order_status}). Cancelled.")
+
+            actual_qty = filled_qty if filled_qty > 0 else quantity_lots
             return {
                 "order_id": order_id,
                 "symbol": symbol,
                 "status": order_status,
                 "average_price": avg_price,
                 "transaction_type": transaction_type,
-                "quantity": quantity_lots,
+                "quantity": actual_qty,
             }
         except Exception as e:
             logger.error("[LIVE] Failed to place entry order for %s: %s", symbol, e)
@@ -201,26 +225,34 @@ class SilverOrderManager:
                 order_type=kite_order_type,
                 price=limit_p,
             )
-            logger.info("[LIVE] Submitted exit order %s for %s (%s, Reason: %s)", order_id, symbol, transaction_type, reason)
+            logger.info("[LIVE] Submitted exit order %s for %s (%s, OrderType: %s, Price: %s, Reason: %s)", order_id, symbol, transaction_type, self.order_type, limit_p or "MARKET", reason)
 
             # Retrieve actual fill price if available from Kite order history
             avg_price = order_price
+            order_status = "SUBMITTED"
             try:
-                for _ in range(5):
+                for _ in range(6):
                     time.sleep(0.5)
                     history = self.kite.order_history(order_id)
                     if history:
                         last_status = history[-1]
-                        if last_status.get("status") == "COMPLETE":
+                        order_status = last_status.get("status")
+                        if order_status == "COMPLETE":
                             avg_price = float(last_status.get("average_price") or order_price)
                             break
+                        elif order_status in ("REJECTED", "CANCELLED"):
+                            reject_reason = last_status.get("status_message", "Order rejected by broker")
+                            logger.error("[LIVE] Exit order %s was %s: %s", order_id, order_status, reject_reason)
+                            raise RuntimeError(f"Exit order {order_id} {order_status}: {reject_reason}")
+            except RuntimeError:
+                raise
             except Exception as hist_err:
                 logger.warning("Could not fetch fill price for exit order %s (%s), defaulting to %.1f", order_id, hist_err, order_price)
 
             return {
                 "order_id": order_id,
                 "symbol": symbol,
-                "status": "COMPLETE",
+                "status": order_status,
                 "average_price": avg_price,
                 "transaction_type": transaction_type,
                 "quantity": quantity_lots,
@@ -229,3 +261,138 @@ class SilverOrderManager:
         except Exception as e:
             logger.error("[LIVE] Failed to place exit order for %s: %s", symbol, e)
             raise
+
+    def place_broker_sl(
+        self,
+        symbol: str,
+        direction: str,
+        quantity_lots: int,
+        trigger_price: float,
+        buffer_pts: float = 50.0,
+    ) -> Optional[str]:
+        """
+        Submits a protective Stop-Loss Limit order on Kite (MCX).
+        For LONG positions, places a SELL SL with trigger_price and limit_price = trigger_price - buffer.
+        For SHORT positions, places a BUY SL with trigger_price and limit_price = trigger_price + buffer.
+        Returns the broker order ID or None on failure.
+        """
+        transaction_type = "SELL" if direction.upper() == "LONG" else "BUY"
+        trig_p = _round_to_mcx_tick(trigger_price)
+        limit_p = _round_to_mcx_tick(trig_p - buffer_pts) if transaction_type == "SELL" else _round_to_mcx_tick(trig_p + buffer_pts)
+
+        if self.mode == "PAPER":
+            sl_id = f"PAPER_SL_{self._order_counter:04d}"
+            self._order_counter += 1
+            self._paper_orders[sl_id] = {
+                "order_id": sl_id,
+                "symbol": symbol,
+                "direction": direction,
+                "transaction_type": transaction_type,
+                "quantity": quantity_lots,
+                "trigger_price": trig_p,
+                "price": limit_p,
+                "status": "TRIGGER PENDING",
+            }
+            logger.info("[PAPER] Placed protective Stop Loss order %s: %s %d lots of %s (Trigger: Rs %.1f, Limit: Rs %.1f)", sl_id, transaction_type, quantity_lots, symbol, trig_p, limit_p)
+            return sl_id
+
+        try:
+            kite_variety = self.kite.VARIETY_REGULAR
+            kite_tx_type = self.kite.TRANSACTION_TYPE_SELL if transaction_type == "SELL" else self.kite.TRANSACTION_TYPE_BUY
+            kite_product = self.kite.PRODUCT_MIS if self.product == "MIS" else self.kite.PRODUCT_NRML
+
+            order_id = self.kite.place_order(
+                variety=kite_variety,
+                exchange=self.exchange,
+                tradingsymbol=symbol,
+                transaction_type=kite_tx_type,
+                quantity=quantity_lots,
+                product=kite_product,
+                order_type=self.kite.ORDER_TYPE_SL,
+                price=limit_p,
+                trigger_price=trig_p,
+            )
+            logger.info("[LIVE] Placed broker-side Stop Loss order %s for %s (%s %d lots, Trigger: Rs %.1f, Limit: Rs %.1f)", order_id, symbol, transaction_type, quantity_lots, trig_p, limit_p)
+            return str(order_id)
+        except Exception as e:
+            logger.critical("[LIVE] Failed to place broker-side Stop Loss order for %s: %s", symbol, e, exc_info=True)
+            return None
+
+    def modify_broker_sl(
+        self,
+        order_id: str,
+        quantity_lots: int,
+        trigger_price: float,
+        buffer_pts: float = 50.0,
+    ) -> bool:
+        """Modifies quantity or trigger price of an existing broker Stop Loss order."""
+        if not order_id:
+            return False
+        trig_p = _round_to_mcx_tick(trigger_price)
+
+        if self.mode == "PAPER":
+            if order_id in self._paper_orders:
+                self._paper_orders[order_id]["quantity"] = quantity_lots
+                self._paper_orders[order_id]["trigger_price"] = trig_p
+            logger.info("[PAPER] Modified Stop Loss %s -> %d lots @ Trigger Rs %.1f", order_id, quantity_lots, trig_p)
+            return True
+
+        try:
+            history = self.kite.order_history(order_id)
+            if not history:
+                return False
+            tx_type = history[-1].get("transaction_type", "BUY")
+            limit_p = _round_to_mcx_tick(trig_p - buffer_pts) if tx_type == "SELL" else _round_to_mcx_tick(trig_p + buffer_pts)
+
+            self.kite.modify_order(
+                variety=self.kite.VARIETY_REGULAR,
+                order_id=order_id,
+                quantity=quantity_lots,
+                price=limit_p,
+                trigger_price=trig_p,
+                order_type=self.kite.ORDER_TYPE_SL,
+            )
+            logger.info("[LIVE] Modified broker Stop Loss %s: %d lots @ Trigger Rs %.1f (Limit Rs %.1f)", order_id, quantity_lots, trig_p, limit_p)
+            return True
+        except Exception as e:
+            logger.error("[LIVE] Failed to modify broker Stop Loss %s: %s", order_id, e)
+            return False
+
+    def cancel_broker_sl(self, order_id: str) -> bool:
+        """Cancels a broker Stop Loss order."""
+        if not order_id:
+            return False
+        if self.mode == "PAPER":
+            if order_id in self._paper_orders:
+                self._paper_orders[order_id]["status"] = "CANCELLED"
+            logger.info("[PAPER] Cancelled protective Stop Loss %s", order_id)
+            return True
+        try:
+            self.kite.cancel_order(variety=self.kite.VARIETY_REGULAR, order_id=order_id)
+            logger.info("[LIVE] Cancelled broker Stop Loss %s", order_id)
+            return True
+        except Exception as e:
+            logger.warning("[LIVE] Error cancelling broker Stop Loss %s (may already be triggered or cancelled): %s", order_id, e)
+            return False
+
+    def get_order_status(self, order_id: str) -> Dict[str, Any]:
+        """Retrieves latest order status from broker or paper tracking."""
+        if self.mode == "PAPER":
+            rec = self._paper_orders.get(order_id, {})
+            return {
+                "status": rec.get("status", "COMPLETE"),
+                "average_price": rec.get("average_price", rec.get("price", 0.0)),
+                "filled_quantity": rec.get("filled_quantity", rec.get("quantity", 0)),
+            }
+        try:
+            history = self.kite.order_history(order_id)
+            if history:
+                last_rec = history[-1]
+                return {
+                    "status": last_rec.get("status", "UNKNOWN"),
+                    "average_price": float(last_rec.get("average_price") or 0.0),
+                    "filled_quantity": int(last_rec.get("filled_quantity") or 0),
+                }
+        except Exception as e:
+            logger.warning("Could not query status for order %s: %s", order_id, e)
+        return {"status": "UNKNOWN", "average_price": 0.0, "filled_quantity": 0}

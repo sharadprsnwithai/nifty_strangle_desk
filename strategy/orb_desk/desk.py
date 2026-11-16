@@ -31,6 +31,17 @@ def _normalize_date(d: Any) -> date:
     return date.today()
 
 
+def is_token_error(e: Exception) -> bool:
+    """Detects whether an exception indicates an expired/invalid Zerodha access token."""
+    err_str = str(e).lower()
+    return (
+        "token" in err_str
+        or "api_key" in err_str
+        or "access_token" in err_str
+        or "tokenexception" in type(e).__name__.lower()
+    )
+
+
 class ORBDesk:
     """
     15-Minute Opening Range Breakout (ORB) Automated Desk.
@@ -59,6 +70,7 @@ class ORBDesk:
         # In-memory daily state
         self.today: date = date.today()
         self.nifty_day_open: Optional[float] = None
+        self._morning_session_checked: bool = False
         self.stock_stats: Dict[str, Dict[str, Any]] = {}  # {sym: {pdh, pdl, ib_high, ib_low, token}}
         self.active_positions: List[Dict[str, Any]] = []
         self.armed_positions: List[Dict[str, Any]] = []
@@ -153,6 +165,7 @@ class ORBDesk:
             if sym in self.stock_stats and not force and self.stock_stats[sym].get("pdh") is not None:
                 continue
 
+            hist = None
             try:
                 hist = self.kite.historical_data(
                     instrument_token=token,
@@ -160,6 +173,25 @@ class ORBDesk:
                     to_date=end_dt.date(),
                     interval="day"
                 )
+            except Exception as e:
+                if is_token_error(e):
+                    logger.warning("Token error while fetching daily history for %s (%s). Re-authenticating...", sym, e)
+                    self._ensure_kite_session(force_login=True)
+                    try:
+                        hist = self.kite.historical_data(
+                            instrument_token=token,
+                            from_date=start_dt.date(),
+                            to_date=end_dt.date(),
+                            interval="day"
+                        )
+                    except Exception as retry_err:
+                        logger.warning("Failed to fetch daily history for %s after re-auth: %s", sym, retry_err)
+                else:
+                    logger.warning("Failed to fetch daily history for %s: %s", sym, e)
+            finally:
+                time.sleep(0.35)  # Respect Kite 3 req/sec rate limit
+
+            if hist:
                 today_d = _normalize_date(self.today)
                 completed = [
                     c for c in hist
@@ -188,9 +220,7 @@ class ORBDesk:
                     "ib_low": self.stock_stats.get(sym, {}).get("ib_low"),
                     "reasons": item.get("reasons", [])
                 }
-                time.sleep(0.35)  # Respect Kite 3 req/sec rate limit
-            except Exception as e:
-                logger.warning("Failed to fetch daily history for %s: %s", sym, e)
+            else:
                 if sym not in self.stock_stats:
                     self.stock_stats[sym] = {
                         "token": token,
@@ -207,6 +237,7 @@ class ORBDesk:
         today = new_date or date.today()
         self.today = _normalize_date(today)
         self.ib_formed = False
+        self._morning_session_checked = False
         self.circuit_tripped = False
         self.traded_stocks_today = set()
         self.active_positions = []
@@ -237,6 +268,9 @@ class ORBDesk:
         else:
             logger.info("F&O Ban Filter: All %d universe stocks cleared (0 in ban list).", len(self.target_stocks))
 
+        # Ensure Kite session is active and valid before morning queries
+        self._ensure_kite_session()
+
         # Check NIFTY 50 Day Open
         try:
             quote = self.kite.quote([NIFTY_SYMBOL])
@@ -244,7 +278,18 @@ class ORBDesk:
                 self.nifty_day_open = float(quote[NIFTY_SYMBOL]["ohlc"]["open"])
                 logger.info("NIFTY 50 Day Open: %.2f", self.nifty_day_open)
         except Exception as e:
-            logger.warning("Could not fetch NIFTY Day Open: %s", e)
+            if is_token_error(e):
+                logger.warning("Token error while fetching NIFTY Day Open (%s). Re-authenticating...", e)
+                self._ensure_kite_session(force_login=True)
+                try:
+                    quote = self.kite.quote([NIFTY_SYMBOL])
+                    if NIFTY_SYMBOL in quote:
+                        self.nifty_day_open = float(quote[NIFTY_SYMBOL]["ohlc"]["open"])
+                        logger.info("NIFTY 50 Day Open: %.2f", self.nifty_day_open)
+                except Exception as retry_err:
+                    logger.warning("Could not fetch NIFTY Day Open after re-auth: %s", retry_err)
+            else:
+                logger.warning("Could not fetch NIFTY Day Open: %s", e)
 
         self._ensure_pdh_pdl_for_target_stocks(force=force)
         self._save_state()
@@ -258,15 +303,19 @@ class ORBDesk:
         Fetches 15-minute candles from 09:15 to 10:15 for the 30 target stocks
         and records Initial Balance (IB High, IB Low).
         """
+        self._ensure_kite_session()
+
         logger.info("Computing 15-minute Initial Balance (09:15 - 10:15) for %d stocks...", len(self.target_stocks))
         now = datetime.now()
         today_start = datetime.combine(_normalize_date(self.today), dt_time(9, 15))
 
+        successful_fetches = 0
         for item in self.target_stocks:
             sym = item["symbol"]
             token = item.get("token")
             if not token:
                 continue
+            candles = None
             try:
                 candles = self.kite.historical_data(
                     instrument_token=token,
@@ -274,6 +323,26 @@ class ORBDesk:
                     to_date=now,
                     interval="15minute"
                 )
+            except Exception as e:
+                if is_token_error(e):
+                    logger.warning("Token error while fetching IB candles for %s (%s). Re-authenticating...", sym, e)
+                    self._ensure_kite_session(force_login=True)
+                    try:
+                        candles = self.kite.historical_data(
+                            instrument_token=token,
+                            from_date=today_start,
+                            to_date=now,
+                            interval="15minute"
+                        )
+                    except Exception as retry_err:
+                        logger.warning("Could not fetch IB candles for %s after re-auth: %s", sym, retry_err)
+                else:
+                    logger.warning("Could not fetch IB candles for %s: %s", sym, e)
+            finally:
+                time.sleep(0.35)  # Always respect Kite 3 req/sec rate limit
+
+            if candles:
+                successful_fetches += 1
                 if len(candles) >= 4:
                     ib_candles = candles[:4]
                     ib_h = max(float(c["high"]) for c in ib_candles)
@@ -288,13 +357,14 @@ class ORBDesk:
                     if sym in self.stock_stats:
                         self.stock_stats[sym]["ib_high"] = ib_h
                         self.stock_stats[sym]["ib_low"] = ib_l
-                time.sleep(0.35)  # Respect Kite 3 req/sec rate limit
-            except Exception as e:
-                logger.warning("Could not fetch IB candles for %s: %s", sym, e)
 
-        self.ib_formed = True
-        self._save_state()
-        self._notify_ib_formed()
+        if successful_fetches > 0:
+            self.ib_formed = True
+            self._save_state()
+            self._notify_ib_formed()
+            logger.info("Initial Balance computation completed for %d/%d stocks.", successful_fetches, len(self.target_stocks))
+        else:
+            logger.warning("Initial Balance computation fetched 0/%d stocks. Will retry next cycle.", len(self.target_stocks))
 
     # -------------------------------------------------------------------------
     # Breakout Scanning & Trigger Execution (10:15 - 13:15)
@@ -328,7 +398,18 @@ class ORBDesk:
                 nifty_bias = "BULLISH" if n_ltp >= self.nifty_day_open else "BEARISH"
                 logger.debug("NIFTY 50 LTP: %.2f vs Open %.2f -> Bias: %s", n_ltp, self.nifty_day_open, nifty_bias)
         except Exception as e:
-            logger.warning("Could not check NIFTY bias: %s", e)
+            if is_token_error(e):
+                logger.warning("Token error checking NIFTY bias (%s). Re-authenticating...", e)
+                self._ensure_kite_session(force_login=True)
+                try:
+                    n_ltp_res = self.kite.ltp([NIFTY_SYMBOL])
+                    if NIFTY_SYMBOL in n_ltp_res and self.nifty_day_open is not None:
+                        n_ltp = float(n_ltp_res[NIFTY_SYMBOL]["last_price"])
+                        nifty_bias = "BULLISH" if n_ltp >= self.nifty_day_open else "BEARISH"
+                except Exception as retry_err:
+                    logger.warning("Could not check NIFTY bias after re-auth: %s", retry_err)
+            else:
+                logger.warning("Could not check NIFTY bias: %s", e)
 
         now = datetime.now()
         today_start = datetime.combine(_normalize_date(self.today), dt_time(9, 15))
@@ -355,12 +436,32 @@ class ORBDesk:
                 continue
 
             try:
-                candles = self.kite.historical_data(
-                    instrument_token=token,
-                    from_date=today_start,
-                    to_date=now,
-                    interval="15minute"
-                )
+                candles = None
+                try:
+                    candles = self.kite.historical_data(
+                        instrument_token=token,
+                        from_date=today_start,
+                        to_date=now,
+                        interval="15minute"
+                    )
+                except Exception as e:
+                    if is_token_error(e):
+                        logger.warning("Token error while scanning %s (%s). Re-authenticating...", sym, e)
+                        self._ensure_kite_session(force_login=True)
+                        try:
+                            candles = self.kite.historical_data(
+                                instrument_token=token,
+                                from_date=today_start,
+                                to_date=now,
+                                interval="15minute"
+                            )
+                        except Exception as retry_err:
+                            logger.warning("Could not fetch candles for %s after re-auth: %s", sym, retry_err)
+                    else:
+                        logger.warning("Could not fetch candles for %s: %s", sym, e)
+
+                if not candles:
+                    continue
                 # Ensure we evaluate the latest completed 15-minute candle
                 completed_candles = [
                     c for c in candles

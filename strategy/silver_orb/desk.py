@@ -273,18 +273,43 @@ class SilverORBDesk:
         ref_high: float,
         ref_low: float,
         current_time: dt_time,
+        current_dt: Optional[datetime] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Evaluates whether current price forms a valid 18:00 breakout
+        Evaluates whether the last closed 15m candle forms a valid 18:00 breakout
         confirmed by 50 EMA trend filter and 1.2x volume average.
+        Only completed candles are considered (ignoring currently forming bars).
         """
-        if len(df) < 50:
+        if df is None or len(df) < 50:
             return None
 
-        df["vol_sma20"] = df["volume"].rolling(20).mean().shift(1)
-        df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+        # Filter out currently forming candle if present.
+        # A 15m candle starting at T closes at T + 15m.
+        eval_dt = current_dt or datetime.now()
+        work_df = df.copy()
 
-        latest_bar = df.iloc[-1]
+        if "date" in work_df.columns:
+            try:
+                candle_dates = pd.to_datetime(work_df["date"])
+                if candle_dates.dt.tz is not None:
+                    candle_dates = candle_dates.dt.tz_localize(None)
+                eval_naive = eval_dt.replace(tzinfo=None) if hasattr(eval_dt, "tzinfo") and eval_dt.tzinfo else eval_dt
+
+                # Closed condition: candle_start + 15m <= eval_time + 5s tolerance
+                is_closed = (candle_dates + pd.Timedelta(minutes=15)) <= (eval_naive + pd.Timedelta(seconds=5))
+                closed_df = work_df[is_closed]
+                if len(closed_df) >= 50:
+                    work_df = closed_df
+            except Exception as dt_err:
+                logger.debug("Date filtering bypassed: %s", dt_err)
+
+        if len(work_df) < 50:
+            return None
+
+        work_df["vol_sma20"] = work_df["volume"].rolling(20).mean().shift(1)
+        work_df["ema50"] = work_df["close"].ewm(span=50, adjust=False).mean()
+
+        latest_bar = work_df.iloc[-1]
         b_high = float(latest_bar["high"])
         b_low = float(latest_bar["low"])
         b_close = float(latest_bar["close"])
@@ -326,6 +351,37 @@ class SilverORBDesk:
     # -------------------------------------------------------------------------
     # Position Lifecycle & 2-Lot Tranche Execution
     # -------------------------------------------------------------------------
+    def check_available_margin(self) -> Dict[str, Any]:
+        """Queries available commodity margin on Kite."""
+        if self.config.mode != "LIVE" or not self.kite:
+            return {"status": "BYPASS", "available_cash": 999999.0}
+        try:
+            margins = self.kite.margins("commodity")
+            available = float(margins.get("available", {}).get("cash", 0.0) or margins.get("net", 0.0))
+            enabled = margins.get("enabled", True)
+            return {"status": "OK" if enabled else "DISABLED", "available_cash": available}
+        except Exception as e:
+            logger.warning("Failed to query commodity margins from Kite: %s", e)
+            return {"status": "ERROR", "available_cash": 0.0}
+
+    def check_broker_position_qty(self, symbol: str) -> Optional[int]:
+        """
+        Queries actual open net position from Kite for the given symbol.
+        Returns positive int for LONG, negative int for SHORT, 0 for FLAT.
+        Returns None if not in LIVE mode or query fails.
+        """
+        if self.config.mode != "LIVE" or not self.kite:
+            return None
+        try:
+            positions = self.kite.positions()
+            for pos in positions.get("net", []):
+                if pos.get("tradingsymbol") == symbol:
+                    return int(pos.get("quantity", 0))
+            return 0
+        except Exception as e:
+            logger.error("Failed to query Kite broker positions for %s: %s", symbol, e)
+            return None
+
     def monitor_active_trade(self, current_ltp: float, current_time: dt_time) -> None:
         """
         Monitors active 2-lot trade:
@@ -349,6 +405,52 @@ class SilverORBDesk:
         total_lots = trade.get("lots_total", self.config.lots)
         lot1_lots = max(1, total_lots // 2)
         lot2_lots = total_lots - lot1_lots
+        sl_order_id = trade.get("sl_order_id")
+
+        # 1. Check if exchange-level Stop Loss order was triggered on Kite
+        if sl_order_id and self.config.mode == "LIVE":
+            sl_stat = self.order_manager.get_order_status(sl_order_id)
+            if sl_stat.get("status") == "COMPLETE":
+                fill_p = float(sl_stat.get("average_price") or current_sl)
+                loss_pts = (entry - fill_p) if direction == "LONG" else (fill_p - entry)
+                trade_loss = -loss_pts * self.config.point_value_per_lot * trade["lots_open"]
+                trade["status"] = "CLOSED"
+                trade["lot1_closed"] = True
+                trade["lot2_closed"] = True
+                trade["lot1_exit_price"] = fill_p
+                trade["lot2_exit_price"] = fill_p
+                trade["lots_open"] = 0
+                state["status"] = "COMPLETED"
+                state["realized_pnl_rs"] += trade_loss
+                self.save_state(state)
+                logger.warning("[EXCHANGE SL TRIGGERED] Broker Stop Loss %s executed on exchange @ Rs %.1f (Loss: Rs %.2f)", sl_order_id, fill_p, trade_loss)
+                self._notify_sl(trade, fill_p, trade_loss, state["realized_pnl_rs"])
+                return
+
+        # 2. Safeguard: Verify broker position matches expected strategy position before placing exit
+        if self.config.mode == "LIVE" and self.kite is not None:
+            broker_qty = self.check_broker_position_qty(sym)
+            if broker_qty is not None:
+                has_valid_pos = (direction == "SHORT" and broker_qty < 0) or (direction == "LONG" and broker_qty > 0)
+                if not has_valid_pos:
+                    logger.critical(
+                        "[DESYNC ERROR] Position mismatch for %s! Strategy expects active %s position (%d lots), but Kite net quantity is %d. Aborting exit order to prevent naked trade.",
+                        sym, direction, trade.get("lots_open", 0), broker_qty
+                    )
+                    if self.notifier:
+                        self.notifier.send_message(
+                            f"🚨 *CRITICAL DESYNC ABORT: {sym}*\n"
+                            f"Strategy expected *{direction}* position ({trade.get('lots_open', 0)} lots), "
+                            f"but Kite net position is *{broker_qty}*.\n"
+                            f"Exit order aborted to avoid opening an unintended naked position!"
+                        )
+                    # Cancel any resting broker SL order to prevent late execution
+                    if sl_order_id:
+                        self.order_manager.cancel_broker_sl(sl_order_id)
+                    trade["status"] = "DESYNC_ABORTED"
+                    state["status"] = "COMPLETED"
+                    self.save_state(state)
+                    return
 
         # Case 1: Lot 1 Target 1 Hit (+800 pts)
         if not trade["lot1_closed"]:
@@ -372,13 +474,24 @@ class SilverORBDesk:
                 trade["current_sl"] = entry  # Trailed to Breakeven
                 trade["be_moved"] = True
                 state["realized_pnl_rs"] += lot1_pnl
+
+                # Modify protective broker SL order on exchange for runner lot to Breakeven!
+                if sl_order_id:
+                    self.order_manager.modify_broker_sl(
+                        order_id=sl_order_id,
+                        quantity_lots=lot2_lots,
+                        trigger_price=entry,
+                    )
+
                 self.save_state(state)
                 logger.info("Tranche 1 Target 1 HIT (%d lots): +Rs %.2f. Runner (%d lots) SL moved to Breakeven @ Rs %.1f", lot1_lots, lot1_pnl, lot2_lots, entry)
                 self._notify_target1(trade, state["realized_pnl_rs"])
                 return
 
             elif hit_sl_early:
-                # Both lots stopped out at initial SL
+                # Cancel broker SL before placing market exit (or let it fire)
+                if sl_order_id:
+                    self.order_manager.cancel_broker_sl(sl_order_id)
                 exit_price = current_sl
                 try:
                     exit_res = self.order_manager.place_exit(sym, direction, trade["lots_total"], exit_price, reason="INITIAL_STOP_LOSS")
@@ -411,6 +524,8 @@ class SilverORBDesk:
             hit_eod = current_time >= self.config.session_cutoff_time
 
             if hit_be_sl:
+                if sl_order_id:
+                    self.order_manager.cancel_broker_sl(sl_order_id)
                 exit_price = current_sl
                 lot2_pnl = 0.0  # Stopped out flat at cost
                 try:
@@ -430,6 +545,8 @@ class SilverORBDesk:
                 return
 
             elif hit_eod:
+                if sl_order_id:
+                    self.order_manager.cancel_broker_sl(sl_order_id)
                 exit_price = current_ltp
                 try:
                     exit_res = self.order_manager.place_exit(sym, direction, lot2_lots, exit_price, reason="SESSION_CUTOFF_EXIT")
@@ -476,8 +593,21 @@ class SilverORBDesk:
         sym = contract["tradingsymbol"]
         token = int(contract["instrument_token"])
 
-        # Step 1: Between 17:45 and 18:00, wait for 17:45 candle close
+        # Pre-flight commodity margin check between 17:45 and 18:00
         if current_t < self.config.trade_window_start:
+            if state.get("margin_checked") is None:
+                margin_info = self.check_available_margin()
+                state["margin_checked"] = margin_info.get("status")
+                state["available_commodity_cash"] = margin_info.get("available_cash")
+                self.save_state(state)
+                if margin_info.get("status") == "DISABLED":
+                    logger.error("MCX Commodity trading segment appears disabled on your Zerodha account!")
+                    if self.notifier:
+                        self.notifier.send_message("⚠️ *MCX Alert:* Commodity trading segment appears disabled on your Zerodha account!")
+                elif margin_info.get("status") == "OK":
+                    cash = float(margin_info.get("available_cash", 0.0))
+                    logger.info("Pre-flight commodity margin check: Rs %.2f available", cash)
+
             logger.debug("Pre-US window (%s). Waiting for 18:00 IST trigger window.", current_t.strftime("%H:%M:%S"))
             return state
 
@@ -506,58 +636,80 @@ class SilverORBDesk:
                 # Optimize API calls: evaluate candle-close breakout only on new 15m intervals or initial check
                 candle_slot = f"{current_t.hour}:{current_t.minute // 15}"
                 should_eval = state.get("last_eval_slot") != candle_slot or current_dt is not None
-                candles = self.fetch_recent_candles(token) if should_eval else None
                 if should_eval:
-                    state["last_eval_slot"] = candle_slot
-                    self.save_state(state)
-                if candles is not None and not candles.empty:
-                    ref_h = state["ref_bar"]["high"]
-                    ref_l = state["ref_bar"]["low"]
-                    sig = self.evaluate_breakout_signal(candles, ref_h, ref_l, current_t)
-                    if sig:
-                        direction = sig["direction"]
-                        entry_p = sig["trigger_price"]
-                        sl_p = entry_p - self.config.initial_sl_pts if direction == "LONG" else entry_p + self.config.initial_sl_pts
-                        tgt1_p = entry_p + self.config.target1_pts if direction == "LONG" else entry_p - self.config.target1_pts
+                    candles = self.fetch_recent_candles(token)
+                    if candles is not None and not candles.empty:
+                        # Advance last_eval_slot ONLY after successful candle fetch
+                        state["last_eval_slot"] = candle_slot
+                        self.save_state(state)
 
-                        # Submit 2-lot entry order
-                        try:
-                            self.order_manager.place_entry(
+                        ref_h = state["ref_bar"]["high"]
+                        ref_l = state["ref_bar"]["low"]
+                        sig = self.evaluate_breakout_signal(candles, ref_h, ref_l, current_t, current_dt=now)
+                        if sig:
+                            direction = sig["direction"]
+                            entry_p = sig["trigger_price"]
+                            sl_p = entry_p - self.config.initial_sl_pts if direction == "LONG" else entry_p + self.config.initial_sl_pts
+                            tgt1_p = entry_p + self.config.target1_pts if direction == "LONG" else entry_p - self.config.target1_pts
+
+                            # Submit entry order
+                            try:
+                                entry_res = self.order_manager.place_entry(
+                                    symbol=sym,
+                                    direction=direction,
+                                    quantity_lots=self.config.lots,
+                                    entry_price=entry_p,
+                                    initial_sl=sl_p,
+                                    target_pts=self.config.target1_pts,
+                                )
+                            except Exception as entry_err:
+                                logger.error("Failed to place breakout entry for %s (%s): %s", sym, direction, entry_err, exc_info=True)
+                                return state
+
+                            if not entry_res or entry_res.get("status") not in ("COMPLETE", "PARTIAL"):
+                                logger.error("Breakout entry order for %s was not completed (status=%s). Position not opened.", sym, entry_res.get("status") if entry_res else None)
+                                return state
+
+                            filled_lots = int(entry_res.get("quantity") or self.config.lots)
+                            actual_entry_p = float(entry_res.get("average_price") or entry_p)
+
+                            # Re-calculate SL and target from actual fill price
+                            sl_p = actual_entry_p - self.config.initial_sl_pts if direction == "LONG" else actual_entry_p + self.config.initial_sl_pts
+                            tgt1_p = actual_entry_p + self.config.target1_pts if direction == "LONG" else actual_entry_p - self.config.target1_pts
+
+                            # Place protective Stop Loss order on Kite exchange immediately
+                            sl_order_id = self.order_manager.place_broker_sl(
                                 symbol=sym,
                                 direction=direction,
-                                quantity_lots=self.config.lots,
-                                entry_price=entry_p,
-                                initial_sl=sl_p,
-                                target_pts=self.config.target1_pts,
+                                quantity_lots=filled_lots,
+                                trigger_price=sl_p,
                             )
-                        except Exception as entry_err:
-                            logger.error("Failed to place breakout entry for %s (%s): %s", sym, direction, entry_err, exc_info=True)
-                            return state
 
-                        trade_record = {
-                            "symbol": sym,
-                            "direction": direction,
-                            "entry_price": entry_p,
-                            "initial_sl": sl_p,
-                            "current_sl": sl_p,
-                            "target1_price": tgt1_p,
-                            "lots_total": self.config.lots,
-                            "lots_open": self.config.lots,
-                            "lot1_closed": False,
-                            "lot1_exit_price": None,
-                            "lot1_pnl_rs": 0.0,
-                            "lot2_closed": False,
-                            "lot2_exit_price": None,
-                            "lot2_pnl_rs": 0.0,
-                            "be_moved": False,
-                            "status": "OPEN",
-                            "entry_time": current_t.strftime("%H:%M:%S"),
-                        }
-                        state["trade"] = trade_record
-                        state["status"] = "ACTIVE_TRADE"
-                        state["trades_count"] += 1
-                        self.save_state(state)
-                        self._notify_entry(trade_record)
+                            trade_record = {
+                                "symbol": sym,
+                                "direction": direction,
+                                "entry_price": actual_entry_p,
+                                "initial_sl": sl_p,
+                                "current_sl": sl_p,
+                                "target1_price": tgt1_p,
+                                "lots_total": filled_lots,
+                                "lots_open": filled_lots,
+                                "lot1_closed": False,
+                                "lot1_exit_price": None,
+                                "lot1_pnl_rs": 0.0,
+                                "lot2_closed": False,
+                                "lot2_exit_price": None,
+                                "lot2_pnl_rs": 0.0,
+                                "be_moved": False,
+                                "status": "OPEN",
+                                "entry_time": current_t.strftime("%H:%M:%S"),
+                                "sl_order_id": sl_order_id,
+                            }
+                            state["trade"] = trade_record
+                            state["status"] = "ACTIVE_TRADE"
+                            state["trades_count"] += 1
+                            self.save_state(state)
+                            self._notify_entry(trade_record)
             else:
                 # Past 19:30 with no trigger: day closes peacefully
                 logger.info("Trade window closed (19:30 IST) without breakout trigger. Session completed.")

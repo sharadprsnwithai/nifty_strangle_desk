@@ -346,3 +346,264 @@ def test_4lot_tranche_scaling(tmp_path):
     assert desk.state["realized_pnl_rs"] == 18000.0  # 8k + 10k = 18k!
 
 
+def test_silver_order_manager_live_market_orders():
+    mock_kite = MagicMock()
+    mock_kite.place_order.return_value = "ORDER_MKT_1"
+    mock_kite.order_history.return_value = [{"status": "COMPLETE", "average_price": 185025.0}]
+
+    om = SilverOrderManager(
+        mode="LIVE",
+        kite=mock_kite,
+        order_type="MARKET",
+    )
+
+    # Test Long Entry with MARKET order
+    res = om.place_entry("SILVERM26NOVFUT", "LONG", 2, 185000.0, 184500.0, 185800.0)
+    assert res["order_id"] == "ORDER_MKT_1"
+    assert res["status"] == "COMPLETE"
+    assert res["average_price"] == 185025.0
+
+    call_kwargs = mock_kite.place_order.call_args[1]
+    assert call_kwargs["order_type"] == mock_kite.ORDER_TYPE_MARKET
+    assert call_kwargs["price"] is None
+
+    # Test Long Exit with MARKET order
+    mock_kite.order_history.return_value = [{"status": "COMPLETE", "average_price": 185810.0}]
+    exit_res = om.place_exit("SILVERM26NOVFUT", "LONG", 1, 185800.0, "TARGET_1_HIT")
+    assert exit_res["status"] == "COMPLETE"
+    assert exit_res["average_price"] == 185810.0
+
+    exit_kwargs = mock_kite.place_order.call_args[1]
+    assert exit_kwargs["order_type"] == mock_kite.ORDER_TYPE_MARKET
+    assert exit_kwargs["price"] is None
+
+
+def test_silver_order_manager_entry_timeout_cancellation():
+    mock_kite = MagicMock()
+    mock_kite.place_order.return_value = "ORDER_PENDING"
+    # Order stays OPEN throughout polling
+    mock_kite.order_history.return_value = [{"status": "OPEN"}]
+
+    om = SilverOrderManager(
+        mode="LIVE",
+        kite=mock_kite,
+        order_type="LIMIT",
+    )
+
+    with pytest.raises(RuntimeError, match="failed to fill within timeout"):
+        om.place_entry("SILVERM26NOVFUT", "SHORT", 2, 171600.0, 172100.0, 170800.0)
+
+    # Verify cancel_order was called on Kite
+    mock_kite.cancel_order.assert_called_once_with(
+        variety=mock_kite.VARIETY_REGULAR,
+        order_id="ORDER_PENDING",
+    )
+
+
+def test_silver_desk_desync_safeguard(tmp_path):
+    state_file = tmp_path / "silver_state.json"
+    notifier_mock = MagicMock()
+    mock_kite = MagicMock()
+    # Broker positions report FLAT (0 quantity), but desk thinks it's SHORT
+    mock_kite.positions.return_value = {"net": [{"tradingsymbol": "SILVERM26NOVFUT", "quantity": 0}]}
+
+    mock_om = MagicMock()
+    cfg = SilverORBConfig(state_file=str(state_file), mode="LIVE", lots=2, initial_sl_pts=500.0, target1_pts=800.0)
+    desk = SilverORBDesk(config=cfg, kite=mock_kite, order_manager=mock_om, notifier=notifier_mock)
+
+    desk.state = {
+        "date": "2026-11-16",
+        "status": "ACTIVE_TRADE",
+        "contract": {"tradingsymbol": "SILVERM26NOVFUT", "instrument_token": 123},
+        "realized_pnl_rs": 0.0,
+        "trade": {
+            "symbol": "SILVERM26NOVFUT",
+            "direction": "SHORT",
+            "entry_price": 171600.0,
+            "initial_sl": 172100.0,
+            "current_sl": 172100.0,
+            "target1_price": 170800.0,
+            "lots_total": 2,
+            "lots_open": 2,
+            "lot1_closed": False,
+            "lot1_exit_price": None,
+            "lot1_pnl_rs": 0.0,
+            "lot2_closed": False,
+            "lot2_exit_price": None,
+            "lot2_pnl_rs": 0.0,
+            "be_moved": False,
+            "status": "OPEN",
+        },
+    }
+    desk.save_state(desk.state)
+
+    # Target hit price reached
+    desk.monitor_active_trade(current_ltp=170700.0, current_time=dt_time(19, 15))
+
+    # Exit order must NOT have been called due to desync
+    mock_om.place_exit.assert_not_called()
+    assert desk.state["trade"]["status"] == "DESYNC_ABORTED"
+    assert desk.state["status"] == "COMPLETED"
+    notifier_mock.send_message.assert_called_once()
+    assert "CRITICAL DESYNC ABORT" in notifier_mock.send_message.call_args[0][0]
+
+
+def test_broker_side_stop_loss_lifecycle():
+    mock_kite = MagicMock()
+    mock_kite.place_order.return_value = "SL_ORDER_999"
+
+    om = SilverOrderManager(
+        mode="LIVE",
+        kite=mock_kite,
+        order_type="MARKET",
+    )
+
+    # 1. Place broker SL order for SHORT position (covering BUY SL)
+    sl_id = om.place_broker_sl(
+        symbol="SILVERM26NOVFUT",
+        direction="SHORT",
+        quantity_lots=2,
+        trigger_price=172100.0,
+        buffer_pts=50.0,
+    )
+    assert sl_id == "SL_ORDER_999"
+    place_kwargs = mock_kite.place_order.call_args[1]
+    assert place_kwargs["order_type"] == mock_kite.ORDER_TYPE_SL
+    assert place_kwargs["transaction_type"] == mock_kite.TRANSACTION_TYPE_BUY
+    assert place_kwargs["trigger_price"] == 172100.0
+    assert place_kwargs["price"] == 172150.0  # 172100 + 50 buffer
+    assert place_kwargs["quantity"] == 2
+
+    # 2. Modify broker SL when Target 1 hits (reduce to 1 lot, move trigger to cost)
+    mock_kite.order_history.return_value = [{"transaction_type": "BUY"}]
+    mod_ok = om.modify_broker_sl(
+        order_id="SL_ORDER_999",
+        quantity_lots=1,
+        trigger_price=171600.0,
+        buffer_pts=50.0,
+    )
+    assert mod_ok is True
+    mod_kwargs = mock_kite.modify_order.call_args[1]
+    assert mod_kwargs["quantity"] == 1
+    assert mod_kwargs["trigger_price"] == 171600.0
+    assert mod_kwargs["price"] == 171650.0
+
+    # 3. Cancel broker SL on trade completion
+    cancel_ok = om.cancel_broker_sl("SL_ORDER_999")
+    assert cancel_ok is True
+    mock_kite.cancel_order.assert_called_once_with(
+        variety=mock_kite.VARIETY_REGULAR,
+        order_id="SL_ORDER_999",
+    )
+
+
+def test_exchange_stop_loss_trigger_detection(tmp_path):
+    state_file = tmp_path / "silver_state.json"
+    notifier_mock = MagicMock()
+    mock_kite = MagicMock()
+    mock_om = MagicMock()
+
+    # Simulate broker SL executed on Kite directly
+    mock_om.get_order_status.return_value = {
+        "status": "COMPLETE",
+        "average_price": 172105.0,
+        "filled_quantity": 2,
+    }
+
+    cfg = SilverORBConfig(state_file=str(state_file), mode="LIVE", lots=2, initial_sl_pts=500.0)
+    desk = SilverORBDesk(config=cfg, kite=mock_kite, order_manager=mock_om, notifier=notifier_mock)
+
+    desk.state = {
+        "date": "2026-11-16",
+        "status": "ACTIVE_TRADE",
+        "contract": {"tradingsymbol": "SILVERM26NOVFUT", "instrument_token": 123},
+        "realized_pnl_rs": 0.0,
+        "trade": {
+            "symbol": "SILVERM26NOVFUT",
+            "direction": "SHORT",
+            "entry_price": 171600.0,
+            "initial_sl": 172100.0,
+            "current_sl": 172100.0,
+            "target1_price": 170800.0,
+            "lots_total": 2,
+            "lots_open": 2,
+            "lot1_closed": False,
+            "lot1_exit_price": None,
+            "lot1_pnl_rs": 0.0,
+            "lot2_closed": False,
+            "lot2_exit_price": None,
+            "lot2_pnl_rs": 0.0,
+            "be_moved": False,
+            "status": "OPEN",
+            "sl_order_id": "SL_ORDER_999",
+        },
+    }
+    desk.save_state(desk.state)
+
+    desk.monitor_active_trade(current_ltp=172150.0, current_time=dt_time(19, 10))
+
+    trade = desk.state["trade"]
+    assert trade["status"] == "CLOSED"
+    assert trade["lots_open"] == 0
+    assert desk.state["status"] == "COMPLETED"
+    # Loss: (172105 - 171600) * 5 * 2 = 505 * 10 = Rs -5,050
+    assert desk.state["realized_pnl_rs"] == -5050.0
+    notifier_mock.send_message.assert_called_once()
+    assert "STOP LOSS HIT" in notifier_mock.send_message.call_args[0][0]
+
+
+def test_partial_fill_handling():
+    mock_kite = MagicMock()
+    mock_kite.place_order.return_value = "ORDER_PARTIAL"
+    # 2 out of 4 lots filled before timeout
+    mock_kite.order_history.return_value = [
+        {"status": "OPEN", "filled_quantity": 2, "average_price": 171605.0}
+    ]
+
+    om = SilverOrderManager(
+        mode="LIVE",
+        kite=mock_kite,
+        order_type="MARKET",
+    )
+
+    res = om.place_entry("SILVERM26NOVFUT", "SHORT", 4, 171600.0, 172100.0, 170800.0)
+    assert res["status"] == "PARTIAL"
+    assert res["quantity"] == 2
+    assert res["average_price"] == 171605.0
+    # Verify remaining 2 lots were cancelled
+    mock_kite.cancel_order.assert_called_once_with(
+        variety=mock_kite.VARIETY_REGULAR,
+        order_id="ORDER_PARTIAL",
+    )
+
+
+def test_closed_candle_filtering():
+    cfg = SilverORBConfig(use_trend_filter=True)
+    desk = SilverORBDesk(config=cfg, kite=None)
+
+    # 60 closed candles up to 18:30, plus 1 currently forming candle at 18:45 with 0 volume
+    dates = pd.date_range("2026-11-16 03:45", periods=61, freq="15min")
+    prices = [180000.0 + (i * 30.0) for i in range(61)]
+    volumes = [100.0] * 59 + [300.0, 0.0]  # Bar 59 (18:30) volume spike, Bar 60 (18:45) is 0
+
+    df = pd.DataFrame({
+        "date": dates,
+        "time": [d.time() for d in dates],
+        "open": prices,
+        "high": [p + 20.0 for p in prices],
+        "low": [p - 20.0 for p in prices],
+        "close": [p + 10.0 for p in prices],
+        "volume": volumes,
+    })
+
+    ref_h = 181500.0
+    ref_l = 181000.0
+    # Current time is 18:45:05 (Bar 60 is only 5 seconds old and not closed)
+    eval_time = datetime(2026, 11, 16, 18, 45, 5)
+    sig = desk.evaluate_breakout_signal(df, ref_h, ref_l, dt_time(18, 45), current_dt=eval_time)
+
+    # It must evaluate the completed 18:30 bar (which had volume 300 > 1.2x average)
+    assert sig is not None
+    assert sig["direction"] == "LONG"
+
+

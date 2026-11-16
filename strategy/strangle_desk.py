@@ -130,10 +130,12 @@ class StrangleDesk:
         reason: str,
         order_type: str,
         limit_buffer_pct: float,
-        state: Dict[str, Any]
+        state: Dict[str, Any],
+        min_buffer_rs: float = 0.0
     ) -> bool:
         """
         Safely executes buy_to_cover for a single strangle leg.
+        Verifies order completion on Kite before updating state to CLOSED.
         Catches broker exceptions, logs errors, alerts Telegram, and prevents loop crashes.
         """
         try:
@@ -142,13 +144,61 @@ class StrangleDesk:
                 or state.get("product")
                 or getattr(self.order_manager, "product", "MIS")
             )
-            self.order_manager.buy_to_cover(
-                symbol, qty, exit_price, reason=reason, order_type=order_type, buffer_pct=limit_buffer_pct,
-                product=leg_product
+            btc_kwargs: Dict[str, Any] = {
+                "reason": reason,
+                "order_type": order_type,
+                "buffer_pct": limit_buffer_pct,
+                "product": leg_product
+            }
+            if min_buffer_rs > 0.0:
+                btc_kwargs["min_buffer_rs"] = min_buffer_rs
+
+            order_res = self.order_manager.buy_to_cover(
+                symbol, qty, exit_price, **btc_kwargs
             )
+            mode = getattr(self.order_manager, "mode", "PAPER")
+            order_id = order_res.get("order_id") if isinstance(order_res, dict) else None
+
+            actual_exit_price = exit_price
+            if mode == "LIVE" and order_id:
+                status_res = self.wait_for_order_completion(order_id, timeout_seconds=10, poll_seconds=1)
+                order_status = status_res.get("status")
+                if order_status == "COMPLETE":
+                    actual_exit_price = float(status_res.get("average_price") or exit_price)
+                elif order_status in ("REJECTED", "CANCELLED"):
+                    err_msg = status_res.get("status_message") or f"Order ended in {order_status}"
+                    logger.error("Exit order %s for %s (%s) was %s: %s", order_id, leg_name.upper(), symbol, order_status, err_msg)
+                    if self.notifier:
+                        self.notifier.send_message(
+                            f"🚨 <b>Exit Order {order_status}</b>: Failed to exit {leg_name.upper()} <code>{symbol}</code> ({reason}): {err_msg}"
+                        )
+                    return False
+                else:
+                    logger.warning("Exit order %s for %s still pending (%s) after 10s. Cancelling resting order...", order_id, symbol, order_status)
+                    self.order_manager.cancel_order(order_id)
+                    cancel_res = self.wait_for_order_completion(order_id, timeout_seconds=5, poll_seconds=1, execute_once=True)
+                    filled_qty = int(cancel_res.get("filled_quantity") or 0)
+                    if filled_qty >= qty:
+                        actual_exit_price = float(cancel_res.get("average_price") or exit_price)
+                    elif filled_qty > 0:
+                        logger.warning("Exit order %s partially filled (%d/%d).", order_id, filled_qty, qty)
+                        if self.notifier:
+                            self.notifier.send_message(
+                                f"⚠️ <b>Partial Exit Fill</b>: {leg_name.upper()} <code>{symbol}</code> filled {filled_qty}/{qty}. Manual check advised!"
+                            )
+                        return False
+                    else:
+                        if self.notifier:
+                            self.notifier.send_message(
+                                f"⚠️ <b>Exit Order Timeout</b>: Limit order for {leg_name.upper()} <code>{symbol}</code> did not fill within 10s. Order cancelled. Retrying next tick."
+                            )
+                        return False
+
             state[leg_name]["status"] = "CLOSED"
-            state[leg_name]["exit_price"] = exit_price
+            state[leg_name]["exit_price"] = actual_exit_price
             state[leg_name]["exit_reason"] = reason
+            if order_id:
+                state[leg_name]["exit_order_id"] = order_id
             self.save_state(state)
             return True
         except Exception as e:
@@ -453,6 +503,34 @@ class StrangleDesk:
             logger.warning("Broker position reconciliation failed: %s", e)
             return state
 
+    def check_available_equity_margin(self) -> Dict[str, Any]:
+        """
+        Queries available equity / F&O margin from Kite Connect.
+        Returns status ('OK', 'DISABLED', 'ERROR', or 'UNKNOWN') and available cash.
+        """
+        kite = getattr(self.order_manager, "kite", None)
+        if not kite:
+            return {"status": "UNKNOWN", "available_cash": 0.0}
+        try:
+            margins = kite.margins("equity")
+            if not isinstance(margins, dict):
+                return {"status": "UNKNOWN", "available_cash": 0.0}
+            available = float(
+                margins.get("available", {}).get("live_balance", 0.0)
+                or margins.get("available", {}).get("cash", 0.0)
+                or margins.get("net", 0.0)
+                or 0.0
+            )
+            enabled = bool(margins.get("enabled", True))
+            return {
+                "status": "OK" if enabled else "DISABLED",
+                "available_cash": available,
+                "raw": margins
+            }
+        except Exception as e:
+            logger.warning("Failed to query equity margins from Kite: %s", e)
+            return {"status": "ERROR", "error": str(e), "available_cash": 0.0}
+
     def run_session(
         self,
         underlying: str = "NIFTY",
@@ -536,6 +614,32 @@ class StrangleDesk:
             if dry_run:
                 logger.info("Dry-run complete. Strike plan displayed above. No orders submitted.")
                 return {"status": "DRY_RUN", "strikes": strikes}
+
+            # Pre-flight equity F&O margin check (LIVE mode)
+            if mode == "LIVE":
+                margin_info = self.check_available_equity_margin()
+                if margin_info.get("status") == "DISABLED":
+                    err_msg = "Equity / F&O segment is disabled on Kite account. Cannot enter strangle."
+                    logger.error(err_msg)
+                    if self.notifier:
+                        self.notifier.send_message(f"🚨 <b>Margin Check Failed</b>: {err_msg}")
+                    return {"status": "ABORTED", "reason": err_msg}
+                elif margin_info.get("status") == "OK":
+                    avail_cash = float(margin_info.get("available_cash", 0.0))
+                    est_margin_required = lots * 130000.0
+                    logger.info(
+                        "Pre-flight equity margin check: Rs %.2f available, ~Rs %.2f estimated for %d lots.",
+                        avail_cash, est_margin_required, lots
+                    )
+                    if avail_cash < est_margin_required:
+                        err_msg = (
+                            f"Insufficient equity margin: Available Rs {avail_cash:,.2f} < "
+                            f"Estimated Rs {est_margin_required:,.2f} for {lots} lots. Aborting entry to prevent broker rejection."
+                        )
+                        logger.error(err_msg)
+                        if self.notifier:
+                            self.notifier.send_message(f"🚨 <b>Insufficient Margin</b>: {err_msg}")
+                        return {"status": "ABORTED", "reason": err_msg}
 
             ce_info = strikes["ce"]
             pe_info = strikes["pe"]
@@ -862,7 +966,7 @@ class StrangleDesk:
                             )
                 elif ce_ltp <= ce_target:
                     logger.info("CE Decay Target reached! LTP: %.2f <= Target: %.2f", ce_ltp, ce_target)
-                    if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state):
+                    if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
                         if self.notifier:
                             ce_entry = float(state["ce"]["entry_price"])
                             leg_pnl = (ce_entry - ce_ltp) * qty
@@ -892,7 +996,7 @@ class StrangleDesk:
                             )
                 elif pe_ltp <= pe_target:
                     logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f", pe_ltp, pe_target)
-                    if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state):
+                    if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
                         if self.notifier:
                             pe_entry = float(state["pe"]["entry_price"])
                             leg_pnl = (pe_entry - pe_ltp) * qty

@@ -155,6 +155,11 @@ def main(args=None):
                     time.sleep(30)
                     continue
 
+                # Morning session verification at market open (09:15)
+                if not getattr(desk, "_morning_session_checked", False):
+                    desk._ensure_kite_session()
+                    desk._morning_session_checked = True
+
                 # Step 1: Compute Initial Balance at or after 10:15
                 if not desk.ib_formed and current_time >= dt_time(10, 15):
                     desk.compute_initial_balance()

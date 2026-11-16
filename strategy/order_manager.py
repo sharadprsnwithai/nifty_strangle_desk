@@ -32,15 +32,17 @@ class OrderManager:
         price: float,
         order_type: str = "LIMIT",
         buffer_pct: float = 0.05,
+        min_buffer_rs: float = 0.0,
         product: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Sells an option leg (entry).
-        If order_type is LIMIT, places a marketable limit order below LTP (by buffer_pct)
+        If order_type is LIMIT, places a marketable limit order below LTP (by buffer_pct / min_buffer_rs)
         to prevent freak-trade execution while guaranteeing immediate fill against the bid.
         """
         order_type_norm = order_type.upper()
-        limit_price = max(0.05, _round_to_nse_tick(price * (1.0 - buffer_pct))) if order_type_norm == "LIMIT" else None
+        buffer = max(price * buffer_pct, min_buffer_rs)
+        limit_price = max(0.05, _round_to_nse_tick(price - buffer)) if order_type_norm == "LIMIT" else None
 
         logger.info(
             "[%s] Executing SELL (%s): %s x %d @ Rs %.2f%s",
@@ -117,15 +119,17 @@ class OrderManager:
         reason: str = "EXIT",
         order_type: str = "LIMIT",
         buffer_pct: float = 0.05,
+        min_buffer_rs: float = 0.0,
         product: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Buys back an open short option leg (exit on SL, target, or 3PM).
-        If order_type is LIMIT, places a marketable limit order above LTP (by buffer_pct)
+        If order_type is LIMIT, places a marketable limit order above LTP (by buffer_pct / min_buffer_rs)
         to guarantee execution against the ask while preventing execution at extreme freak prices.
         """
         order_type_norm = order_type.upper()
-        limit_price = max(0.05, _round_to_nse_tick(price * (1.0 + buffer_pct))) if order_type_norm == "LIMIT" else None
+        buffer = max(price * buffer_pct, min_buffer_rs)
+        limit_price = max(0.05, _round_to_nse_tick(price + buffer)) if order_type_norm == "LIMIT" else None
 
         logger.info(
             "[%s] Executing BUY TO COVER (%s / %s): %s x %d @ Rs %.2f%s",

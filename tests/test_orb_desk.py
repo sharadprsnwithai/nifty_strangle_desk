@@ -436,3 +436,32 @@ def test_orb_desk_reset_for_new_day(tmp_path):
     # Also test with a string today value
     desk.today = "2026-11-04"
     desk.compute_initial_balance()  # Should gracefully handle string representation too
+
+
+def test_orb_desk_token_error_reauth(tmp_path):
+    kite_mock = MagicMock()
+    cfg = ORBConfig(state_file=str(tmp_path / "test_orb_state.json"))
+    om = ORBOrderManager(mode="PAPER")
+    desk = ORBDesk(kite=kite_mock, order_manager=om, config=cfg)
+    desk.target_stocks = [{"symbol": "INFY", "token": 408065, "lot": 400}]
+    desk.stock_stats = {"INFY": {"token": 408065, "lot": 400, "pdh": 1550.0, "pdl": 1500.0}}
+
+    # Simulate token error on first call, success on second call after re-auth
+    kite_mock.historical_data.side_effect = [
+        Exception("Incorrect `api_key` or `access_token`."),
+        [
+            {"date": datetime.now(), "high": 1530.0, "low": 1510.0, "open": 1515.0, "close": 1525.0},
+            {"date": datetime.now(), "high": 1535.0, "low": 1515.0, "open": 1525.0, "close": 1520.0},
+            {"date": datetime.now(), "high": 1540.0, "low": 1518.0, "open": 1520.0, "close": 1530.0},
+            {"date": datetime.now(), "high": 1545.0, "low": 1520.0, "open": 1530.0, "close": 1540.0},
+        ]
+    ]
+
+    with patch.object(desk, "_ensure_kite_session") as mock_reauth, \
+         patch("time.sleep"):
+        desk.compute_initial_balance()
+        mock_reauth.assert_any_call(force_login=True)
+        assert desk.ib_formed is True
+        assert desk.stock_stats["INFY"]["ib_high"] == 1545.0
+        assert desk.stock_stats["INFY"]["ib_low"] == 1510.0
+
