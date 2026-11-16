@@ -431,11 +431,12 @@ def test_orb_desk_reset_for_new_day(tmp_path):
 
     # Verify compute_initial_balance runs without TypeError when self.today is date or str
     kite_mock.historical_data.return_value = []
-    desk.compute_initial_balance()  # Should not raise TypeError: combine() argument 1 must be datetime.date, not str
+    with patch("time.sleep"):
+        desk.compute_initial_balance()  # Should not raise TypeError: combine() argument 1 must be datetime.date, not str
 
-    # Also test with a string today value
-    desk.today = "2026-11-04"
-    desk.compute_initial_balance()  # Should gracefully handle string representation too
+        # Also test with a string today value
+        desk.today = "2026-11-04"
+        desk.compute_initial_balance()  # Should gracefully handle string representation too
 
 
 def test_orb_desk_token_error_reauth(tmp_path):

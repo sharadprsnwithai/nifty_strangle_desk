@@ -759,12 +759,6 @@ class ORBDesk:
 
             # B. Target 1 (1.0 R): Book 50% & Trail SL to Cost / Breakeven
             elif not pos["half_booked"] and ((direction == "LONG" and ltp >= t_1r) or (direction == "SHORT" and ltp <= t_1r)):
-                pos["half_booked"] = True
-                pos["be_moved"] = True
-                pos["current_sl"] = entry_p  # Trail SL to Cost
-                half_booked_pnl = (t_1r - entry_p) * half_qty if direction == "LONG" else (entry_p - t_1r) * half_qty
-                pos["half_booked_pnl"] = half_booked_pnl
-                logger.info("50%% Booked at Target 1 on %s (+Rs %.2f). SL trailed to Cost (Rs %.2f)", sym, half_booked_pnl, entry_p)
                 try:
                     self.om.place_exit(
                         symbol=sym,
@@ -773,9 +767,15 @@ class ORBDesk:
                         exit_price=t_1r,
                         reason="TARGET_1R_BOOK_50%"
                     )
+                    pos["half_booked"] = True
+                    pos["be_moved"] = True
+                    pos["current_sl"] = entry_p  # Trail SL to Cost
+                    half_booked_pnl = (t_1r - entry_p) * half_qty if direction == "LONG" else (entry_p - t_1r) * half_qty
+                    pos["half_booked_pnl"] = half_booked_pnl
+                    logger.info("50%% Booked at Target 1 on %s (+Rs %.2f). SL trailed to Cost (Rs %.2f)", sym, half_booked_pnl, entry_p)
+                    self._notify_target_booked(pos, t_1r, half_booked_pnl)
                 except Exception as exit_err:
                     logger.error("Failed to place Target 1 exit order for %s: %s", sym, exit_err, exc_info=True)
-                self._notify_target_booked(pos, t_1r, half_booked_pnl)
 
             # C. Mandatory 3:00 PM IST Square-Off (Option 3 Canonical Runner Exit)
             if is_eod and not pos_closed:
@@ -795,6 +795,8 @@ class ORBDesk:
                     )
                 except Exception as exit_err:
                     logger.error("Failed to place %s exit order for %s: %s", exit_reason, sym, exit_err, exc_info=True)
+                    remaining_positions.append(pos)
+                    continue
 
                 # Calculate final trade P&L
                 rem_pnl = (exit_price - entry_p) * rem_qty if direction == "LONG" else (entry_p - exit_price) * rem_qty
