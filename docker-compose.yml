@@ -142,8 +142,8 @@ services:
     # - Telegram Notifications: Strictly on Entry, SL, and Exit with Total Day P&L
     #
     # 1. Paper Trading Mode:
-    # command: ["--paper", "--lots", "4", "--sl", "500", "--target1", "800", "--order-type", "LIMIT", "--limit-buffer-pts", "15.0", "--poll", "5"]
+    # command: ["--paper", "--lots", "4", "--sl", "500", "--target1", "800", "--order-type", "MARKET", "--limit-buffer-pts", "80.0", "--poll", "5"]
     #
     # 2. Live Production Mode (Real Broker Order Execution via Kite Connect API + Telegram Alerts):
-    command: ["--live", "--lots", "4", "--sl", "500", "--target1", "800", "--order-type", "LIMIT", "--limit-buffer-pts", "15.0", "--poll", "5"]
+    command: ["--live", "--lots", "4", "--sl", "500", "--target1", "800", "--order-type", "MARKET", "--limit-buffer-pts", "80.0", "--poll", "5"]
     # -----------------------------------------------------------------------------------

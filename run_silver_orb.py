@@ -44,7 +44,7 @@ def parse_args(args=None):
     parser.add_argument("--poll", type=int, default=5, help="Polling interval in seconds (default: 5)")
     parser.add_argument("--product", choices=["MIS", "NRML"], default="MIS", help="Product type (default: MIS)")
     parser.add_argument("--order-type", choices=["MARKET", "LIMIT"], default="MARKET", help="Order execution type (default: MARKET)")
-    parser.add_argument("--limit-buffer-pts", type=float, default=50.0, help="Marketable limit price buffer in points if LIMIT is used (default: 50.0)")
+    parser.add_argument("--limit-buffer-pts", type=float, default=80.0, help="Marketable limit price buffer in points if LIMIT is used (default: 80.0)")
     parser.add_argument("--state-file", type=str, default=os.getenv("SILVER_STATE_FILE", "data/silver_trades_today.json"), help="State file path")
     parser.add_argument("--dry-run", action="store_true", help="Inspect active contract and day state without trading")
     parser.add_argument("--once", action="store_true", help="Run single evaluation cycle and exit")

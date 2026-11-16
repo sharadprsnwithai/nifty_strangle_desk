@@ -187,7 +187,7 @@ The desk is fully containerized with Indian Standard Time (`Asia/Kolkata`) pre-c
    command: ["--live", "--risk", "2500", "--max-trades", "5", "--daily-loss", "10000", "--poll", "5"]
 
    # silver-orb-desk (MCX Silver Mini 18:00 US Session Desk):
-   command: ["--live", "--lots", "2", "--sl", "500", "--target1", "800", "--order-type", "LIMIT", "--limit-buffer-pts", "15.0", "--poll", "5"]
+   command: ["--live", "--lots", "2", "--sl", "500", "--target1", "800", "--order-type", "MARKET", "--limit-buffer-pts", "80.0", "--poll", "5"]
    ```
 
 2. **Start the Containers**:
