@@ -51,6 +51,30 @@ class TelegramNotifier:
                 else:
                     logger.warning("Telegram API returned non-200 status code: %d", status)
                     return False
+        except urllib.error.HTTPError as e:
+            # If HTML parsing fails (HTTP 400 Bad Request, e.g. unclosed tags or unescaped '<'),
+            # retry sending without HTML parse_mode so critical trade/risk alerts are never dropped.
+            if e.code == 400 and payload.get("parse_mode") == "HTML":
+                try:
+                    plain_payload = {
+                        "chat_id": self.chat_id,
+                        "text": message,
+                        "disable_web_page_preview": True
+                    }
+                    fallback_data = json.dumps(plain_payload).encode("utf-8")
+                    fallback_req = urllib.request.Request(
+                        url,
+                        data=fallback_data,
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(fallback_req, timeout=3.5) as fb_response:
+                        if 200 <= fb_response.getcode() < 300:
+                            logger.info("Telegram alert delivered via plain text fallback after HTML parse error.")
+                            return True
+                except Exception as fb_err:
+                    logger.warning("Failed to send Telegram alert on plain text fallback: %s", fb_err)
+            logger.warning("Failed to send Telegram alert: %s", e)
+            return False
         except (urllib.error.URLError, TimeoutError) as e:
             logger.warning("Failed to send Telegram alert: %s", e)
             return False

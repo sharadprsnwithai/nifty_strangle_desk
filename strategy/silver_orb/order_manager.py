@@ -93,16 +93,34 @@ class SilverOrderManager:
             else:
                 limit_p = None
 
-            order_id = self.kite.place_order(
-                variety=kite_variety,
-                exchange=self.exchange,
-                tradingsymbol=symbol,
-                transaction_type=kite_tx_type,
-                quantity=quantity_lots,
-                product=kite_product,
-                order_type=kite_order_type,
-                price=limit_p,
-            )
+            try:
+                order_id = self.kite.place_order(
+                    variety=kite_variety,
+                    exchange=self.exchange,
+                    tradingsymbol=symbol,
+                    transaction_type=kite_tx_type,
+                    quantity=quantity_lots,
+                    product=kite_product,
+                    order_type=kite_order_type,
+                    price=limit_p,
+                )
+            except Exception as e:
+                from kite.client import is_token_error, ensure_kite_session
+                if is_token_error(e):
+                    logger.warning("[LIVE ENTRY] Token error for %s (%s). Reloading token from .env and retrying...", symbol, e)
+                    self.kite = ensure_kite_session(self.kite, force_login=False)
+                    order_id = self.kite.place_order(
+                        variety=kite_variety,
+                        exchange=self.exchange,
+                        tradingsymbol=symbol,
+                        transaction_type=kite_tx_type,
+                        quantity=quantity_lots,
+                        product=kite_product,
+                        order_type=kite_order_type,
+                        price=limit_p,
+                    )
+                else:
+                    raise
             logger.info("[LIVE] Submitted entry order %s for %s (%s, OrderType: %s, Price: %s)", order_id, symbol, transaction_type, self.order_type, limit_p or "MARKET")
 
             # Await and verify execution fill status
@@ -215,16 +233,34 @@ class SilverOrderManager:
                 limit_p = None
                 kite_order_type = self.kite.ORDER_TYPE_MARKET
 
-            order_id = self.kite.place_order(
-                variety=kite_variety,
-                exchange=self.exchange,
-                tradingsymbol=symbol,
-                transaction_type=kite_tx_type,
-                quantity=quantity_lots,
-                product=kite_product,
-                order_type=kite_order_type,
-                price=limit_p,
-            )
+            try:
+                order_id = self.kite.place_order(
+                    variety=kite_variety,
+                    exchange=self.exchange,
+                    tradingsymbol=symbol,
+                    transaction_type=kite_tx_type,
+                    quantity=quantity_lots,
+                    product=kite_product,
+                    order_type=kite_order_type,
+                    price=limit_p,
+                )
+            except Exception as e:
+                from kite.client import is_token_error, ensure_kite_session
+                if is_token_error(e):
+                    logger.warning("[LIVE EXIT] Token error for %s (%s). Reloading token from .env and retrying...", symbol, e)
+                    self.kite = ensure_kite_session(self.kite, force_login=False)
+                    order_id = self.kite.place_order(
+                        variety=kite_variety,
+                        exchange=self.exchange,
+                        tradingsymbol=symbol,
+                        transaction_type=kite_tx_type,
+                        quantity=quantity_lots,
+                        product=kite_product,
+                        order_type=kite_order_type,
+                        price=limit_p,
+                    )
+                else:
+                    raise
             logger.info("[LIVE] Submitted exit order %s for %s (%s, OrderType: %s, Price: %s, Reason: %s)", order_id, symbol, transaction_type, self.order_type, limit_p or "MARKET", reason)
 
             # Retrieve actual fill price if available from Kite order history
@@ -315,6 +351,27 @@ class SilverOrderManager:
             logger.info("[LIVE] Placed broker-side Stop Loss order %s for %s (%s %d lots, Trigger: Rs %.1f, Limit: Rs %.1f)", order_id, symbol, transaction_type, quantity_lots, trig_p, limit_p)
             return str(order_id)
         except Exception as e:
+            from kite.client import is_token_error, ensure_kite_session
+            if is_token_error(e):
+                logger.warning("[LIVE SL] Token error for %s (%s). Reloading token from .env and retrying...", symbol, e)
+                try:
+                    self.kite = ensure_kite_session(self.kite, force_login=False)
+                    order_id = self.kite.place_order(
+                        variety=kite_variety,
+                        exchange=self.exchange,
+                        tradingsymbol=symbol,
+                        transaction_type=kite_tx_type,
+                        quantity=quantity_lots,
+                        product=kite_product,
+                        order_type=self.kite.ORDER_TYPE_SL,
+                        price=limit_p,
+                        trigger_price=trig_p,
+                    )
+                    logger.info("[LIVE SL] Stop Loss order succeeded after session refresh: %s for %s", order_id, symbol)
+                    return str(order_id)
+                except Exception as retry_e:
+                    logger.critical("[LIVE SL] Failed to place broker-side Stop Loss order after session refresh: %s", retry_e, exc_info=True)
+                    return None
             logger.critical("[LIVE] Failed to place broker-side Stop Loss order for %s: %s", symbol, e, exc_info=True)
             return None
 

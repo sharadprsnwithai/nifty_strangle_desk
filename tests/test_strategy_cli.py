@@ -942,12 +942,13 @@ def test_check_available_equity_margin(tmp_path):
     assert margin_dis["status"] == "DISABLED"
 
 
-def test_insufficient_equity_margin_aborts_entry(tmp_path):
+def test_no_preflight_equity_margin_check_proceeds_to_entry(tmp_path):
     state_file = tmp_path / "trades_today.json"
     mock_om = MagicMock()
     mock_kite = MagicMock()
     mock_om.kite = mock_kite
     mock_om.mode = "LIVE"
+    mock_om.sell.return_value = {"order_id": "ORD_1", "status": "SUBMITTED"}
     desk = StrangleDesk(order_manager=mock_om, state_file=state_file)
 
     mock_kite.profile.return_value = {"user_id": "TC4648"}
@@ -959,7 +960,8 @@ def test_insufficient_equity_margin_aborts_entry(tmp_path):
     }
 
     with patch("strategy.strangle_desk.is_trading_holiday", return_value=(False, "")), \
-         patch("strategy.strangle_desk.find_strangle_strikes") as mock_find:
+         patch("strategy.strangle_desk.find_strangle_strikes") as mock_find, \
+         patch.object(desk, "wait_for_order_completion", return_value={"status": "COMPLETE", "average_price": 30.5}):
         mock_find.return_value = {
             "expiry": "2026-11-09",
             "total_lots": 2,
@@ -967,11 +969,10 @@ def test_insufficient_equity_margin_aborts_entry(tmp_path):
             "ce": {"symbol": "NIFTY26N0924300CE", "ltp": 30.5, "sl_price": 45.75, "target_price": 6.1},
             "pe": {"symbol": "NIFTY26N0923800PE", "ltp": 31.0, "sl_price": 46.5, "target_price": 6.2},
         }
-        # 2 lots require ~260,000, but only 50,000 is available
         res = desk.run_session(lots=2, kite=mock_kite, execute_once=True, ignore_holidays=True)
-        assert res["status"] == "ABORTED"
-        assert "Insufficient equity margin" in res["reason"]
-        mock_om.sell.assert_not_called()
+        # Pre-flight equity margin check removed: does not abort, sells both CE and PE legs directly
+        assert res is not None
+        assert mock_om.sell.call_count == 2
 
 
 def test_safe_exit_leg_live_verification(tmp_path):

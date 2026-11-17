@@ -122,7 +122,16 @@ class ORBOrderManager:
             else:
                 params["order_type"] = self.kite.ORDER_TYPE_MARKET
 
-            live_order_id = self.kite.place_order(**params)
+            try:
+                live_order_id = self.kite.place_order(**params)
+            except Exception as e:
+                from kite.client import is_token_error, ensure_kite_session
+                if is_token_error(e):
+                    logger.warning("[LIVE ENTRY] Token error for %s (%s). Reloading token from .env and retrying...", symbol, e)
+                    self.kite = ensure_kite_session(self.kite, force_login=False)
+                    live_order_id = self.kite.place_order(**params)
+                else:
+                    raise
             logger.info(
                 "[LIVE ENTRY SUCCESS] Order ID: %s for %s %s x %d (%s @ %s)",
                 live_order_id,
@@ -226,7 +235,16 @@ class ORBOrderManager:
             else:
                 params["order_type"] = self.kite.ORDER_TYPE_MARKET
 
-            live_order_id = self.kite.place_order(**params)
+            try:
+                live_order_id = self.kite.place_order(**params)
+            except Exception as e:
+                from kite.client import is_token_error, ensure_kite_session
+                if is_token_error(e):
+                    logger.warning("[LIVE EXIT] Token error for %s (%s). Reloading token from .env and retrying...", symbol, e)
+                    self.kite = ensure_kite_session(self.kite, force_login=False)
+                    live_order_id = self.kite.place_order(**params)
+                else:
+                    raise
             logger.info(
                 "[LIVE EXIT SUCCESS] Order ID: %s for %s %s x %d (%s @ %s, Reason: %s)",
                 live_order_id,

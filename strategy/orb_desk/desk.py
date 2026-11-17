@@ -31,15 +31,7 @@ def _normalize_date(d: Any) -> date:
     return date.today()
 
 
-def is_token_error(e: Exception) -> bool:
-    """Detects whether an exception indicates an expired/invalid Zerodha access token."""
-    err_str = str(e).lower()
-    return (
-        "token" in err_str
-        or "api_key" in err_str
-        or "access_token" in err_str
-        or "tokenexception" in type(e).__name__.lower()
-    )
+from kite.client import is_token_error
 
 
 class ORBDesk:

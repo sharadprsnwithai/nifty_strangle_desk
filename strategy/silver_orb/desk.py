@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 from kiteconnect import KiteConnect
+from kite.client import is_token_error
 
 from notifications.telegram import TelegramNotifier
 from strategy.holidays import is_mcx_trading_holiday
@@ -248,8 +249,7 @@ class SilverORBDesk:
             df["day"] = df["date"].dt.date
             return df
         except Exception as e:
-            err_str = str(e).lower()
-            if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+            if is_token_error(e):
                 logger.warning("Token error while fetching 15m candles (%s). Re-authenticating...", e)
                 self._ensure_kite_session(force_login=True)
                 try:
@@ -727,8 +727,7 @@ class SilverORBDesk:
                     ltp = float(quote[full_symbol]["last_price"])
                     self.monitor_active_trade(ltp, current_t)
             except Exception as e:
-                err_str = str(e).lower()
-                if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+                if is_token_error(e):
                     logger.warning("Token error while querying MCX quote (%s). Refreshing session...", e)
                     self._ensure_kite_session(force_login=True)
                 else:

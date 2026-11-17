@@ -108,6 +108,27 @@ class OrderManager:
                 "status": "SUBMITTED"
             }
         except Exception as e:
+            from kite.client import is_token_error, ensure_kite_session
+            if is_token_error(e):
+                logger.warning("[LIVE] Token error on SELL order (%s). Refreshing session from .env and retrying...", e)
+                try:
+                    self.kite = ensure_kite_session(self.kite, force_login=False)
+                    order_id = self.kite.place_order(**params)
+                    logger.info("[LIVE] SELL order succeeded after session refresh: %s x %d (Order ID: %s)", symbol, quantity, order_id)
+                    return {
+                        "order_id": order_id,
+                        "mode": "LIVE",
+                        "symbol": symbol,
+                        "transaction_type": "SELL",
+                        "quantity": quantity,
+                        "order_type": order_type_norm,
+                        "limit_price": limit_price,
+                        "fill_price": price,
+                        "status": "SUBMITTED"
+                    }
+                except Exception as retry_e:
+                    logger.exception("[LIVE] Failed to place SELL order after session refresh for %s: %s", symbol, retry_e)
+                    raise
             logger.exception("[LIVE] Failed to place SELL order for %s (qty: %d, type: %s): %s", symbol, quantity, order_type_norm, e)
             raise
 
@@ -197,6 +218,28 @@ class OrderManager:
                 "status": "SUBMITTED"
             }
         except Exception as e:
+            from kite.client import is_token_error, ensure_kite_session
+            if is_token_error(e):
+                logger.warning("[LIVE] Token error on BUY-TO-COVER order (%s). Refreshing session from .env and retrying...", e)
+                try:
+                    self.kite = ensure_kite_session(self.kite, force_login=False)
+                    order_id = self.kite.place_order(**params)
+                    logger.info("[LIVE] BUY-TO-COVER succeeded after session refresh: %s x %d (Order ID: %s)", symbol, quantity, order_id)
+                    return {
+                        "order_id": order_id,
+                        "mode": "LIVE",
+                        "symbol": symbol,
+                        "transaction_type": "BUY",
+                        "quantity": quantity,
+                        "order_type": order_type_norm,
+                        "limit_price": limit_price,
+                        "fill_price": price,
+                        "reason": reason,
+                        "status": "SUBMITTED"
+                    }
+                except Exception as retry_e:
+                    logger.exception("[LIVE] Failed to place BUY-TO-COVER order after session refresh for %s: %s", symbol, retry_e)
+                    raise
             logger.exception("[LIVE] Failed to place BUY-TO-COVER order for %s (qty: %d, reason: %s): %s", symbol, quantity, reason, e)
             raise
 

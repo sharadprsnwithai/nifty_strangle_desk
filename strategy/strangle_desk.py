@@ -7,6 +7,7 @@ from datetime import date, datetime, time as dt_time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from kiteconnect import KiteConnect
+from kite.client import is_token_error
 from strategy.order_manager import OrderManager
 from strategy.option_chain import find_strangle_strikes, resolve_target_expiry, _normalize_date
 from strategy.holidays import is_trading_holiday
@@ -286,23 +287,15 @@ class StrangleDesk:
         if kite is None:
             kite = getattr(self.order_manager, "kite", None)
 
-        if not force_login and kite is not None:
-            try:
-                kite.profile()
-                return kite
-            except Exception as e:
-                err_str = str(e).lower()
-                if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
-                    logger.warning("Kite session token is expired or invalidated (%s). Initiating TOTP re-authentication...", e)
-                else:
-                    logger.warning("Kite profile check encountered unexpected error (%s). Proceeding to re-authenticate...", e)
-
-        logger.info("Refreshing Kite session via automated TOTP login...")
-        from kite.client import get_kite_client
-        new_kite = get_kite_client(force_login=True)
-        if hasattr(self.order_manager, "kite") and self.order_manager.kite is not None:
-            self.order_manager.kite = new_kite
-        return new_kite
+        from kite.client import ensure_kite_session
+        try:
+            active_kite = ensure_kite_session(kite, force_login=force_login)
+            if active_kite and hasattr(self, "order_manager") and self.order_manager is not None:
+                self.order_manager.kite = active_kite
+            return active_kite or kite
+        except Exception as e:
+            logger.error("Failed to re-authenticate Kite session for Strangle Desk: %s", e)
+            return kite
 
     def perform_daily_morning_login(self, kite: Optional[Any] = None) -> Any:
         """
@@ -500,7 +493,11 @@ class StrangleDesk:
 
             return state
         except Exception as e:
-            logger.warning("Broker position reconciliation failed: %s", e)
+            err_str = str(e).lower()
+            if "too many requests" in err_str or "429" in err_str:
+                logger.warning("Broker position reconciliation rate-limited by Kite (Too many requests). Backing off.")
+            else:
+                logger.warning("Broker position reconciliation failed: %s", e)
             return state
 
     def check_available_equity_margin(self) -> Dict[str, Any]:
@@ -600,8 +597,7 @@ class StrangleDesk:
             try:
                 strikes = find_strangle_strikes(kite, underlying=underlying, target_price=30.0, lots=lots)
             except Exception as e:
-                err_str = str(e).lower()
-                if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+                if is_token_error(e):
                     logger.warning("Token error during strike discovery (%s). Refreshing token and retrying...", e)
                     kite = self._ensure_kite_session(kite, force_login=True)
                     strikes = find_strangle_strikes(kite, underlying=underlying, target_price=30.0, lots=lots)
@@ -614,32 +610,6 @@ class StrangleDesk:
             if dry_run:
                 logger.info("Dry-run complete. Strike plan displayed above. No orders submitted.")
                 return {"status": "DRY_RUN", "strikes": strikes}
-
-            # Pre-flight equity F&O margin check (LIVE mode)
-            if mode == "LIVE":
-                margin_info = self.check_available_equity_margin()
-                if margin_info.get("status") == "DISABLED":
-                    err_msg = "Equity / F&O segment is disabled on Kite account. Cannot enter strangle."
-                    logger.error(err_msg)
-                    if self.notifier:
-                        self.notifier.send_message(f"🚨 <b>Margin Check Failed</b>: {err_msg}")
-                    return {"status": "ABORTED", "reason": err_msg}
-                elif margin_info.get("status") == "OK":
-                    avail_cash = float(margin_info.get("available_cash", 0.0))
-                    est_margin_required = lots * 130000.0
-                    logger.info(
-                        "Pre-flight equity margin check: Rs %.2f available, ~Rs %.2f estimated for %d lots.",
-                        avail_cash, est_margin_required, lots
-                    )
-                    if avail_cash < est_margin_required:
-                        err_msg = (
-                            f"Insufficient equity margin: Available Rs {avail_cash:,.2f} < "
-                            f"Estimated Rs {est_margin_required:,.2f} for {lots} lots. Aborting entry to prevent broker rejection."
-                        )
-                        logger.error(err_msg)
-                        if self.notifier:
-                            self.notifier.send_message(f"🚨 <b>Insufficient Margin</b>: {err_msg}")
-                        return {"status": "ABORTED", "reason": err_msg}
 
             ce_info = strikes["ce"]
             pe_info = strikes["pe"]
@@ -655,8 +625,17 @@ class StrangleDesk:
                 err_msg = f"Failed to place CE entry order ({ce_info['symbol']}): {e}"
                 logger.error(err_msg)
                 if self.notifier:
-                    self.notifier.send_message(f"🚨 <b>Strangle Desk Error</b>: {err_msg}")
-                return {"status": "ABORTED", "reason": err_msg}
+                    import html
+                    self.notifier.send_message(f"🚨 <b>Strangle Desk Error</b>: {html.escape(err_msg)}")
+                aborted_state = {
+                    "status": "ABORTED",
+                    "reason": err_msg,
+                    "date": today_str,
+                    "underlying": underlying,
+                    "expiry": str(strikes.get("expiry")) if isinstance(strikes, dict) else None,
+                }
+                self.save_state(aborted_state)
+                return aborted_state
 
             try:
                 pe_order = self.order_manager.sell(
@@ -666,7 +645,8 @@ class StrangleDesk:
                 err_msg = f"Failed to place PE entry order ({pe_info['symbol']}) after CE placed: {e}. Squaring off CE leg..."
                 logger.error(err_msg)
                 if self.notifier:
-                    self.notifier.send_message(f"🚨 <b>Strangle Desk Error</b>: {err_msg}")
+                    import html
+                    self.notifier.send_message(f"🚨 <b>Strangle Desk Error</b>: {html.escape(err_msg)}")
                 ce_id = ce_order.get("order_id") if isinstance(ce_order, dict) else None
                 if ce_id:
                     try:
@@ -684,7 +664,15 @@ class StrangleDesk:
                             )
                     except Exception as clean_err:
                         logger.error("Failed to clean up CE leg after PE entry failure: %s", clean_err)
-                return {"status": "ABORTED", "reason": err_msg}
+                aborted_state = {
+                    "status": "ABORTED",
+                    "reason": err_msg,
+                    "date": today_str,
+                    "underlying": underlying,
+                    "expiry": str(strikes.get("expiry")) if isinstance(strikes, dict) else None,
+                }
+                self.save_state(aborted_state)
+                return aborted_state
 
             ce_id = ce_order.get("order_id")
             pe_id = pe_order.get("order_id")
@@ -893,8 +881,7 @@ class StrangleDesk:
                                     f"NFO:{pe_sym}" if ":" not in pe_sym else pe_sym]
                 quotes = kite.ltp(symbols_to_query)
             except Exception as e:
-                err_str = str(e).lower()
-                if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
+                if is_token_error(e):
                     logger.warning("Token error during live quote polling (%s). Refreshing session...", e)
                     try:
                         kite = self._ensure_kite_session(kite, force_login=True)
@@ -1073,6 +1060,7 @@ class StrangleDesk:
         last_heartbeat_hour: int = -1
         last_holiday_date: Optional[date] = None
         last_totp_login_date: Optional[date] = None
+        last_idle_reconcile_time: float = 0.0
         iteration = 0
 
         while True:
@@ -1156,10 +1144,19 @@ class StrangleDesk:
             # 4. During Market Hours: Reconcile with broker positions in LIVE mode
             mode = getattr(self.order_manager, "mode", "PAPER")
             if mode == "LIVE" and kite is not None:
-                kite = self._ensure_kite_session(kite)
-                state = self.reconcile_with_broker(kite, state, underlying=underlying)
-                if state is not None and state.get("date") == today_str and state.get("status") == "OPEN":
-                    continue
+                # If an active trade exists locally, reconcile every loop to detect external broker exits.
+                # If state is None / idle, throttle queries to at most once per 60s to conserve API limits.
+                should_reconcile = True
+                if state is None or state.get("status") not in ("OPEN",):
+                    if last_idle_reconcile_time and (time.time() - last_idle_reconcile_time) < 60.0:
+                        should_reconcile = False
+
+                if should_reconcile:
+                    kite = self._ensure_kite_session(kite)
+                    state = self.reconcile_with_broker(kite, state, underlying=underlying)
+                    last_idle_reconcile_time = time.time()
+                    if state is not None and state.get("date") == today_str and state.get("status") == "OPEN":
+                        continue
 
             # 5. If before 10:00 AM (e.g. 09:15-09:59 IST), wait for entry time
             if current_t < dt_time(entry_h, entry_m):
@@ -1171,7 +1168,7 @@ class StrangleDesk:
                 logger.info("Triggering 10:00 AM Strangle entry for %s...", today_str)
                 try:
                     kite = self._ensure_kite_session(kite)
-                    self.run_session(
+                    session_res = self.run_session(
                         underlying=underlying,
                         lots=lots,
                         poll_seconds=poll_seconds,
@@ -1182,9 +1179,12 @@ class StrangleDesk:
                         ignore_holidays=ignore_holidays,
                         order_timeout=order_timeout
                     )
+                    if isinstance(session_res, dict) and session_res.get("status") in ("ABORTED", "COMPLETED"):
+                        logger.info("Strangle session returned %s. Pausing before next scheduler cycle.", session_res.get("status"))
                 except Exception as e:
                     logger.exception("Error during 10:00 AM strangle session: %s", e)
                     pass  # Non-trade error alert removed per policy
+                time.sleep(idle_sleep_seconds)
                 continue
 
             # 5. Outside entry window & market closed (e.g. evening 18:33 IST): sleep

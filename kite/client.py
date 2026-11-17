@@ -130,6 +130,35 @@ def get_kite_client(config: Optional[KiteConfig] = None, force_login: bool = Fal
         return kite
 
 
+def is_token_error(e: Exception) -> bool:
+    """
+    Detects whether an exception specifically indicates an expired, revoked,
+    or invalid Zerodha Kite Connect session access token (as opposed to an
+    instrument_token error, rate limit, or transient network issue).
+    """
+    if isinstance(e, TokenException) or "tokenexception" in type(e).__name__.lower():
+        return True
+
+    err_str = str(e).lower()
+    # Explicitly exclude instrument_token / contract lookup errors
+    if "instrument_token" in err_str or "instrument token" in err_str:
+        return False
+    if "too many requests" in err_str or "429" in err_str:
+        return False
+
+    return (
+        "incorrect `api_key`" in err_str
+        or "incorrect api_key" in err_str
+        or ("access_token" in err_str and ("invalid" in err_str or "expired" in err_str or "missing" in err_str or "incorrect" in err_str))
+        or "token is invalid" in err_str
+        or "token expired" in err_str
+        or "session expired" in err_str
+        or "invalid token" in err_str
+        or "user not logged in" in err_str
+        or ("403" in err_str and "forbidden" in err_str)
+    )
+
+
 def ensure_kite_session(kite: Optional[KiteConnect] = None, force_login: bool = False) -> KiteConnect:
     """
     Validates active KiteConnect session by verifying connectivity with kite.profile().
@@ -145,29 +174,40 @@ def ensure_kite_session(kite: Optional[KiteConnect] = None, force_login: bool = 
             return kite
         except Exception as e:
             err_str = str(e).lower()
-            if "token" in err_str or "api_key" in err_str or "access_token" in err_str or "tokenexception" in type(e).__name__.lower():
-                logger.warning("Kite session token is expired or invalidated (%s). Refreshing...", e)
-            else:
-                logger.warning("Kite profile check encountered unexpected error (%s). Refreshing session...", e)
+            if "too many requests" in err_str or "429" in err_str:
+                logger.warning("Kite API rate limit encountered during profile check (%s). Preserving existing token.", e)
+                return kite
+            if "read timed out" in err_str or "connection" in err_str or "timeout" in err_str or "502" in err_str or "503" in err_str or "504" in err_str:
+                logger.warning("Transient network/server error during Kite profile check (%s). Preserving existing session.", e)
+                return kite
+            if not is_token_error(e):
+                logger.warning("Kite profile check encountered unexpected non-auth error (%s). Preserving existing session.", e)
+                return kite
+            logger.warning("Kite session token is expired or invalidated (%s). Refreshing...", e)
 
     # In multi-strategy execution, check if .env has already been updated with a valid token
     current_token = getattr(kite, "access_token", None) if kite else None
-    if current_token:
+    if current_token and isinstance(current_token, str):
         cfg = load_config()
         env_token = cfg.access_token
         if env_token and env_token != current_token:
-            logger.info("Found updated access token in .env. Testing validity before logging in...")
+            logger.info("Found updated access token in .env from a peer strategy. Testing validity before logging in...")
             test_client = _validate_token(cfg.api_key, env_token)
             if test_client:
                 logger.info("Token from .env is valid (shared across strategies). Reusing session without new login.")
-                if kite is not None:
-                    kite.set_access_token(env_token)
+                if kite is not None and hasattr(kite, "set_access_token"):
+                    try:
+                        kite.set_access_token(env_token)
+                    except Exception:
+                        pass
                     return kite
                 return test_client
 
     logger.info("Acquiring fresh Kite session via automated TOTP login...")
     new_client = get_kite_client(force_login=True)
-    if kite is not None and hasattr(new_client, "access_token"):
-        kite.set_access_token(new_client.access_token)
-        return kite
+    if kite is not None and hasattr(new_client, "access_token") and hasattr(kite, "set_access_token"):
+        try:
+            kite.set_access_token(new_client.access_token)
+        except Exception:
+            pass
     return new_client
