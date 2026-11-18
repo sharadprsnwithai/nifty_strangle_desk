@@ -5,7 +5,7 @@ A modular algorithmic trading desk connected to Zerodha Kite Connect API using a
 ## Features
 - **Headless TOTP 2FA**: Automated daily login via `pyotp` RFC 6238 without manual browser interaction.
 - **Smart Token Caching**: Caches and validates daily `access_token` in `.env` to avoid unnecessary logins.
-- **10:00 AM NIFTY Short Strangle Strategy**: Automated strike discovery ($\ge ₹30.0$), 0 DTE $\to$ next week shift, 5-minute portfolio stop-loss exit (₹10,000 max strategy loss across all legs), independent $+50\%$ SL, $80\%$ decay target, 3:00 PM time exit, and dual Paper/Live execution.
+- **10:00 AM NIFTY Short Strangle Strategy**: Automated strike discovery ($\ge ₹30.0$), 0 DTE $\to$ next week shift, combined portfolio stop-loss exit (₹10,000 max loss across both legs), dual-leg exit on 80% decay target (eliminating naked single-leg exposure), mandatory 14:45 IST cutoff time exit, and dual Paper/Live execution.
 - **Crash-Resilient State Machine**: Persists active legs and trade state to handle restarts gracefully.
 - **Realistic Backtesting Engine**: Day-by-day continuous fractional-DTE option simulation accounting for exact NSE transaction taxes, STT, SEBI fees, GST, brokerage, and execution slippage.
 - **Comprehensive Positions Viewer**: Displays both Net and Day positions with quantity, entry averages, LTP, MTM, and P&L metrics.
@@ -72,15 +72,15 @@ Executes or simulates the 10:00 AM Short Strangle desk:
 - **0 DTE Rule**: When today is Tuesday (weekly expiry), automatically selects next week's expiry.
 - **Contract Specifications**: NIFTY lot size is 65 (10 lots = 650 shares).
 - **Strike Selection**: Lowest OTM strikes with LTP $\ge ₹30.0$.
-- **Risk Management**: 
-  - **Portfolio Max Loss Exit**: ₹10,000 maximum daily loss across all open legs evaluated at every 5-minute check (closes all legs immediately on breach with reason `STRATEGY_MAX_LOSS_10K`, eliminating whipsaw losses and cutting max drawdown by 45.4%).
-  - **Stop Loss & Target**: Independent $+50\%$ Stop Loss per leg (`entry * 1.50`) and independent $80\%$ decay profit target per leg (`entry * 0.20`).
-  - **Time Exit**: Mandatory 3:00 PM (15:00 IST) market square-off for any remaining positions.
+- **Risk Management (Option 3 Canonical Rules)**: 
+  - **Combined Portfolio Max Loss Exit**: ₹10,000 maximum combined daily loss across both legs (`total_strategy_pnl <= -10000.0`). Closes both legs simultaneously on breach with reason `STRATEGY_MAX_LOSS_10K`. Individual leg stop-loss is removed so winning legs offset losing legs.
+  - **Dual-Leg Profit Target Exit**: When either leg achieves its 80% decay target (`entry * 0.20`), **both legs exit simultaneously** (`DECAY_TARGET` + `CO_TARGET_EXIT`) to lock in strangle gains and eliminate unhedged single-leg directional risk.
+  - **14:45 IST Time Exit**: Mandatory 14:45 IST square-off for any remaining positions, avoiding 3:00 PM expiry gamma spikes and flash gap moves.
 - **Automated 08:00 AM IST Daily TOTP Login Renewal**: Proactively renews the Zerodha Kite access token via headless TOTP authentication every morning at 08:00 AM IST on trading days. Persists the token to `.env` and notifies Telegram, ensuring all subsequent daily activities (10:00 AM strike scan, order entries, live polling) use a freshly minted, validated credential.
 - **Order Execution Verification & Timeout**: Monitors entry order status for up to 5 minutes (`--order-timeout 300`). If unfilled, pending orders are automatically cancelled. If partially filled, pending portions are cancelled and filled shares are immediately squared off (`buy_to_cover`) to prevent unhedged or unmatched exposure.
 - **Market Protection**: Uses marketable `LIMIT` orders with customizable price buffer (default: 5% off LTP) rounded to NSE ₹0.05 ticks to prevent Zerodha RMS freak-trade order rejections.
 - **NSE Holiday Protection**: Automatically checks weekend and official NSE trading holiday calendars and skips non-trading sessions.
-- **Telegram Alerts**: Real-time notifications on entry fills, SL/Max-Loss triggers, decay targets, and 15:00 summary.
+- **Telegram Alerts**: Real-time notifications on entry fills, combined portfolio stop-loss triggers, decay targets, and 14:45 cutoff summary.
 - **State Recovery & Host Event Logging**: Crash-resilient tracking persisted to `data/trades_today.json`, and rotating detailed event logs persisted directly to `logs/strangle_desk.log` on the host machine.
 
 ```bash

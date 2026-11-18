@@ -247,7 +247,7 @@ def run_backtest_simulation(
             if not ce_active and not pe_active:
                 break
 
-        # If still active at 3:00 PM, exit at market price
+        # If still active at cutoff time (14:45), exit at market price
         if ce_active:
             exit_bar = intraday_bars.iloc[-1] if not intraday_bars.empty else entry_bar
             curr_dte = compute_fractional_dte(target_expiry, exit_bar["dt"])
