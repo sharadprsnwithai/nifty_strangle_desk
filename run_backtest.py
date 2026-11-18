@@ -3,7 +3,7 @@ import os
 import argparse
 import logging
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import pandas as pd
 from tabulate import tabulate
 from kite import get_kite_client
@@ -89,12 +89,16 @@ def run_backtest_cli(args=None) -> int:
     parser.add_argument("--lots", type=int, default=10, help="Number of lots (default: 10)")
     parser.add_argument("--lot-size", type=int, default=65, help="Lot size (default: 65)")
     parser.add_argument("--strategy-max-loss", "--max-loss", type=float, default=10000.0, dest="strategy_max_loss", help="Strategy total loss exit in Rs across all legs (default: 10000.0)")
+    parser.add_argument("--use-leg-sl", action="store_true", help="Enable legacy individual leg stop-loss (50% premium increase)")
+    parser.add_argument("--exit-cutoff", type=str, default="14:45", help="Intraday square-off cutoff time HH:MM (default: 14:45)")
     parser.add_argument("--expiry-weekday", type=int, default=1, help="Expiry weekday (0=Mon, 1=Tue, ..., 3=Thu. Default: 1 for Tuesday)")
     parser.add_argument("--iv", type=float, default=0.13, help="Option IV (default: 0.13)")
     parser.add_argument("--output", type=str, default="data/backtest_trade_log.csv", help="CSV trade log path")
     parser.add_argument("--force-fetch", action="store_true", help="Force fresh fetch from Kite Connect API, bypassing local cache")
 
     parsed = parser.parse_args(args)
+    cutoff_h, cutoff_m = map(int, parsed.exit_cutoff.split(":"))
+    exit_cutoff = time(cutoff_h, cutoff_m)
 
     try:
         bars_df = load_historical_nifty_data(days=parsed.days, force_fetch=parsed.force_fetch)
@@ -107,7 +111,9 @@ def run_backtest_cli(args=None) -> int:
             lot_size=parsed.lot_size,
             iv=parsed.iv,
             expiry_weekday=parsed.expiry_weekday,
-            strategy_max_loss=parsed.strategy_max_loss
+            strategy_max_loss=parsed.strategy_max_loss,
+            use_leg_sl=parsed.use_leg_sl,
+            exit_cutoff_time=exit_cutoff
         )
 
         summary = results["summary"]

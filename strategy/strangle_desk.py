@@ -107,10 +107,9 @@ class StrangleDesk:
         print("=" * 65)
         print(f"Target Expiry : {strikes['expiry']}")
         print(f"Order Sizing  : {strikes['total_lots']} lots ({strikes['total_quantity']} qty)")
-        print(f"CALL Leg      : {ce_info['symbol']} @ Rs {ce_info['ltp']:.2f}")
-        print(f"                SL: Rs {ce_info['sl_price']:.2f} (+50%) | Target: Rs {ce_info['target_price']:.2f} (80% decay)")
-        print(f"PUT Leg       : {pe_info['symbol']} @ Rs {pe_info['ltp']:.2f}")
-        print(f"                SL: Rs {pe_info['sl_price']:.2f} (+50%) | Target: Rs {pe_info['target_price']:.2f} (80% decay)")
+        print(f"CALL Leg      : {ce_info['symbol']} @ Rs {ce_info['ltp']:.2f} | Target: Rs {ce_info['target_price']:.2f} (80% decay)")
+        print(f"PUT Leg       : {pe_info['symbol']} @ Rs {pe_info['ltp']:.2f} | Target: Rs {pe_info['target_price']:.2f} (80% decay)")
+        print(f"Exit Rules    : Combined loss > Rs 10k (both exit) | Target: 80% decay (both exit) | Cutoff: 14:45 IST")
         print("=" * 65 + "\n")
 
     @staticmethod
@@ -546,7 +545,7 @@ class StrangleDesk:
         """
         Executes and monitors the 10:00 AM Short Strangle intraday session.
         Handles holiday skip, strike discovery, dual-leg entry, live quote polling,
-        independent stop-loss, profit-decay target, and 3:00 PM time square-off.
+        combined portfolio stop-loss (₹10k), decay target (closes both legs), and 2:45 PM time square-off.
         """
         if not ignore_holidays:
             is_holiday, reason = is_trading_holiday()
@@ -792,11 +791,9 @@ class StrangleDesk:
                     f"🚀 <b>NIFTY 10:00 AM Strangle Opened [{mode}]</b>\n"
                     f"Expiry: <code>{strikes['expiry']}</code> | Qty: {total_qty} ({strikes['total_lots']} lots)\n"
                     f"Order Type: <code>{order_type}</code> (Buffer: {limit_buffer_pct*100:.0f}%)\n"
-                    f"• <b>CALL</b>: <code>{ce_info['symbol']}</code> @ Rs {ce_exec_price:.2f}\n"
-                    f"  SL: Rs {ce_sl:.2f} | Target: Rs {ce_tgt:.2f}\n"
-                    f"• <b>PUT</b>: <code>{pe_info['symbol']}</code> @ Rs {pe_exec_price:.2f}\n"
-                    f"  SL: Rs {pe_sl:.2f} | Target: Rs {pe_tgt:.2f}\n"
-                    f"• Risk Cap: {risk_cap_str}"
+                    f"• <b>CALL</b>: <code>{ce_info['symbol']}</code> @ Rs {ce_exec_price:.2f} | Target: Rs {ce_tgt:.2f}\n"
+                    f"• <b>PUT</b>: <code>{pe_info['symbol']}</code> @ Rs {pe_exec_price:.2f} | Target: Rs {pe_tgt:.2f}\n"
+                    f"• <b>Exit Rules</b>: Portfolio SL: {risk_cap_str} | Target: 80% decay (both exit) | Cutoff: 14:45 IST"
                 )
                 self.notifier.send_message(entry_msg)
 
@@ -841,9 +838,9 @@ class StrangleDesk:
         qty = state.get("quantity", lots * 65)
 
         while state.get("status") == "OPEN":
-            # Current time check: 3:00 PM cutoff
-            if datetime.now().time() >= dt_time(15, 0):
-                logger.info("Intraday 15:00 cutoff reached. Closing all open strangle legs.")
+            # Current time check: 2:45 PM cutoff (avoids 3pm expiry gamma spikes)
+            if datetime.now().time() >= dt_time(14, 45):
+                logger.info("Intraday 14:45 cutoff reached. Closing all open strangle legs.")
                 quotes: Dict[str, Any] = {}
                 if kite is not None:
                     try:
@@ -867,7 +864,7 @@ class StrangleDesk:
                     if self.notifier:
                         total_day_pnl = self._get_current_day_pnl(state, qty)
                         self.notifier.send_message(
-                            f"🏁 <b>15:00 Cutoff Exit</b>: Closed open legs (CE @ ₹{ce_ltp:.2f}, PE @ ₹{pe_ltp:.2f})\n\n"
+                            f"🏁 <b>14:45 Cutoff Exit</b>: Closed open legs (CE @ ₹{ce_ltp:.2f}, PE @ ₹{pe_ltp:.2f})\n\n"
                             f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
                         )
                     break
@@ -916,11 +913,12 @@ class StrangleDesk:
                 total_strategy_pnl
             )
 
-            # Evaluate strategy-level portfolio stop loss
-            if strategy_max_loss is not None and total_strategy_pnl <= -strategy_max_loss:
+            # Evaluate strategy-level portfolio stop loss (both legs exit simultaneously if combined loss > 10k)
+            effective_max_loss = strategy_max_loss if strategy_max_loss is not None else 10000.0
+            if total_strategy_pnl <= -effective_max_loss:
                 logger.warning(
-                    "Total strategy loss Rs %.2f >= limit Rs %.2f. Triggering immediate portfolio exit for all open legs.",
-                    abs(total_strategy_pnl), strategy_max_loss
+                    "Total strategy loss Rs %.2f >= limit Rs %.2f. Triggering immediate portfolio exit for all open legs simultaneously.",
+                    abs(total_strategy_pnl), effective_max_loss
                 )
                 if state["ce"].get("status") == "OPEN":
                     self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state)
@@ -929,67 +927,48 @@ class StrangleDesk:
                 if self.notifier:
                     total_day_pnl = self._get_current_day_pnl(state, qty)
                     self.notifier.send_message(
-                        f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{strategy_max_loss:,.2f}. Exited all open legs!\n\n"
+                        f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}. Exited all open legs!\n\n"
                         f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
                     )
 
-
-            # Evaluate CE leg
+            # Evaluate CE leg (decay target profit taking only; individual leg loss exit removed)
+            # When one leg hits decay target, close BOTH legs to avoid naked single-leg risk
             if state["ce"].get("status") == "OPEN":
-                ce_sl = state["ce"]["sl_price"]
-                ce_target = state["ce"]["target_price"]
-
-                if ce_ltp >= ce_sl:
-                    logger.warning("CE Stop-Loss hit! LTP: %.2f >= SL: %.2f", ce_ltp, ce_sl)
-                    if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state):
-                        if self.notifier:
-                            ce_entry = float(state["ce"]["entry_price"])
-                            leg_pnl = (ce_entry - ce_ltp) * qty
-                            total_day_pnl = self._get_current_day_pnl(state, qty)
-                            self.notifier.send_message(
-                                f"🛑 <b>STOP LOSS HIT</b>: CE <code>{ce_sym}</code> exited @ ₹{ce_ltp:.2f} (SL: ₹{ce_sl:.2f})\n"
-                                f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
-                                f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
-                            )
-                elif ce_ltp <= ce_target:
-                    logger.info("CE Decay Target reached! LTP: %.2f <= Target: %.2f", ce_ltp, ce_target)
+                ce_target = state["ce"].get("target_price")
+                if ce_target is not None and ce_ltp <= ce_target:
+                    logger.info("CE Decay Target reached! LTP: %.2f <= Target: %.2f. Closing both legs.", ce_ltp, ce_target)
                     if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
+                        # Close opposite PE leg simultaneously to avoid naked single-leg risk
+                        if state["pe"].get("status") == "OPEN":
+                            self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state)
                         if self.notifier:
                             ce_entry = float(state["ce"]["entry_price"])
                             leg_pnl = (ce_entry - ce_ltp) * qty
                             total_day_pnl = self._get_current_day_pnl(state, qty)
                             self.notifier.send_message(
                                 f"🎯 <b>DECAY TARGET REACHED</b>: CE <code>{ce_sym}</code> exited @ ₹{ce_ltp:.2f} (Target: ₹{ce_target:.2f})\n"
+                                f"Both legs closed to avoid naked risk.\n"
                                 f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
                                 f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
                             )
 
-            # Evaluate PE leg
+            # Evaluate PE leg (decay target profit taking only; individual leg loss exit removed)
+            # When one leg hits decay target, close BOTH legs to avoid naked single-leg risk
             if state["pe"].get("status") == "OPEN":
-                pe_sl = state["pe"]["sl_price"]
-                pe_target = state["pe"]["target_price"]
-
-                if pe_ltp >= pe_sl:
-                    logger.warning("PE Stop-Loss hit! LTP: %.2f >= SL: %.2f", pe_ltp, pe_sl)
-                    if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state):
-                        if self.notifier:
-                            pe_entry = float(state["pe"]["entry_price"])
-                            leg_pnl = (pe_entry - pe_ltp) * qty
-                            total_day_pnl = self._get_current_day_pnl(state, qty)
-                            self.notifier.send_message(
-                                f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ ₹{pe_ltp:.2f} (SL: ₹{pe_sl:.2f})\n"
-                                f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
-                                f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
-                            )
-                elif pe_ltp <= pe_target:
-                    logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f", pe_ltp, pe_target)
+                pe_target = state["pe"].get("target_price")
+                if pe_target is not None and pe_ltp <= pe_target:
+                    logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f. Closing both legs.", pe_ltp, pe_target)
                     if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
+                        # Close opposite CE leg simultaneously to avoid naked single-leg risk
+                        if state["ce"].get("status") == "OPEN":
+                            self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state)
                         if self.notifier:
                             pe_entry = float(state["pe"]["entry_price"])
                             leg_pnl = (pe_entry - pe_ltp) * qty
                             total_day_pnl = self._get_current_day_pnl(state, qty)
                             self.notifier.send_message(
                                 f"🎯 <b>DECAY TARGET REACHED</b>: PE <code>{pe_sym}</code> exited @ ₹{pe_ltp:.2f} (Target: ₹{pe_target:.2f})\n"
+                                f"Both legs closed to avoid naked risk.\n"
                                 f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
                                 f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
                             )
@@ -1035,7 +1014,7 @@ class StrangleDesk:
         ignore_holidays: bool = False,
         order_timeout: int = 300,
         entry_time_str: str = "10:00",
-        exit_time_str: str = "15:00",
+        exit_time_str: str = "14:45",
         idle_sleep_seconds: int = 15,
         max_iterations: Optional[int] = None
     ) -> None:
@@ -1046,7 +1025,7 @@ class StrangleDesk:
         - Skips weekends and official NSE trading holidays
         - If active trade exists for today: resumes monitoring until completion
         - At 10:00 AM IST: executes option chain scan, places dual-leg entry, and starts monitoring loop
-        - At 15:00 PM IST: closes any remaining open positions
+        - At 14:45 PM IST: closes any remaining open positions (avoids late gamma spikes)
         - Outside market hours (e.g. evening 18:33 IST): sleeps peacefully and never submits orders
         """
         mode = getattr(self.order_manager, "mode", "PAPER")

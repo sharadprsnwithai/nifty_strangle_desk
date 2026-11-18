@@ -137,18 +137,16 @@ def test_run_backtest_simulation_strategy_max_loss_default():
 
 
 def test_run_backtest_simulation_strategy_max_loss_exit():
-    # Construct a trading day with whipsaw where CE stops out, and then as spot declines
-    # the total strategy loss hits 10,000, triggering an immediate portfolio exit on PE.
+    # Construct a trading day with steady strong rally where combined loss hits 10,000,
+    # triggering an immediate simultaneous portfolio exit on both legs.
     rows = []
     base_time = datetime(2026, 11, 2, 9, 15)
     for i in range(75):
         t = base_time + timedelta(minutes=i * 5)
         if i < 15:
             spot = 24000.0
-        elif i < 25:
-            spot = 24000.0 + (i - 14) * 10.0  # Rallies to 24100 (stops out CE)
         else:
-            spot = 24100.0 - (i - 24) * 10.0  # Declines gradually, eating away PE gains
+            spot = 24000.0 + ((i - 14) * 15.0)  # Steady strong rally
         rows.append({"timestamps": t, "open": spot, "high": spot + 1.0, "low": spot - 1.0, "close": spot})
     df = pd.DataFrame(rows)
 
@@ -161,7 +159,8 @@ def test_run_backtest_simulation_strategy_max_loss_exit():
     assert results["summary"]["total_days_traded"] == 1
     trade = results["trades"][0]
 
-    # Active PE leg should have exited with STRATEGY_MAX_LOSS_10K
+    # Both legs should have exited simultaneously with STRATEGY_MAX_LOSS_10K
+    assert trade["ce_reason"] == "STRATEGY_MAX_LOSS_10K"
     assert trade["pe_reason"] == "STRATEGY_MAX_LOSS_10K"
     # Gross loss should be capped near -10,000 (within 5-minute candle granularity)
     assert trade["gross_pnl"] <= -10000.0

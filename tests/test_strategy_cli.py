@@ -186,14 +186,16 @@ def test_run_strategy_cli_once_flag():
         )
 
 
-def test_strangle_desk_run_session_sl_and_target_exits(tmp_path):
+def test_strangle_desk_run_session_sl_removed_and_target_exit(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
         {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
         {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
     ]
     # 1st call to ltp: strike discovery
-    # 2nd call to ltp: monitoring loop (CE hits SL 49.0 >= 48.0, PE hits Target 6.0 <= 6.2)
+    # 2nd call to ltp: monitoring loop (CE LTP 49.0 > 48.0 (+50%), PE hits Target 6.0 <= 6.2)
+    # Combined PnL = (32 - 49)*65 + (31 - 6)*65 = -1105 + 1625 = +520 (loss not > 10k)
+    # CE must NOT exit on individual leg loss; only PE exits on DECAY_TARGET.
     mock_kite.ltp.side_effect = [
         {"NFO:NIFTY26NOV24200CE": {"last_price": 32.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}},
         {"NFO:NIFTY26NOV24200CE": {"last_price": 49.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 6.0}}
@@ -209,12 +211,45 @@ def test_strangle_desk_run_session_sl_and_target_exits(tmp_path):
 
     assert state is not None
     assert state["status"] == "COMPLETED"
-    assert state["ce"]["status"] == "CLOSED"
-    assert state["ce"]["exit_reason"] == "STOP_LOSS"
-    assert state["ce"]["exit_price"] == 49.0
+    # PE decay target is reached: PE is CLOSED with DECAY_TARGET
     assert state["pe"]["status"] == "CLOSED"
     assert state["pe"]["exit_reason"] == "DECAY_TARGET"
     assert state["pe"]["exit_price"] == 6.0
+    # Option 3: opposite leg is simultaneously closed to avoid naked risk
+    assert state["ce"]["status"] == "CLOSED"
+    assert state["ce"]["exit_reason"] == "CO_TARGET_EXIT"
+    assert state["ce"]["exit_price"] == 49.0
+
+
+def test_strangle_desk_run_session_no_exit_when_sl_exceeded_and_no_target(tmp_path):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+    ]
+    # CE Entry: 32.0, PE Entry: 31.0
+    # Tick 2: CE LTP 49.0 (> 48.0 legacy SL), PE LTP 25.0 (> 6.2 target)
+    # Combined loss = (49-32)*65 + (25-31)*65 = 1105 - 390 = 715 (< 10,000)
+    # Neither leg should exit: both legs stay OPEN
+    mock_kite.ltp.side_effect = [
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 32.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}},
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 49.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 25.0}}
+    ]
+
+    state_file = tmp_path / "trades_today.json"
+    om = OrderManager(mode="PAPER", kite=mock_kite)
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    with patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
+        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite)
+
+    assert state is not None
+    assert state["status"] == "OPEN"
+    assert state["ce"]["status"] == "OPEN"
+    assert state["ce"]["exit_reason"] is None
+    assert state["pe"]["status"] == "OPEN"
+    assert state["pe"]["exit_reason"] is None
 
 
 def test_strangle_desk_run_session_time_exit(tmp_path):
@@ -235,6 +270,34 @@ def test_strangle_desk_run_session_time_exit(tmp_path):
     # Freeze time past 15:00
     with patch("strategy.strangle_desk.datetime") as mock_dt:
         mock_dt.now.return_value = datetime(2026, 11, 3, 15, 5)
+        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite)
+
+    assert state is not None
+    assert state["status"] == "COMPLETED"
+    assert state["ce"]["status"] == "CLOSED"
+    assert state["ce"]["exit_reason"] == "TIME_EXIT"
+    assert state["pe"]["status"] == "CLOSED"
+    assert state["pe"]["exit_reason"] == "TIME_EXIT"
+
+
+def test_strangle_desk_run_session_1445_cutoff_exit(tmp_path):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+    ]
+    mock_kite.ltp.return_value = {
+        "NFO:NIFTY26NOV24200CE": {"last_price": 32.0},
+        "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}
+    }
+
+    state_file = tmp_path / "trades_today.json"
+    om = OrderManager(mode="PAPER", kite=mock_kite)
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    # Freeze time at 14:46 (past 14:45 cutoff)
+    with patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 11, 3, 14, 46)
         state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite)
 
     assert state is not None
