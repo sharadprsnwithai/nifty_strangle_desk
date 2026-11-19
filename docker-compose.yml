@@ -142,8 +142,46 @@ services:
     # - Telegram Notifications: Strictly on Entry, SL, and Exit with Total Day P&L
     #
     # 1. Paper Trading Mode:
-    # command: ["--paper", "--lots", "4", "--sl", "500", "--target1", "800", "--order-type", "MARKET", "--limit-buffer-pts", "80.0", "--poll", "5"]
+    # command: ["--paper", "--lots", "4", "--sl", "500", "--target1", "800", "--order-type", "LIMIT", "--limit-buffer-pts", "80.0", "--poll", "5"]
     #
     # 2. Live Production Mode (Real Broker Order Execution via Kite Connect API + Telegram Alerts):
-    command: ["--live", "--lots", "4", "--sl", "500", "--target1", "800", "--order-type", "MARKET", "--limit-buffer-pts", "80.0", "--poll", "5"]
+    command: ["--live", "--lots", "4", "--sl", "500", "--target1", "800", "--order-type", "LIMIT", "--limit-buffer-pts", "80.0", "--poll", "5"]
     # -----------------------------------------------------------------------------------
+
+  nifty-orb-desk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nifty_orb_desk
+    image: ${DOCKER_USER:-sharadprsn}/nifty_strangle_desk:latest
+    restart: unless-stopped
+    entrypoint: ["python", "run_nifty_orb.py"]
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Kolkata
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "10"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    # -----------------------------------------------------------------------------------
+    # NIFTY 50 30-Min ORB Futures Desk (2-Lot Tranche Scaling):
+    # - Reference: 09:15 - 09:45 IST, 15m confirmation bars
+    # - Risk: 2 Lots, SL: 50 pts
+    # - Tranche: Tranche 1 (1 Lot) booked @ +75 pts; Runner (1 Lot) trailed to Cost & rides to 15:15
+    #
+    # 1. Paper Trading Mode (Default Simulation):
+    command: ["--paper", "--lots", "2", "--sl", "50", "--target1", "75", "--order-type", "LIMIT", "--limit-buffer-pts", "5.0", "--poll", "5"]
+    #
+    # 2. Live Production Mode (Live Broker Execution via Kite Connect):
+    # command: ["--live", "--lots", "2", "--sl", "50", "--target1", "75", "--order-type", "LIMIT", "--limit-buffer-pts", "5.0", "--poll", "5"]
+    # -----------------------------------------------------------------------------------
+
