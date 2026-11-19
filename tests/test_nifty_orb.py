@@ -1,5 +1,8 @@
-from datetime import time
+from datetime import date, time
+from unittest.mock import MagicMock
+import pytest
 from strategy.nifty_orb.config import NiftyORBConfig
+from strategy.nifty_orb.contract_resolver import resolve_active_nifty_fut_contract
 
 
 def test_nifty_orb_config_defaults():
@@ -18,3 +21,90 @@ def test_nifty_orb_config_defaults():
     assert cfg.order_type == "LIMIT"
     assert cfg.limit_buffer_pts == 5.0
     assert cfg.state_file == "data/nifty_orb_trades_today.json"
+
+
+def test_resolve_active_nifty_fut_contract_mock():
+    # Test offline fallback when kite is None
+    contract = resolve_active_nifty_fut_contract(None)
+    assert "NIFTY" in contract["tradingsymbol"]
+    assert contract["instrument_token"] > 0
+    assert contract["lot_size"] in (25, 50, 65, 75)
+    assert isinstance(contract["expiry"], date)
+
+
+def test_resolve_active_nifty_fut_contract_live_list():
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {
+            "tradingsymbol": "BANKNIFTY26NOVFUT",
+            "name": "BANKNIFTY",
+            "instrument_type": "FUT",
+            "expiry": date(2026, 11, 26),
+            "instrument_token": 1001,
+            "lot_size": 15,
+        },
+        {
+            "tradingsymbol": "NIFTY26NOVFUT",
+            "name": "NIFTY",
+            "instrument_type": "FUT",
+            "expiry": date(2026, 11, 26),
+            "instrument_token": 1002,
+            "lot_size": 65,
+        },
+        {
+            "tradingsymbol": "NIFTY26DECFUT",
+            "name": "NIFTY",
+            "instrument_type": "FUT",
+            "expiry": date(2026, 12, 31),
+            "instrument_token": 1003,
+            "lot_size": 65,
+        },
+        {
+            "tradingsymbol": "NIFTY26N2624000CE",
+            "name": "NIFTY",
+            "instrument_type": "CE",
+            "expiry": date(2026, 11, 26),
+            "instrument_token": 1004,
+            "lot_size": 65,
+        },
+    ]
+
+    contract = resolve_active_nifty_fut_contract(mock_kite, today_d=date(2026, 11, 19))
+    assert contract["tradingsymbol"] == "NIFTY26NOVFUT"
+    assert contract["instrument_token"] == 1002
+    assert contract["lot_size"] == 65
+    assert contract["expiry"] == date(2026, 11, 26)
+
+
+def test_resolve_active_nifty_fut_contract_string_expiry_and_cutoff():
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {
+            "tradingsymbol": "NIFTY26NOVFUT",
+            "name": "NIFTY",
+            "instrument_type": "FUT",
+            "expiry": "2026-11-26",
+            "instrument_token": 1002,
+            "lot_size": 65,
+        },
+        {
+            "tradingsymbol": "NIFTY26DECFUT",
+            "name": "NIFTY",
+            "instrument_type": "FUT",
+            "expiry": "2026-12-31",
+            "instrument_token": 1003,
+            "lot_size": 65,
+        },
+    ]
+
+    # If min_days_to_expiry is 10 and today is 2026-11-20, cutoff is 2026-11-30, so it should pick DEC contract
+    contract = resolve_active_nifty_fut_contract(mock_kite, min_days_to_expiry=10, today_d=date(2026, 11, 20))
+    assert contract["tradingsymbol"] == "NIFTY26DECFUT"
+    assert contract["expiry"] == date(2026, 12, 31)
+
+
+def test_resolve_active_nifty_fut_contract_no_candidates():
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = []
+    with pytest.raises(ValueError, match="No active NIFTY FUT contracts found"):
+        resolve_active_nifty_fut_contract(mock_kite, today_d=date(2026, 11, 19))
