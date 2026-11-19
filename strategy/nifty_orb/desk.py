@@ -277,7 +277,13 @@ class NiftyORBDesk:
         if df is None or len(df) < 50:
             return None
 
-        eval_dt = current_dt or datetime.now()
+        if current_dt is not None:
+            eval_dt = current_dt
+        elif current_time is not None:
+            eval_dt = datetime.combine(date.today(), current_time)
+        else:
+            eval_dt = datetime.now()
+
         work_df = df.copy()
 
         if "day" not in work_df.columns and "date" in work_df.columns:
@@ -293,8 +299,9 @@ class NiftyORBDesk:
                 eval_naive = eval_dt.replace(tzinfo=None) if hasattr(eval_dt, "tzinfo") and eval_dt.tzinfo else eval_dt
                 is_closed = (candle_dates + pd.Timedelta(minutes=15)) <= (eval_naive + pd.Timedelta(seconds=5))
                 closed_df = work_df[is_closed]
-                if len(closed_df) >= 50:
-                    work_df = closed_df
+                work_df = closed_df
+                if len(work_df) < 50:
+                    return None
             except Exception as e:
                 logger.debug("Candle filtering exception: %s", e)
 

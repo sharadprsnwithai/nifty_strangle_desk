@@ -46,6 +46,8 @@ def resolve_active_nifty_fut_contract(
                     expiry_date = date.fromisoformat(expiry)
                 except ValueError:
                     continue
+            elif hasattr(expiry, "date") and callable(expiry.date):  # Handles datetime.datetime and pd.Timestamp
+                expiry_date = expiry.date()
             elif isinstance(expiry, date):
                 expiry_date = expiry
             else:
