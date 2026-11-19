@@ -520,3 +520,70 @@ def test_desk_scanning_cutoff(tmp_path):
     assert desk.state["status"] == "COMPLETED"
 
 
+def test_parse_args_defaults():
+    from run_nifty_orb import parse_args
+
+    args = parse_args([])
+    assert args.paper is True
+    assert args.lots == 2
+    assert args.sl == 50.0
+    assert args.target1 == 75.0
+    assert args.product == "MIS"
+    assert args.order_type == "LIMIT"
+    assert args.limit_buffer_pts == 5.0
+
+
+def test_parse_args_custom():
+    from run_nifty_orb import parse_args
+
+    args = parse_args([
+        "--live",
+        "--lots", "4",
+        "--sl", "60.0",
+        "--target1", "100.0",
+        "--poll", "10",
+        "--product", "NRML",
+        "--order-type", "MARKET",
+        "--limit-buffer-pts", "3.0",
+        "--dry-run",
+        "--once",
+    ])
+    assert args.live is True
+    assert args.paper is False
+    assert args.lots == 4
+    assert args.sl == 60.0
+    assert args.target1 == 100.0
+    assert args.poll == 10
+    assert args.product == "NRML"
+    assert args.order_type == "MARKET"
+    assert args.limit_buffer_pts == 3.0
+    assert args.dry_run is True
+    assert args.once is True
+
+
+def test_run_nifty_orb_main_dry_run(monkeypatch, tmp_path):
+    from run_nifty_orb import main
+
+    monkeypatch.setattr("run_nifty_orb.load_config", lambda: MagicMock(telegram_bot_token=None, chat_id=None))
+    monkeypatch.setattr("run_nifty_orb.get_kite_client", lambda config: None)
+    monkeypatch.setattr("run_nifty_orb.TelegramNotifier", MagicMock)
+    state_file = str(tmp_path / "nifty_dry_run_state.json")
+
+    code = main(["--paper", "--dry-run", "--state-file", state_file, "--log-dir", str(tmp_path)])
+    assert code == 0
+
+
+def test_run_nifty_orb_main_once(monkeypatch, tmp_path):
+    from run_nifty_orb import main
+
+    monkeypatch.setattr("run_nifty_orb.load_config", lambda: MagicMock(telegram_bot_token=None, chat_id=None))
+    monkeypatch.setattr("run_nifty_orb.get_kite_client", lambda config: None)
+    monkeypatch.setattr("run_nifty_orb.TelegramNotifier", MagicMock)
+    state_file = str(tmp_path / "nifty_once_state.json")
+
+    code = main(["--paper", "--once", "--state-file", state_file, "--log-dir", str(tmp_path)])
+    assert code == 0
+
+
+
+
