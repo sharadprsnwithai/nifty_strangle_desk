@@ -43,7 +43,7 @@ def parse_args(args=None):
     parser.add_argument("--target1", type=float, default=800.0, help="Lot 1 Target in points (default: 800.0)")
     parser.add_argument("--poll", type=int, default=5, help="Polling interval in seconds (default: 5)")
     parser.add_argument("--product", choices=["MIS", "NRML"], default="MIS", help="Product type (default: MIS)")
-    parser.add_argument("--order-type", choices=["MARKET", "LIMIT"], default="MARKET", help="Order execution type (default: MARKET)")
+    parser.add_argument("--order-type", choices=["MARKET", "LIMIT"], default="LIMIT", help="Order execution type (default: LIMIT)")
     parser.add_argument("--limit-buffer-pts", type=float, default=80.0, help="Marketable limit price buffer in points if LIMIT is used (default: 80.0)")
     parser.add_argument("--state-file", type=str, default=os.getenv("SILVER_STATE_FILE", "data/silver_trades_today.json"), help="State file path")
     parser.add_argument("--dry-run", action="store_true", help="Inspect active contract and day state without trading")

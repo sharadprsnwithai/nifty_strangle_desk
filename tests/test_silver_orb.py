@@ -607,3 +607,26 @@ def test_closed_candle_filtering():
     assert sig["direction"] == "LONG"
 
 
+def test_default_order_type_is_limit_with_buffer():
+    """Verify that SilverORBConfig and SilverOrderManager default to LIMIT with 80 pts buffer to satisfy Zerodha RMS."""
+    cfg = SilverORBConfig()
+    assert cfg.order_type == "LIMIT"
+    assert cfg.limit_buffer_pts == 80.0
+
+    mock_kite = MagicMock()
+    mock_kite.place_order.return_value = "ORDER_LIMIT_DEFAULT"
+    mock_kite.order_history.return_value = [{"status": "COMPLETE", "average_price": 164527.0}]
+
+    om = SilverOrderManager(mode="LIVE", kite=mock_kite)
+    assert om.order_type == "LIMIT"
+    assert om.limit_buffer_pts == 80.0
+
+    # Short entry test: SELL LIMIT should be priced at (order_price - 80.0)
+    res = om.place_entry("SILVERM26NOVFUT", "SHORT", 2, 164607.0, 165107.0, 163807.0)
+    assert res["status"] == "COMPLETE"
+    call_kwargs = mock_kite.place_order.call_args[1]
+    assert call_kwargs["order_type"] == mock_kite.ORDER_TYPE_LIMIT
+    assert call_kwargs["price"] == 164607.0 - 80.0  # 164527.0
+
+
+

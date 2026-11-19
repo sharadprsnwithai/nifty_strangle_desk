@@ -25,8 +25,8 @@ class SilverORBConfig:
     mode: str = "PAPER"            # "PAPER" or "LIVE"
     product: str = "MIS"           # "MIS" for intraday, "NRML" for carry/margin
     exchange: str = "MCX"
-    order_type: str = "MARKET"     # "MARKET" or "LIMIT"
-    limit_buffer_pts: float = 80.0 # Slippage buffer in points if LIMIT is selected
+    order_type: str = "LIMIT"      # Marketable LIMIT order with protection buffer
+    limit_buffer_pts: float = 80.0 # Slippage buffer in points for LIMIT order
     poll_interval_seconds: int = 5
 
     state_file: str = "data/silver_trades_today.json"

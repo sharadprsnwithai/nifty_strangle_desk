@@ -23,8 +23,8 @@ class SilverOrderManager:
         kite: Optional[KiteConnect] = None,
         exchange: str = "MCX",
         product: str = "MIS",
-        order_type: str = "MARKET",
-        limit_buffer_pts: float = 50.0,
+        order_type: str = "LIMIT",
+        limit_buffer_pts: float = 80.0,
     ):
         self.mode = mode.upper()
         if self.mode not in ("PAPER", "LIVE"):
