@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 from strategy.nifty_orb.config import NiftyORBConfig
 from strategy.nifty_orb.contract_resolver import resolve_active_nifty_fut_contract
+from strategy.nifty_orb.order_manager import NiftyOrderManager
 
 
 def test_nifty_orb_config_defaults():
@@ -108,3 +109,64 @@ def test_resolve_active_nifty_fut_contract_no_candidates():
     mock_kite.instruments.return_value = []
     with pytest.raises(ValueError, match="No active NIFTY FUT contracts found"):
         resolve_active_nifty_fut_contract(mock_kite, today_d=date(2026, 11, 19))
+
+
+def test_order_manager_paper_execution():
+    om = NiftyOrderManager(mode="PAPER", limit_buffer_pts=5.0)
+
+    # Calculate limit price with buffer
+    buy_limit = om.calculate_limit_price("BUY", 24000.0)
+    assert buy_limit == 24005.0
+
+    sell_limit = om.calculate_limit_price("SELL", 24000.0)
+    assert sell_limit == 23995.0
+
+    # Place paper buy order
+    res = om.place_order(
+        symbol="NIFTY26NOVFUT",
+        transaction_type="BUY",
+        quantity=130,
+        trigger_price=24000.0,
+    )
+    assert res["status"] == "COMPLETE"
+    assert res["order_id"].startswith("PAPER_")
+    assert res["price"] == 24000.0
+    assert res["quantity"] == 130
+
+
+def test_order_manager_live_execution():
+    mock_kite = MagicMock()
+    mock_kite.VARIETY_REGULAR = "regular"
+    mock_kite.ORDER_TYPE_LIMIT = "LIMIT"
+    mock_kite.ORDER_TYPE_MARKET = "MARKET"
+    mock_kite.place_order.return_value = "241119000123"
+
+    om = NiftyOrderManager(mode="LIVE", kite=mock_kite, limit_buffer_pts=5.0)
+    res = om.place_order(
+        symbol="NIFTY26NOVFUT",
+        transaction_type="BUY",
+        quantity=130,
+        trigger_price=24000.0,
+    )
+    assert res["status"] == "COMPLETE"
+    assert res["order_id"] == "241119000123"
+    assert res["price"] == 24000.0
+    assert res["quantity"] == 130
+    mock_kite.place_order.assert_called_once_with(
+        variety="regular",
+        exchange="NFO",
+        tradingsymbol="NIFTY26NOVFUT",
+        transaction_type="BUY",
+        quantity=130,
+        product="MIS",
+        order_type="LIMIT",
+        price=24005.0,
+        tag="NIFTY_ORB",
+    )
+
+
+def test_order_manager_live_no_kite():
+    om = NiftyOrderManager(mode="LIVE", kite=None)
+    with pytest.raises(RuntimeError, match="Live mode enabled but KiteConnect client is None"):
+        om.place_order(symbol="NIFTY26NOVFUT", transaction_type="BUY", quantity=130)
+
