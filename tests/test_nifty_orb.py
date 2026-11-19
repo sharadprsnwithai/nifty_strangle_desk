@@ -14,7 +14,7 @@ def test_nifty_orb_config_defaults():
     assert cfg.initial_sl_pts == 50.0
     assert cfg.target1_pts == 75.0
     assert cfg.ref_start_time == time(9, 15)
-    assert cfg.ref_end_time == time(9, 45)
+    assert cfg.ref_end_time == time(10, 15)
     assert cfg.trade_window_end == time(13, 30)
     assert cfg.session_cutoff_time == time(15, 15)
     assert cfg.vol_multiplier == 1.2
@@ -209,7 +209,7 @@ def test_evaluate_reference_range():
 
     ref = desk.evaluate_reference_range(df, target_day=date(2026, 11, 19))
     assert ref is not None
-    assert ref["ref_high"] == 24120.0
+    assert ref["ref_high"] == 24150.0
     assert ref["ref_low"] == 23980.0
 
     # Test edge case: < 2 bars
@@ -325,22 +325,22 @@ def test_desk_lifecycle_target1_then_cost(tmp_path):
     t_day = date(2026, 11, 19)
     desk.initialize_day(today_d=t_day)
 
-    # 09:30: Range not yet formed (ref_end_time is 09:45)
+    # 10:00: Range not yet formed (ref_end_time is 10:15)
     df_range = pd.DataFrame([
         {"date": datetime(2026, 11, 19, 9, 15), "high": 24100.0, "low": 24000.0, "close": 24050.0, "volume": 1000},
         {"date": datetime(2026, 11, 19, 9, 30), "high": 24120.0, "low": 23980.0, "close": 24070.0, "volume": 1200},
     ])
     desk.run_monitoring_cycle(
-        current_time=time(9, 30),
-        current_dt=datetime(2026, 11, 19, 9, 30),
+        current_time=time(10, 0),
+        current_dt=datetime(2026, 11, 19, 10, 0),
         mock_df=df_range,
     )
     assert desk.state["status"] == "INITIALIZING"
 
-    # 09:45: Range is established
+    # 10:15: Range is established
     desk.run_monitoring_cycle(
-        current_time=time(9, 45),
-        current_dt=datetime(2026, 11, 19, 9, 45),
+        current_time=time(10, 15),
+        current_dt=datetime(2026, 11, 19, 10, 15),
         mock_df=df_range,
     )
     assert desk.state["status"] == "SCANNING"
@@ -348,7 +348,7 @@ def test_desk_lifecycle_target1_then_cost(tmp_path):
     assert desk.state["ref_low"] == 23980.0
     mock_notifier.send_message.assert_called()  # Range notification
 
-    # 10:00: Breakout candle closes above ref_high
+    # 10:30: Breakout candle closes above ref_high
     df_breakout = create_sample_15m_candles(num_bars=55, base_price=24000.0, trend="UP")
     df_breakout.loc[df_breakout.index[-1], "high"] = 24150.0
     df_breakout.loc[df_breakout.index[-1], "close"] = 24130.0
@@ -368,10 +368,10 @@ def test_desk_lifecycle_target1_then_cost(tmp_path):
     assert trade["sl_price"] == 24080.0  # -50 pts
     assert trade["target1_price"] == 24205.0  # +75 pts
 
-    # 10:30: LTP hits Target 1 (+75 pts -> 24205.0)
+    # 10:45: LTP hits Target 1 (+75 pts -> 24205.0)
     desk.run_monitoring_cycle(
-        current_time=time(10, 30),
-        current_dt=datetime(2026, 11, 19, 10, 30),
+        current_time=time(10, 45),
+        current_dt=datetime(2026, 11, 19, 10, 45),
         mock_df=df_breakout,
         mock_ltp=24205.0,
     )
@@ -404,9 +404,10 @@ def test_desk_lifecycle_target1_then_session_cutoff(tmp_path):
         {"date": datetime(2026, 11, 19, 9, 15), "high": 24120.0, "low": 23980.0, "close": 24070.0, "volume": 1200},
         {"date": datetime(2026, 11, 19, 9, 30), "high": 24120.0, "low": 23980.0, "close": 24070.0, "volume": 1200},
     ])
+    # 10:15: Range is established
     desk.run_monitoring_cycle(
-        current_time=time(9, 45),
-        current_dt=datetime(2026, 11, 19, 9, 45),
+        current_time=time(10, 15),
+        current_dt=datetime(2026, 11, 19, 10, 15),
         mock_df=df_range,
     )
 
@@ -458,9 +459,10 @@ def test_desk_lifecycle_initial_stop_loss(tmp_path):
         {"date": datetime(2026, 11, 19, 9, 15), "high": 24120.0, "low": 23980.0, "close": 24070.0, "volume": 1200},
         {"date": datetime(2026, 11, 19, 9, 30), "high": 24120.0, "low": 23980.0, "close": 24070.0, "volume": 1200},
     ])
+    # 10:15: Range is established
     desk.run_monitoring_cycle(
-        current_time=time(9, 45),
-        current_dt=datetime(2026, 11, 19, 9, 45),
+        current_time=time(10, 15),
+        current_dt=datetime(2026, 11, 19, 10, 15),
         mock_df=df_range,
     )
 
@@ -504,9 +506,10 @@ def test_desk_scanning_cutoff(tmp_path):
         {"date": datetime(2026, 11, 19, 9, 15), "high": 24120.0, "low": 23980.0, "close": 24070.0, "volume": 1200},
         {"date": datetime(2026, 11, 19, 9, 30), "high": 24120.0, "low": 23980.0, "close": 24070.0, "volume": 1200},
     ])
+    # 10:15: Range is established
     desk.run_monitoring_cycle(
-        current_time=time(9, 45),
-        current_dt=datetime(2026, 11, 19, 9, 45),
+        current_time=time(10, 15),
+        current_dt=datetime(2026, 11, 19, 10, 15),
         mock_df=df_range,
     )
     assert desk.state["status"] == "SCANNING"

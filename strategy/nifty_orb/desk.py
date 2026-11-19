@@ -139,14 +139,17 @@ class NiftyORBDesk:
         if not self.notifier:
             return
         rng_pts = r_high - r_low
+        start_str = self.config.ref_start_time.strftime("%H:%M")
+        end_str = self.config.ref_end_time.strftime("%H:%M")
+        label = "1-HOUR" if (self.config.ref_end_time.hour - self.config.ref_start_time.hour) >= 1 else "30-MIN"
         msg = (
-            f"🔔 <b>NIFTY 30-MIN ORB RANGE ESTABLISHED [{self.config.mode}]</b>\n\n"
+            f"🔔 <b>NIFTY {label} ORB RANGE ESTABLISHED [{self.config.mode}]</b>\n\n"
             f"Contract: <code>{sym}</code>\n"
-            f"Window: <b>09:15 – 09:45 IST</b>\n"
+            f"Window: <b>{start_str} – {end_str} IST</b>\n"
             f"High: <b>₹{r_high:,.1f}</b>\n"
             f"Low: <b>₹{r_low:,.1f}</b> (Spread: {rng_pts:.1f} pts)\n"
             f"15m 50 EMA: <b>₹{ema50:,.1f}</b>\n\n"
-            f"Breakout evaluation is active until 13:30 IST."
+            f"Breakout evaluation is active until {self.config.trade_window_end.strftime('%H:%M')} IST."
         )
         self.notifier.send_message(msg)
 
@@ -246,7 +249,7 @@ class NiftyORBDesk:
             return None
 
     def evaluate_reference_range(self, df: pd.DataFrame, target_day: Optional[date] = None) -> Optional[Dict[str, float]]:
-        """Calculates 30-min ORB High and Low across 09:15 and 09:30 bars."""
+        """Calculates Opening Range High and Low between ref_start_time and ref_end_time."""
         if df is None or len(df) < 2:
             return None
         t_day = target_day or date.today()
@@ -257,7 +260,7 @@ class NiftyORBDesk:
             work_df["time"] = pd.to_datetime(work_df["date"]).dt.time
 
         day_bars = work_df[work_df["day"] == t_day]
-        ref_bars = day_bars[(day_bars["time"] >= dt_time(9, 15)) & (day_bars["time"] <= dt_time(9, 30))]
+        ref_bars = day_bars[(day_bars["time"] >= self.config.ref_start_time) & (day_bars["time"] < self.config.ref_end_time)]
         if len(ref_bars) < 2:
             return None
 
@@ -333,7 +336,8 @@ class NiftyORBDesk:
         if candle_time is None and "date" in latest_bar and hasattr(latest_bar["date"], "time"):
             candle_time = latest_bar["date"].time()
 
-        if long_ok:
+        d_mode = getattr(self.config, "direction_mode", "BOTH").upper()
+        if long_ok and d_mode in ("BOTH", "LONG"):
             return {
                 "direction": "LONG",
                 "trigger_price": b_close,
@@ -341,7 +345,7 @@ class NiftyORBDesk:
                 "ref_low": ref_low,
                 "candle_time": candle_time,
             }
-        elif short_ok:
+        elif short_ok and d_mode in ("BOTH", "SHORT"):
             return {
                 "direction": "SHORT",
                 "trigger_price": b_close,

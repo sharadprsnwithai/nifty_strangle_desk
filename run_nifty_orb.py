@@ -3,7 +3,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, time as dt_time
 
 # Ensure stdout and stderr handle UTF-8 characters gracefully
 if hasattr(sys.stdout, "reconfigure"):
@@ -28,7 +28,7 @@ logger = logging.getLogger("run_nifty_orb")
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(
-        description="Sharad's NIFTY 50 Index 30-Min ORB Futures Trading Desk"
+        description="Sharad's NIFTY 50 Index 1-Hour ORB Futures Trading Desk"
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -38,6 +38,8 @@ def parse_args(args=None):
         "--live", action="store_true", help="Execute real LIVE orders via Kite Connect"
     )
 
+    parser.add_argument("--orb-window", choices=["1H", "30M"], default="1H", help="Opening range window: 1H (09:15-10:15) or 30M (09:15-09:45) (default: 1H)")
+    parser.add_argument("--direction", choices=["BOTH", "SHORT", "LONG"], default="BOTH", help="Breakout direction allowed (default: BOTH)")
     parser.add_argument("--lots", type=int, default=2, help="Number of Nifty Futures lots (default: 2)")
     parser.add_argument("--sl", type=float, default=50.0, help="Initial Stop Loss in points (default: 50.0)")
     parser.add_argument("--target1", type=float, default=75.0, help="Tranche 1 Target in points (default: 75.0)")
@@ -64,9 +66,11 @@ def main(args=None) -> int:
 
     t1_lots = max(1, parsed.lots // 2)
     t2_lots = parsed.lots - t1_lots
+    ref_end = dt_time(10, 15) if parsed.orb_window == "1H" else dt_time(9, 45)
 
     logger.info("=" * 75)
-    logger.info("  STARTING NIFTY 50 INDEX 30-MIN ORB FUTURES DESK [%s MODE]", mode)
+    logger.info("  STARTING NIFTY 50 INDEX %s ORB FUTURES DESK [%s MODE]", parsed.orb_window, mode)
+    logger.info("  Window: 09:15 - %s IST | Direction: %s", ref_end.strftime("%H:%M"), parsed.direction)
     logger.info("  Lots: %d | Initial SL: %.1f pts | Tranche 1 Target: %.1f pts", parsed.lots, parsed.sl, parsed.target1)
     logger.info("  Plan: Book Tranche 1 (%d lots) @ +%.1f pts & Move SL to Cost; Runner (%d lots) rides to 15:15 IST", t1_lots, parsed.target1, t2_lots)
     logger.info("=" * 75)
@@ -79,6 +83,8 @@ def main(args=None) -> int:
         lots=parsed.lots,
         initial_sl_pts=parsed.sl,
         target1_pts=parsed.target1,
+        ref_end_time=ref_end,
+        direction_mode=parsed.direction,
         mode=mode,
         product=parsed.product,
         order_type=parsed.order_type,

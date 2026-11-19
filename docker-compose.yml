@@ -173,15 +173,15 @@ services:
       - ./logs:/app/logs
       - ./.env:/app/.env
     # -----------------------------------------------------------------------------------
-    # NIFTY 50 30-Min ORB Futures Desk (2-Lot Tranche Scaling):
-    # - Reference: 09:15 - 09:45 IST, 15m confirmation bars
+    # NIFTY 50 1-Hour ORB Futures Desk (2-Lot Tranche Scaling):
+    # - Reference: 09:15 - 10:15 IST (1-hour opening range), 15m confirmation bars
     # - Risk: 2 Lots, SL: 50 pts
     # - Tranche: Tranche 1 (1 Lot) booked @ +75 pts; Runner (1 Lot) trailed to Cost & rides to 15:15
     #
     # 1. Paper Trading Mode (Default Simulation):
-    command: ["--paper", "--lots", "2", "--sl", "50", "--target1", "75", "--order-type", "LIMIT", "--limit-buffer-pts", "5.0", "--poll", "5"]
+    command: ["--paper", "--orb-window", "1H", "--lots", "2", "--sl", "50", "--target1", "75", "--order-type", "LIMIT", "--limit-buffer-pts", "5.0", "--poll", "5"]
     #
     # 2. Live Production Mode (Live Broker Execution via Kite Connect):
-    # command: ["--live", "--lots", "2", "--sl", "50", "--target1", "75", "--order-type", "LIMIT", "--limit-buffer-pts", "5.0", "--poll", "5"]
+    # command: ["--live", "--orb-window", "1H", "--lots", "2", "--sl", "50", "--target1", "75", "--order-type", "LIMIT", "--limit-buffer-pts", "5.0", "--poll", "5"]
     # -----------------------------------------------------------------------------------
 
