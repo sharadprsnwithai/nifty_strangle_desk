@@ -370,10 +370,26 @@ class SilverORBDesk:
         if self.config.mode != "LIVE" or not self.kite:
             return {"status": "BYPASS", "available_cash": 999999.0}
         try:
+            # Check profile exchanges to verify if MCX segment is enabled
+            is_mcx_enabled = True
+            try:
+                prof = self.kite.profile()
+                exchanges = prof.get("exchanges", [])
+                if exchanges and "MCX" not in exchanges:
+                    is_mcx_enabled = False
+            except Exception as prof_err:
+                logger.debug("Could not verify profile exchanges: %s", prof_err)
+
+            if not is_mcx_enabled:
+                return {"status": "DISABLED", "available_cash": 0.0}
+
             margins = self.kite.margins("commodity")
             available = float(margins.get("available", {}).get("cash", 0.0) or margins.get("net", 0.0))
-            enabled = margins.get("enabled", True)
-            return {"status": "OK" if enabled else "DISABLED", "available_cash": available}
+
+            if available <= 0.0:
+                return {"status": "INSUFFICIENT_FUNDS", "available_cash": available}
+
+            return {"status": "OK", "available_cash": available}
         except Exception as e:
             logger.warning("Failed to query commodity margins from Kite: %s", e)
             return {"status": "ERROR", "available_cash": 0.0}
@@ -717,7 +733,12 @@ class SilverORBDesk:
         sym = contract["tradingsymbol"]
         token = int(contract["instrument_token"])
 
-        # Pre-flight commodity margin check between 17:45 and 18:00
+        # Step 1: Wait quietly until pre-US session window (17:45 IST)
+        if current_t < self.config.ref_candle_time:
+            logger.debug("Pre-US window (%s). Waiting for 17:45 IST reference candle.", current_t.strftime("%H:%M:%S"))
+            return state
+
+        # Step 1b: Pre-flight commodity margin check strictly between 17:45 and 18:00
         if current_t < self.config.trade_window_start:
             if state.get("margin_checked") is None:
                 margin_info = self.check_available_margin()
@@ -725,9 +746,16 @@ class SilverORBDesk:
                 state["available_commodity_cash"] = margin_info.get("available_cash")
                 self.save_state(state)
                 if margin_info.get("status") == "DISABLED":
-                    logger.error("MCX Commodity trading segment appears disabled on your Zerodha account!")
+                    logger.error("MCX Commodity trading segment is disabled on your Zerodha account!")
                     if self.notifier:
                         self.notifier.send_message("⚠️ *MCX Alert:* Commodity trading segment appears disabled on your Zerodha account!")
+                elif margin_info.get("status") == "INSUFFICIENT_FUNDS":
+                    logger.warning("MCX Commodity cash balance is ₹0.00. Funds required to trade Silver Mini.")
+                    if self.notifier:
+                        self.notifier.send_message(
+                            "⚠️ *MCX Margin Alert:* Commodity cash balance is ₹0.00.\n"
+                            "Your MCX segment is active, but funds must be transferred from Equity to Commodity on Zerodha to trade Silver Mini."
+                        )
                 elif margin_info.get("status") == "OK":
                     cash = float(margin_info.get("available_cash", 0.0))
                     logger.info("Pre-flight commodity margin check: Rs %.2f available", cash)

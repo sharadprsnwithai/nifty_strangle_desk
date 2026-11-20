@@ -870,6 +870,40 @@ def test_fetch_recent_candles_uses_35_days_for_slot_profiling():
     assert (to_d - from_d).days == 35
 
 
+def test_midnight_cycle_does_not_fire_margin_check_or_alerts():
+    """Verify that when run_session_cycle runs at midnight, it waits quietly for 17:45 without triggering alerts."""
+    mock_kite = MagicMock()
+    mock_notifier = MagicMock()
+    cfg = SilverORBConfig(mode="LIVE")
+    desk = SilverORBDesk(config=cfg, kite=mock_kite, notifier=mock_notifier)
+
+    # Simulate 00:05:00 AM (midnight)
+    midnight_dt = datetime(2026, 11, 20, 0, 5, 0)
+    with patch("strategy.silver_orb.desk.resolve_active_silverm_contract", return_value={"tradingsymbol": "SILVERM26NOVFUT", "instrument_token": 123, "expiry": "2026-11-30"}):
+        state = desk.run_session_cycle(current_dt=midnight_dt)
+
+    assert state.get("margin_checked") is None
+    mock_kite.margins.assert_not_called()
+    mock_notifier.send_message.assert_not_called()
+
+
+def test_check_available_margin_distinguishes_zero_funds_from_disabled_segment():
+    """Verify that if MCX is in profile exchanges but cash is 0, status is INSUFFICIENT_FUNDS, not DISABLED."""
+    mock_kite = MagicMock()
+    # Profile has MCX enabled
+    mock_kite.profile.return_value = {"exchanges": ["NSE", "NFO", "MCX"]}
+    # Margin returns 0 cash
+    mock_kite.margins.return_value = {"available": {"cash": 0.0}, "net": 0.0}
+
+    cfg = SilverORBConfig(mode="LIVE")
+    desk = SilverORBDesk(config=cfg, kite=mock_kite)
+    res = desk.check_available_margin()
+
+    assert res["status"] == "INSUFFICIENT_FUNDS"
+    assert res["available_cash"] == 0.0
+
+
+
 
 
 
