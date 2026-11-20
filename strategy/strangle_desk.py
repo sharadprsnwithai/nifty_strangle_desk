@@ -109,7 +109,7 @@ class StrangleDesk:
         print(f"Order Sizing  : {strikes['total_lots']} lots ({strikes['total_quantity']} qty)")
         print(f"CALL Leg      : {ce_info['symbol']} @ Rs {ce_info['ltp']:.2f} | Target: Rs {ce_info['target_price']:.2f} (80% decay)")
         print(f"PUT Leg       : {pe_info['symbol']} @ Rs {pe_info['ltp']:.2f} | Target: Rs {pe_info['target_price']:.2f} (80% decay)")
-        print(f"Exit Rules    : Combined loss > Rs 10k (both exit) | Target: 80% decay (both exit) | Cutoff: 14:45 IST")
+        print(f"Exit Rules    : Single-Leg 50% SL (winner stays open & trails to cost) | Target: 80% decay | Cutoff: 14:45 IST")
         print("=" * 65 + "\n")
 
     @staticmethod
@@ -632,6 +632,8 @@ class StrangleDesk:
         execute_once: bool = False,
         kite: Optional[KiteConnect] = None,
         strategy_max_loss: Optional[float] = 10000.0,
+        use_leg_sl: bool = True,
+        trail_to_cost: bool = True,
         order_type: str = "LIMIT",
         limit_buffer_pct: float = 0.05,
         ignore_holidays: bool = False,
@@ -646,7 +648,8 @@ class StrangleDesk:
         """
         Executes and monitors the 10:00 AM Short Strangle intraday session.
         Handles holiday skip, morning trend filter skip (>0.60% range), dynamic ATR strike discovery,
-        dual-leg entry, live quote polling, combined portfolio stop-loss (₹10k), decay target, and 2:45 PM square-off.
+        dual-leg entry, live quote polling, single-leg stop loss (50% SL / ₹10k exit on losing leg only),
+        breakeven trailing on winning leg, decay target, and 2:45 PM square-off.
         """
         if not ignore_holidays:
             is_holiday, reason = is_trading_holiday()
@@ -981,13 +984,18 @@ class StrangleDesk:
 
             if self.notifier:
                 risk_cap_str = f"Max Rs {strategy_max_loss:,.0f} portfolio loss" if strategy_max_loss is not None else "None"
+                exit_rule_desc = (
+                    f"Single-Leg 50% SL (winner stays open & trails to cost) | Target: 80% decay | Cutoff: 14:45 IST"
+                    if use_leg_sl
+                    else f"Portfolio SL: {risk_cap_str} | Target: 80% decay (both exit) | Cutoff: 14:45 IST"
+                )
                 entry_msg = (
                     f"🚀 <b>NIFTY 10:00 AM Strangle Opened [{mode}]</b>\n"
                     f"Expiry: <code>{strikes['expiry']}</code> | Qty: {total_qty} ({strikes['total_lots']} lots)\n"
                     f"Order Type: <code>{order_type}</code> (Buffer: {limit_buffer_pct*100:.0f}%)\n"
                     f"• <b>CALL</b>: <code>{ce_info['symbol']}</code> @ Rs {ce_exec_price:.2f} | Target: Rs {ce_tgt:.2f}\n"
                     f"• <b>PUT</b>: <code>{pe_info['symbol']}</code> @ Rs {pe_exec_price:.2f} | Target: Rs {pe_tgt:.2f}\n"
-                    f"• <b>Exit Rules</b>: Portfolio SL: {risk_cap_str} | Target: 80% decay (both exit) | Cutoff: 14:45 IST"
+                    f"• <b>Exit Rules</b>: {exit_rule_desc}"
                 )
                 self.notifier.send_message(entry_msg)
 
@@ -1107,33 +1115,111 @@ class StrangleDesk:
                 total_strategy_pnl
             )
 
-            # Evaluate strategy-level portfolio stop loss (both legs exit simultaneously if combined loss > 10k)
+            # 1. Evaluate strategy-level portfolio stop loss (circuit breaker)
             effective_max_loss = strategy_max_loss if strategy_max_loss is not None else 10000.0
             if total_strategy_pnl <= -effective_max_loss:
-                logger.warning(
-                    "Total strategy loss Rs %.2f >= limit Rs %.2f. Triggering immediate portfolio exit for all open legs simultaneously.",
-                    abs(total_strategy_pnl), effective_max_loss
-                )
-                if state["ce"].get("status") == "OPEN":
-                    self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
-                if state["pe"].get("status") == "OPEN":
-                    self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
-                if self.notifier:
-                    total_day_pnl = self._get_current_day_pnl(state, qty)
-                    self.notifier.send_message(
-                        f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}. Exited all open legs!\n\n"
-                        f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
+                if use_leg_sl:
+                    # In single-leg mode, do NOT dump both legs simultaneously!
+                    # Only exit the losing leg, letting the winning leg cushion the drawdown
+                    if state["ce"].get("status") == "OPEN" and state["pe"].get("status") == "OPEN":
+                        if ce_pnl < pe_pnl:
+                            logger.warning(
+                                "Combined loss Rs %.2f >= limit Rs %.2f. Exiting losing CE leg (PnL: Rs %.2f). PE remains OPEN.",
+                                abs(total_strategy_pnl), effective_max_loss, ce_pnl
+                            )
+                            if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "SINGLE_LEG_10K_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
+                                if trail_to_cost and state["pe"].get("status") == "OPEN":
+                                    state["pe"]["sl_price"] = pe_entry
+                                    self.save_state(state)
+                                if self.notifier:
+                                    total_day_pnl = self._get_current_day_pnl(state, qty)
+                                    self.notifier.send_message(
+                                        f"🚨 <b>PORTFOLIO 10K THRESHOLD HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}.\n"
+                                        f"Exited losing CE leg @ ₹{ce_ltp:.2f} (Loss: ₹{ce_pnl:+,.2f}).\n"
+                                        f"PE leg remains <b>OPEN</b> (trailed to cost ₹{pe_entry:.2f}) to harvest decay!\n\n"
+                                        f"📊 <b>Current Day P&L: ₹{total_day_pnl:+,.2f}</b>"
+                                    )
+                        else:
+                            logger.warning(
+                                "Combined loss Rs %.2f >= limit Rs %.2f. Exiting losing PE leg (PnL: Rs %.2f). CE remains OPEN.",
+                                abs(total_strategy_pnl), effective_max_loss, pe_pnl
+                            )
+                            if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "SINGLE_LEG_10K_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
+                                if trail_to_cost and state["ce"].get("status") == "OPEN":
+                                    state["ce"]["sl_price"] = ce_entry
+                                    self.save_state(state)
+                                if self.notifier:
+                                    total_day_pnl = self._get_current_day_pnl(state, qty)
+                                    self.notifier.send_message(
+                                        f"🚨 <b>PORTFOLIO 10K THRESHOLD HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}.\n"
+                                        f"Exited losing PE leg @ ₹{pe_ltp:.2f} (Loss: ₹{pe_pnl:+,.2f}).\n"
+                                        f"CE leg remains <b>OPEN</b> (trailed to cost ₹{ce_entry:.2f}) to harvest decay!\n\n"
+                                        f"📊 <b>Current Day P&L: ₹{total_day_pnl:+,.2f}</b>"
+                                    )
+                    elif state["ce"].get("status") == "OPEN":
+                        # Only CE leg was still open
+                        self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                        if self.notifier:
+                            total_day_pnl = self._get_current_day_pnl(state, qty)
+                            self.notifier.send_message(
+                                f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}. Exited remaining CE leg!\n\n"
+                                f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
+                            )
+                    elif state["pe"].get("status") == "OPEN":
+                        # Only PE leg was still open
+                        self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                        if self.notifier:
+                            total_day_pnl = self._get_current_day_pnl(state, qty)
+                            self.notifier.send_message(
+                                f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}. Exited remaining PE leg!\n\n"
+                                f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
+                            )
+                else:
+                    # Legacy Option 3 dual-leg simultaneous exit
+                    logger.warning(
+                        "Total strategy loss Rs %.2f >= limit Rs %.2f. Triggering immediate portfolio exit for all open legs simultaneously.",
+                        abs(total_strategy_pnl), effective_max_loss
                     )
+                    if state["ce"].get("status") == "OPEN":
+                        self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                    if state["pe"].get("status") == "OPEN":
+                        self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                    if self.notifier:
+                        total_day_pnl = self._get_current_day_pnl(state, qty)
+                        self.notifier.send_message(
+                            f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}. Exited all open legs!\n\n"
+                            f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
+                        )
 
-            # Evaluate CE leg (decay target profit taking only; individual leg loss exit removed)
-            # When one leg hits decay target, close BOTH legs to avoid naked single-leg risk
+            # 2. Evaluate individual CE leg
             if state["ce"].get("status") == "OPEN":
+                ce_sl = state["ce"].get("sl_price")
                 ce_target = state["ce"].get("target_price")
-                if ce_target is not None and ce_ltp <= ce_target:
-                    logger.info("CE Decay Target reached! LTP: %.2f <= Target: %.2f. Closing both legs.", ce_ltp, ce_target)
+
+                if use_leg_sl and ce_sl is not None and ce_ltp >= ce_sl:
+                    logger.warning("CE Stop-Loss hit! LTP: %.2f >= SL: %.2f. Exiting CE leg only.", ce_ltp, ce_sl)
+                    if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
+                        # Trail opposite PE leg to breakeven/cost
+                        if trail_to_cost and state["pe"].get("status") == "OPEN":
+                            state["pe"]["sl_price"] = pe_entry
+                            self.save_state(state)
+                            logger.info("Trailed PE stop-loss to cost/breakeven: %.2f", pe_entry)
+                        if self.notifier:
+                            leg_pnl = (ce_entry - ce_ltp) * qty
+                            total_day_pnl = self._get_current_day_pnl(state, qty)
+                            trail_note = f"\nPE leg stop loss trailed to cost (₹{pe_entry:.2f})." if (trail_to_cost and state['pe'].get('status') == 'OPEN') else ""
+                            self.notifier.send_message(
+                                f"🛑 <b>STOP LOSS HIT</b>: CE <code>{ce_sym}</code> exited @ ₹{ce_ltp:.2f} (SL: ₹{ce_sl:.2f})\n"
+                                f"PE leg remains <b>OPEN</b> to harvest theta decay!{trail_note}\n"
+                                f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
+                                f"📊 <b>Current Day P&L: ₹{total_day_pnl:+,.2f}</b>"
+                            )
+
+                elif ce_target is not None and ce_ltp <= ce_target:
+                    logger.info("CE Decay Target reached! LTP: %.2f <= Target: %.2f.", ce_ltp, ce_target)
                     if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
-                        # Close opposite PE leg simultaneously to avoid naked single-leg risk
-                        if state["pe"].get("status") == "OPEN":
+                        # If legacy dual-leg mode, close opposite PE
+                        if not use_leg_sl and state["pe"].get("status") == "OPEN":
                             self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
                         if self.notifier:
                             ce_entry = float(state["ce"]["entry_price"])
@@ -1141,20 +1227,39 @@ class StrangleDesk:
                             total_day_pnl = self._get_current_day_pnl(state, qty)
                             self.notifier.send_message(
                                 f"🎯 <b>DECAY TARGET REACHED</b>: CE <code>{ce_sym}</code> exited @ ₹{ce_ltp:.2f} (Target: ₹{ce_target:.2f})\n"
-                                f"Both legs closed to avoid naked risk.\n"
                                 f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
                                 f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
                             )
 
-            # Evaluate PE leg (decay target profit taking only; individual leg loss exit removed)
-            # When one leg hits decay target, close BOTH legs to avoid naked single-leg risk
+            # 3. Evaluate individual PE leg
             if state["pe"].get("status") == "OPEN":
+                pe_sl = state["pe"].get("sl_price")
                 pe_target = state["pe"].get("target_price")
-                if pe_target is not None and pe_ltp <= pe_target:
-                    logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f. Closing both legs.", pe_ltp, pe_target)
+
+                if use_leg_sl and pe_sl is not None and pe_ltp >= pe_sl:
+                    logger.warning("PE Stop-Loss hit! LTP: %.2f >= SL: %.2f. Exiting PE leg only.", pe_ltp, pe_sl)
+                    if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
+                        # Trail opposite CE leg to breakeven/cost
+                        if trail_to_cost and state["ce"].get("status") == "OPEN":
+                            state["ce"]["sl_price"] = ce_entry
+                            self.save_state(state)
+                            logger.info("Trailed CE stop-loss to cost/breakeven: %.2f", ce_entry)
+                        if self.notifier:
+                            leg_pnl = (pe_entry - pe_ltp) * qty
+                            total_day_pnl = self._get_current_day_pnl(state, qty)
+                            trail_note = f"\nCE leg stop loss trailed to cost (₹{ce_entry:.2f})." if (trail_to_cost and state['ce'].get('status') == 'OPEN') else ""
+                            self.notifier.send_message(
+                                f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ ₹{pe_ltp:.2f} (SL: ₹{pe_sl:.2f})\n"
+                                f"CE leg remains <b>OPEN</b> to harvest theta decay!{trail_note}\n"
+                                f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
+                                f"📊 <b>Current Day P&L: ₹{total_day_pnl:+,.2f}</b>"
+                            )
+
+                elif pe_target is not None and pe_ltp <= pe_target:
+                    logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f.", pe_ltp, pe_target)
                     if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
-                        # Close opposite CE leg simultaneously to avoid naked single-leg risk
-                        if state["ce"].get("status") == "OPEN":
+                        # If legacy dual-leg mode, close opposite CE
+                        if not use_leg_sl and state["ce"].get("status") == "OPEN":
                             self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
                         if self.notifier:
                             pe_entry = float(state["pe"]["entry_price"])
@@ -1162,7 +1267,6 @@ class StrangleDesk:
                             total_day_pnl = self._get_current_day_pnl(state, qty)
                             self.notifier.send_message(
                                 f"🎯 <b>DECAY TARGET REACHED</b>: PE <code>{pe_sym}</code> exited @ ₹{pe_ltp:.2f} (Target: ₹{pe_target:.2f})\n"
-                                f"Both legs closed to avoid naked risk.\n"
                                 f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
                                 f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
                             )
@@ -1203,6 +1307,8 @@ class StrangleDesk:
         poll_seconds: int = 5,
         kite: Optional[KiteConnect] = None,
         strategy_max_loss: Optional[float] = 10000.0,
+        use_leg_sl: bool = True,
+        trail_to_cost: bool = True,
         order_type: str = "LIMIT",
         limit_buffer_pct: float = 0.05,
         ignore_holidays: bool = False,
@@ -1299,6 +1405,8 @@ class StrangleDesk:
                         poll_seconds=poll_seconds,
                         kite=kite,
                         strategy_max_loss=strategy_max_loss,
+                        use_leg_sl=use_leg_sl,
+                        trail_to_cost=trail_to_cost,
                         order_type=order_type,
                         limit_buffer_pct=limit_buffer_pct,
                         ignore_holidays=ignore_holidays,
@@ -1357,6 +1465,8 @@ class StrangleDesk:
                         poll_seconds=poll_seconds,
                         kite=kite,
                         strategy_max_loss=strategy_max_loss,
+                        use_leg_sl=use_leg_sl,
+                        trail_to_cost=trail_to_cost,
                         order_type=order_type,
                         limit_buffer_pct=limit_buffer_pct,
                         ignore_holidays=ignore_holidays,

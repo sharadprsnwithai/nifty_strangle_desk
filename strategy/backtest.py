@@ -96,7 +96,8 @@ def run_backtest_simulation(
     r: float = 0.065,
     expiry_weekday: int = 1,
     strategy_max_loss: Optional[float] = 10000.0,
-    use_leg_sl: bool = False,
+    use_leg_sl: bool = True,
+    trail_opposite_to_cost: bool = True,
     exit_cutoff_time: time = time(14, 45),
     morning_filter: bool = False,
     morning_filter_threshold_pct: float = 0.60,
@@ -213,7 +214,7 @@ def run_backtest_simulation(
             bar_low_spot = float(bar["low"])
             bar_close_spot = float(bar["close"])
 
-            # 1. 5-minute Strategy-Level Loss Check (both legs exit simultaneously if combined loss >= strategy_max_loss)
+            # 1. 5-minute Strategy-Level Loss Check (both legs exit simultaneously if combined loss >= strategy_max_loss in legacy mode, or exit losing leg only in single-leg mode)
             effective_max_loss = strategy_max_loss if strategy_max_loss is not None else 10000.0
             if (ce_active or pe_active):
                 ce_5m_price = black_76_price(bar_close_spot, ce_strike, curr_dte, iv, r, "CE") if ce_active else ce_exit_price
@@ -221,17 +222,49 @@ def run_backtest_simulation(
                 current_loss = ((ce_5m_price - ce_entry) + (pe_5m_price - pe_entry)) * total_qty
 
                 if current_loss >= effective_max_loss:
-                    if ce_active:
-                        ce_active = False
-                        ce_exit_price = round(ce_5m_price, 2)
-                        ce_exit_reason = "STRATEGY_MAX_LOSS_10K"
-                        ce_exit_time = curr_dt
-                    if pe_active:
-                        pe_active = False
-                        pe_exit_price = round(pe_5m_price, 2)
-                        pe_exit_reason = "STRATEGY_MAX_LOSS_10K"
-                        pe_exit_time = curr_dt
-                    break
+                    if use_leg_sl:
+                        # In single-leg mode, exit only the losing leg if both are active
+                        if ce_active and pe_active:
+                            ce_loss = (ce_5m_price - ce_entry) * total_qty
+                            pe_loss = (pe_5m_price - pe_entry) * total_qty
+                            if ce_loss > pe_loss:
+                                ce_active = False
+                                ce_exit_price = round(ce_5m_price, 2)
+                                ce_exit_reason = "SINGLE_LEG_10K_EXIT"
+                                ce_exit_time = curr_dt
+                                if trail_opposite_to_cost and pe_active:
+                                    pe_sl = pe_entry
+                            else:
+                                pe_active = False
+                                pe_exit_price = round(pe_5m_price, 2)
+                                pe_exit_reason = "SINGLE_LEG_10K_EXIT"
+                                pe_exit_time = curr_dt
+                                if trail_opposite_to_cost and ce_active:
+                                    ce_sl = ce_entry
+                        elif ce_active:
+                            ce_active = False
+                            ce_exit_price = round(ce_5m_price, 2)
+                            ce_exit_reason = "STRATEGY_MAX_LOSS_10K"
+                            ce_exit_time = curr_dt
+                            break
+                        elif pe_active:
+                            pe_active = False
+                            pe_exit_price = round(pe_5m_price, 2)
+                            pe_exit_reason = "STRATEGY_MAX_LOSS_10K"
+                            pe_exit_time = curr_dt
+                            break
+                    else:
+                        if ce_active:
+                            ce_active = False
+                            ce_exit_price = round(ce_5m_price, 2)
+                            ce_exit_reason = "STRATEGY_MAX_LOSS_10K"
+                            ce_exit_time = curr_dt
+                        if pe_active:
+                            pe_active = False
+                            pe_exit_price = round(pe_5m_price, 2)
+                            pe_exit_reason = "STRATEGY_MAX_LOSS_10K"
+                            pe_exit_time = curr_dt
+                        break
 
             # 2. Evaluate individual CE leg
             if ce_active:
@@ -242,6 +275,8 @@ def run_backtest_simulation(
                         ce_exit_price = ce_sl
                         ce_exit_reason = "STOP_LOSS"
                         ce_exit_time = curr_dt
+                        if trail_opposite_to_cost and pe_active:
+                            pe_sl = pe_entry
 
                 if ce_active:
                     ce_min_price = black_76_price(bar_low_spot, ce_strike, curr_dte, iv, r, "CE")
@@ -250,7 +285,7 @@ def run_backtest_simulation(
                         ce_exit_price = ce_target
                         ce_exit_reason = "DECAY_TARGET"
                         ce_exit_time = curr_dt
-                        # Close opposite PE leg simultaneously to avoid naked single-leg risk
+                        # Close opposite PE leg simultaneously to avoid naked single-leg risk in legacy mode
                         if not use_leg_sl and pe_active:
                             pe_5m_price = black_76_price(bar_close_spot, pe_strike, curr_dte, iv, r, "PE")
                             pe_active = False
@@ -267,6 +302,8 @@ def run_backtest_simulation(
                         pe_exit_price = pe_sl
                         pe_exit_reason = "STOP_LOSS"
                         pe_exit_time = curr_dt
+                        if trail_opposite_to_cost and ce_active:
+                            ce_sl = ce_entry
 
                 if pe_active:
                     pe_min_price = black_76_price(bar_high_spot, pe_strike, curr_dte, iv, r, "PE")
@@ -275,13 +312,16 @@ def run_backtest_simulation(
                         pe_exit_price = pe_target
                         pe_exit_reason = "DECAY_TARGET"
                         pe_exit_time = curr_dt
-                        # Close opposite CE leg simultaneously to avoid naked single-leg risk
+                        # Close opposite CE leg simultaneously to avoid naked single-leg risk in legacy mode
                         if not use_leg_sl and ce_active:
                             ce_5m_price = black_76_price(bar_close_spot, ce_strike, curr_dte, iv, r, "CE")
                             ce_active = False
                             ce_exit_price = round(ce_5m_price, 2)
                             ce_exit_reason = "CO_TARGET_EXIT"
                             ce_exit_time = curr_dt
+
+            if not ce_active and not pe_active:
+                break
 
             # 4. If one leg exited intra-bar on decay target, re-evaluate strategy total loss with active opposite leg
             if (ce_active or pe_active):

@@ -187,7 +187,9 @@ def test_run_strategy_cli_once_flag():
             morning_filter_pct=0.60,
             strike_mode="ATR",
             atr_multiplier=1.25,
-            target_price=30.0
+            target_price=30.0,
+            use_leg_sl=True,
+            trail_to_cost=True
         )
 
 
@@ -212,7 +214,7 @@ def test_strangle_desk_run_session_sl_removed_and_target_exit(tmp_path):
 
     with patch("strategy.strangle_desk.datetime") as mock_dt:
         mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
-        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite)
+        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite, use_leg_sl=False)
 
     assert state is not None
     assert state["status"] == "COMPLETED"
@@ -220,22 +222,21 @@ def test_strangle_desk_run_session_sl_removed_and_target_exit(tmp_path):
     assert state["pe"]["status"] == "CLOSED"
     assert state["pe"]["exit_reason"] == "DECAY_TARGET"
     assert state["pe"]["exit_price"] == 6.0
-    # Option 3: opposite leg is simultaneously closed to avoid naked risk
+    # Option 3 (legacy): opposite leg is simultaneously closed to avoid naked risk
     assert state["ce"]["status"] == "CLOSED"
     assert state["ce"]["exit_reason"] == "CO_TARGET_EXIT"
     assert state["ce"]["exit_price"] == 49.0
 
 
-def test_strangle_desk_run_session_no_exit_when_sl_exceeded_and_no_target(tmp_path):
+def test_strangle_desk_run_session_single_leg_sl_exit(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
         {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
         {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
     ]
-    # CE Entry: 32.0, PE Entry: 31.0
-    # Tick 2: CE LTP 49.0 (> 48.0 legacy SL), PE LTP 25.0 (> 6.2 target)
-    # Combined loss = (49-32)*65 + (25-31)*65 = 1105 - 390 = 715 (< 10,000)
-    # Neither leg should exit: both legs stay OPEN
+    # CE Entry: 32.0 (SL 48.0), PE Entry: 31.0
+    # Tick 2: CE LTP 49.0 (> 48.0 SL), PE LTP 25.0 (> 6.2 target)
+    # Under single-leg exit: CE exits on STOP_LOSS, PE stays OPEN and is trailed to cost (31.0)
     mock_kite.ltp.side_effect = [
         {"NFO:NIFTY26NOV24200CE": {"last_price": 32.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}},
         {"NFO:NIFTY26NOV24200CE": {"last_price": 49.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 25.0}}
@@ -247,7 +248,36 @@ def test_strangle_desk_run_session_no_exit_when_sl_exceeded_and_no_target(tmp_pa
 
     with patch("strategy.strangle_desk.datetime") as mock_dt:
         mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
-        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite)
+        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite, use_leg_sl=True, trail_to_cost=True)
+
+    assert state is not None
+    assert state["status"] == "OPEN"
+    assert state["ce"]["status"] == "CLOSED"
+    assert state["ce"]["exit_reason"] == "STOP_LOSS"
+    assert state["ce"]["exit_price"] == 49.0
+    assert state["pe"]["status"] == "OPEN"
+    assert state["pe"]["sl_price"] == 31.0  # Trailed to cost!
+
+
+def test_strangle_desk_run_session_no_exit_when_sl_exceeded_and_no_target(tmp_path):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+    ]
+    # In legacy mode (use_leg_sl=False), individual leg SL is bypassed
+    mock_kite.ltp.side_effect = [
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 32.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}},
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 49.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 25.0}}
+    ]
+
+    state_file = tmp_path / "trades_today.json"
+    om = OrderManager(mode="PAPER", kite=mock_kite)
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    with patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
+        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite, use_leg_sl=False)
 
     assert state is not None
     assert state["status"] == "OPEN"
@@ -392,16 +422,56 @@ def test_strangle_desk_run_session_strategy_max_loss_exit(tmp_path):
             dry_run=False,
             execute_once=True,
             kite=mock_kite,
-            strategy_max_loss=10000.0
+            strategy_max_loss=10000.0,
+            use_leg_sl=False
         )
 
     assert state is not None
-    # BOTH legs must be closed immediately
+    # BOTH legs must be closed immediately in legacy dual-leg mode
     assert state["ce"]["status"] == "CLOSED"
     assert state["pe"]["status"] == "CLOSED"
     assert state["ce"]["exit_reason"] == "STRATEGY_MAX_LOSS_10K"
     assert state["pe"]["exit_reason"] == "STRATEGY_MAX_LOSS_10K"
     assert state["status"] == "COMPLETED"
+
+
+def test_strangle_desk_run_session_single_leg_10k_loss_exit(tmp_path):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+    ]
+    # CE Entry: 35.0, PE Entry: 35.0. Total qty = 650.
+    # At tick 2: CE LTP 52.0 (loss = (52 - 35) * 650 = 11,050).
+    # PE LTP 34.0 (gain = (35 - 34) * 650 = 650).
+    # Total strategy loss = 10,400 >= 10,000.
+    # In single-leg mode (use_leg_sl=True): ONLY CE is exited! PE remains OPEN!
+    mock_kite.ltp.side_effect = [
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 35.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 35.0}},
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 52.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 34.0}}
+    ]
+    state_file = tmp_path / "trades_today.json"
+    om = OrderManager(mode="PAPER", kite=mock_kite)
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    with patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
+        state = desk.run_session(
+            lots=10,
+            poll_seconds=0,
+            dry_run=False,
+            execute_once=True,
+            kite=mock_kite,
+            strategy_max_loss=10000.0,
+            use_leg_sl=True,
+            trail_to_cost=True
+        )
+
+    assert state is not None
+    assert state["ce"]["status"] == "CLOSED"
+    assert state["ce"]["exit_reason"] in ("SINGLE_LEG_10K_EXIT", "STOP_LOSS")
+    assert state["pe"]["status"] == "OPEN"
+    assert state["pe"]["sl_price"] == 35.0  # Trailed to cost!
 
 
 
@@ -433,7 +503,9 @@ def test_run_strategy_cli_max_loss_flag():
             morning_filter_pct=0.60,
             strike_mode="ATR",
             atr_multiplier=1.25,
-            target_price=30.0
+            target_price=30.0,
+            use_leg_sl=True,
+            trail_to_cost=True
         )
 
 
@@ -465,7 +537,9 @@ def test_run_strategy_cli_strategy_max_loss_flag():
             morning_filter_pct=0.60,
             strike_mode="ATR",
             atr_multiplier=1.25,
-            target_price=30.0
+            target_price=30.0,
+            use_leg_sl=True,
+            trail_to_cost=True
         )
 
 
@@ -510,7 +584,9 @@ def test_run_strategy_cli_order_type_and_holiday_flags():
             morning_filter_pct=0.60,
             strike_mode="ATR",
             atr_multiplier=1.25,
-            target_price=30.0
+            target_price=30.0,
+            use_leg_sl=True,
+            trail_to_cost=True
         )
 
 
@@ -542,7 +618,9 @@ def test_run_strategy_cli_order_timeout_flag():
             morning_filter_pct=0.60,
             strike_mode="ATR",
             atr_multiplier=1.25,
-            target_price=30.0
+            target_price=30.0,
+            use_leg_sl=True,
+            trail_to_cost=True
         )
 
 

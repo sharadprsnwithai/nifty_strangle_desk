@@ -89,7 +89,10 @@ def run_backtest_cli(args=None) -> int:
     parser.add_argument("--lots", type=int, default=10, help="Number of lots (default: 10)")
     parser.add_argument("--lot-size", type=int, default=65, help="Lot size (default: 65)")
     parser.add_argument("--strategy-max-loss", "--max-loss", type=float, default=10000.0, dest="strategy_max_loss", help="Strategy total loss exit in Rs across all legs (default: 10000.0)")
-    parser.add_argument("--use-leg-sl", action="store_true", help="Enable legacy individual leg stop-loss (50% premium increase)")
+    parser.add_argument("--use-leg-sl", dest="use_leg_sl", action="store_true", default=True, help="Enable single-leg exit on 50% stop loss (default: True)")
+    parser.add_argument("--no-leg-sl", dest="use_leg_sl", action="store_false", help="Disable single-leg exit (use simultaneous dual-leg exit)")
+    parser.add_argument("--trail-cost", dest="trail_opposite_to_cost", action="store_true", default=True, help="Trail opposite leg to cost/breakeven after stop-loss (default: True)")
+    parser.add_argument("--no-trail-cost", dest="trail_opposite_to_cost", action="store_false", help="Disable trailing opposite leg to cost")
     parser.add_argument("--exit-cutoff", type=str, default="14:45", help="Intraday square-off cutoff time HH:MM (default: 14:45)")
     parser.add_argument("--expiry-weekday", type=int, default=1, help="Expiry weekday (0=Mon, 1=Tue, ..., 3=Thu. Default: 1 for Tuesday)")
     parser.add_argument("--iv", type=float, default=0.13, help="Option IV (default: 0.13)")
@@ -118,6 +121,7 @@ def run_backtest_cli(args=None) -> int:
             expiry_weekday=parsed.expiry_weekday,
             strategy_max_loss=parsed.strategy_max_loss,
             use_leg_sl=parsed.use_leg_sl,
+            trail_opposite_to_cost=parsed.trail_opposite_to_cost,
             exit_cutoff_time=exit_cutoff,
             morning_filter=parsed.morning_filter,
             morning_filter_threshold_pct=parsed.morning_filter_pct,

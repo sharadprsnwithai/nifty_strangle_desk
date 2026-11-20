@@ -154,7 +154,8 @@ def test_run_backtest_simulation_strategy_max_loss_exit():
         bars_df=df,
         lots=10,
         lot_size=65,
-        strategy_max_loss=10000.0
+        strategy_max_loss=10000.0,
+        use_leg_sl=False
     )
     assert results["summary"]["total_days_traded"] == 1
     trade = results["trades"][0]
@@ -165,4 +166,35 @@ def test_run_backtest_simulation_strategy_max_loss_exit():
     # Gross loss should be capped near -10,000 (within 5-minute candle granularity)
     assert trade["gross_pnl"] <= -10000.0
     assert trade["gross_pnl"] >= -12500.0
+
+
+def test_run_backtest_simulation_single_leg_exit():
+    # Construct a trading day with steady strong rally where CE hits SL,
+    # but PE stays open to harvest decay.
+    rows = []
+    base_time = datetime(2026, 11, 2, 9, 15)
+    for i in range(75):
+        t = base_time + timedelta(minutes=i * 5)
+        if i < 15:
+            spot = 24000.0
+        else:
+            spot = 24000.0 + ((i - 14) * 15.0)  # Steady strong rally
+        rows.append({"timestamps": t, "open": spot, "high": spot + 1.0, "low": spot - 1.0, "close": spot})
+    df = pd.DataFrame(rows)
+
+    results = run_backtest_simulation(
+        bars_df=df,
+        lots=10,
+        lot_size=65,
+        strategy_max_loss=10000.0,
+        use_leg_sl=True,
+        trail_opposite_to_cost=True
+    )
+    assert results["summary"]["total_days_traded"] == 1
+    trade = results["trades"][0]
+
+    # CE stopped out on STOP_LOSS or SINGLE_LEG_10K_EXIT
+    assert trade["ce_reason"] in ("STOP_LOSS", "SINGLE_LEG_10K_EXIT")
+    # PE remained active or exited at TIME_EXIT / DECAY_TARGET (not STRATEGY_MAX_LOSS_10K)
+    assert trade["pe_reason"] in ("TIME_EXIT", "DECAY_TARGET")
 
