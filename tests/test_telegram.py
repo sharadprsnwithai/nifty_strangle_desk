@@ -36,3 +36,24 @@ def test_telegram_notifier_handles_network_error_gracefully():
         # Should not raise exception
         success = notifier.send_message("Test Alert")
         assert success is False
+
+
+def test_telegram_notifier_falls_back_to_plaintext_on_http_400():
+    notifier = TelegramNotifier(bot_token="bot_token_123", chat_id="chat_id_456")
+
+    # First call (HTML) raises HTTP 400 Bad Request, fallback call (plain text) returns 200 OK
+    http_400 = urllib.error.HTTPError(
+        url="https://api.telegram.org",
+        code=400,
+        msg="Bad Request: can't parse entities",
+        hdrs={},
+        fp=None
+    )
+    fallback_resp = MagicMock()
+    fallback_resp.getcode.return_value = 200
+    fallback_cm = MagicMock()
+    fallback_cm.__enter__.return_value = fallback_resp
+
+    with patch("urllib.request.urlopen", side_effect=[http_400, fallback_cm]):
+        success = notifier.send_message("🚨 Error: Available Rs 100 < Estimated Rs 200")
+        assert success is True

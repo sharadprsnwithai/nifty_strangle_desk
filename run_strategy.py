@@ -32,7 +32,7 @@ def run_strategy_cli(args=None) -> int:
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--live", action="store_true", help="Execute real LIVE orders via Kite Connect")
     mode_group.add_argument("--paper", action="store_true", help="Run simulated PAPER trading (default)")
-    parser.add_argument("--lots", type=int, default=10, help="Number of lots (default: 10)")
+    parser.add_argument("--lots", type=int, default=int(os.getenv("STRANGLE_LOTS", "10")), help="Number of lots (default: 10, or STRANGLE_LOTS env var)")
     parser.add_argument("--poll", type=int, default=5, help="Monitoring poll interval in seconds (default: 5)")
     parser.add_argument("--strategy-max-loss", "--max-loss", type=float, default=10000.0, dest="strategy_max_loss", help="Strategy total loss exit in Rs across all legs (default: 10000.0)")
     parser.add_argument("--order-type", choices=["LIMIT", "MARKET"], default="LIMIT", help="Order execution type (default: LIMIT)")
@@ -48,6 +48,19 @@ def run_strategy_cli(args=None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Perform single strike lookup and print plan without waiting")
     parser.add_argument("--once", action="store_true", help="Run single monitoring iteration and exit (default runs automated daemon)")
     parser.add_argument("--morning-login", action="store_true", help="Execute 08:00 AM TOTP morning login to renew credentials, notify Telegram, and exit")
+    morning_filter_default = os.getenv("STRANGLE_MORNING_FILTER", "true").lower() in ("true", "1", "yes")
+    parser.add_argument("--morning-filter", dest="morning_filter", action="store_true", default=morning_filter_default, help="Enable 09:15-10:00 AM range trend filter (default: True)")
+    parser.add_argument("--no-morning-filter", dest="morning_filter", action="store_false", help="Disable morning trend filter")
+    parser.add_argument("--morning-filter-pct", type=float, default=float(os.getenv("STRANGLE_MORNING_FILTER_PCT", "0.60")), help="Morning range percentage threshold to skip session (default: 0.60)")
+    parser.add_argument("--strike-mode", choices=["ATR", "PRICE"], default=os.getenv("STRANGLE_STRIKE_MODE", "ATR"), help="Strike selection mode (ATR: 1.25x ATR distance, PRICE: Rs 30 premium, default: ATR)")
+    parser.add_argument("--atr-multiplier", type=float, default=float(os.getenv("STRANGLE_ATR_MULTIPLIER", "1.25")), help="ATR multiplier for strike distance (default: 1.25)")
+    parser.add_argument("--target-price", type=float, default=float(os.getenv("STRANGLE_TARGET_PRICE", "30.0")), help="Target premium in Rs for PRICE mode or fallback (default: 30.0)")
+    single_leg_default = os.getenv("STRANGLE_SINGLE_LEG_EXIT", "true").lower() in ("true", "1", "yes")
+    parser.add_argument("--single-leg-exit", "--use-leg-sl", dest="use_leg_sl", action="store_true", default=single_leg_default, help="Enable single-leg exit on 50%% SL / 10k loss (winning leg stays open to decay, default: True)")
+    parser.add_argument("--no-single-leg-exit", dest="use_leg_sl", action="store_false", help="Disable single-leg exit (uses legacy simultaneous dual-leg exit)")
+    trail_cost_default = os.getenv("STRANGLE_TRAIL_COST", "true").lower() in ("true", "1", "yes")
+    parser.add_argument("--trail-cost", dest="trail_to_cost", action="store_true", default=trail_cost_default, help="Trail winning leg stop-loss to cost/breakeven after losing leg stops out (default: True)")
+    parser.add_argument("--no-trail-cost", dest="trail_to_cost", action="store_false", help="Disable trailing winning leg to cost")
 
     parsed = parser.parse_args(args)
     setup_logging(log_dir=parsed.log_dir, log_level=parsed.log_level)
@@ -83,7 +96,14 @@ def run_strategy_cli(args=None) -> int:
             "order_type": parsed.order_type,
             "limit_buffer_pct": parsed.limit_buffer_pct,
             "ignore_holidays": parsed.ignore_holidays,
-            "order_timeout": parsed.order_timeout
+            "order_timeout": parsed.order_timeout,
+            "morning_filter": parsed.morning_filter,
+            "morning_filter_pct": parsed.morning_filter_pct,
+            "strike_mode": parsed.strike_mode,
+            "atr_multiplier": parsed.atr_multiplier,
+            "target_price": parsed.target_price,
+            "use_leg_sl": parsed.use_leg_sl,
+            "trail_to_cost": parsed.trail_to_cost
         }
 
         if parsed.dry_run or parsed.once:

@@ -32,15 +32,17 @@ class OrderManager:
         price: float,
         order_type: str = "LIMIT",
         buffer_pct: float = 0.05,
+        min_buffer_rs: float = 0.0,
         product: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Sells an option leg (entry).
-        If order_type is LIMIT, places a marketable limit order below LTP (by buffer_pct)
+        If order_type is LIMIT, places a marketable limit order below LTP (by buffer_pct / min_buffer_rs)
         to prevent freak-trade execution while guaranteeing immediate fill against the bid.
         """
         order_type_norm = order_type.upper()
-        limit_price = max(0.05, _round_to_nse_tick(price * (1.0 - buffer_pct))) if order_type_norm == "LIMIT" else None
+        buffer = max(price * buffer_pct, min_buffer_rs)
+        limit_price = max(0.05, _round_to_nse_tick(price - buffer)) if order_type_norm == "LIMIT" else None
 
         logger.info(
             "[%s] Executing SELL (%s): %s x %d @ Rs %.2f%s",
@@ -106,6 +108,27 @@ class OrderManager:
                 "status": "SUBMITTED"
             }
         except Exception as e:
+            from kite.client import is_token_error, ensure_kite_session
+            if is_token_error(e):
+                logger.warning("[LIVE] Token error on SELL order (%s). Refreshing session from .env and retrying...", e)
+                try:
+                    self.kite = ensure_kite_session(self.kite, force_login=False)
+                    order_id = self.kite.place_order(**params)
+                    logger.info("[LIVE] SELL order succeeded after session refresh: %s x %d (Order ID: %s)", symbol, quantity, order_id)
+                    return {
+                        "order_id": order_id,
+                        "mode": "LIVE",
+                        "symbol": symbol,
+                        "transaction_type": "SELL",
+                        "quantity": quantity,
+                        "order_type": order_type_norm,
+                        "limit_price": limit_price,
+                        "fill_price": price,
+                        "status": "SUBMITTED"
+                    }
+                except Exception as retry_e:
+                    logger.exception("[LIVE] Failed to place SELL order after session refresh for %s: %s", symbol, retry_e)
+                    raise
             logger.exception("[LIVE] Failed to place SELL order for %s (qty: %d, type: %s): %s", symbol, quantity, order_type_norm, e)
             raise
 
@@ -117,15 +140,17 @@ class OrderManager:
         reason: str = "EXIT",
         order_type: str = "LIMIT",
         buffer_pct: float = 0.05,
+        min_buffer_rs: float = 0.0,
         product: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Buys back an open short option leg (exit on SL, target, or 3PM).
-        If order_type is LIMIT, places a marketable limit order above LTP (by buffer_pct)
+        If order_type is LIMIT, places a marketable limit order above LTP (by buffer_pct / min_buffer_rs)
         to guarantee execution against the ask while preventing execution at extreme freak prices.
         """
         order_type_norm = order_type.upper()
-        limit_price = max(0.05, _round_to_nse_tick(price * (1.0 + buffer_pct))) if order_type_norm == "LIMIT" else None
+        buffer = max(price * buffer_pct, min_buffer_rs)
+        limit_price = max(0.05, _round_to_nse_tick(price + buffer)) if order_type_norm == "LIMIT" else None
 
         logger.info(
             "[%s] Executing BUY TO COVER (%s / %s): %s x %d @ Rs %.2f%s",
@@ -193,6 +218,28 @@ class OrderManager:
                 "status": "SUBMITTED"
             }
         except Exception as e:
+            from kite.client import is_token_error, ensure_kite_session
+            if is_token_error(e):
+                logger.warning("[LIVE] Token error on BUY-TO-COVER order (%s). Refreshing session from .env and retrying...", e)
+                try:
+                    self.kite = ensure_kite_session(self.kite, force_login=False)
+                    order_id = self.kite.place_order(**params)
+                    logger.info("[LIVE] BUY-TO-COVER succeeded after session refresh: %s x %d (Order ID: %s)", symbol, quantity, order_id)
+                    return {
+                        "order_id": order_id,
+                        "mode": "LIVE",
+                        "symbol": symbol,
+                        "transaction_type": "BUY",
+                        "quantity": quantity,
+                        "order_type": order_type_norm,
+                        "limit_price": limit_price,
+                        "fill_price": price,
+                        "reason": reason,
+                        "status": "SUBMITTED"
+                    }
+                except Exception as retry_e:
+                    logger.exception("[LIVE] Failed to place BUY-TO-COVER order after session refresh for %s: %s", symbol, retry_e)
+                    raise
             logger.exception("[LIVE] Failed to place BUY-TO-COVER order for %s (qty: %d, reason: %s): %s", symbol, quantity, reason, e)
             raise
 

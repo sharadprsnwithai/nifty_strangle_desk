@@ -97,3 +97,32 @@ def test_get_kite_client_default_config_loads_from_load_config(mock_config):
         client = get_kite_client()
         mock_load_config.assert_called_once()
         assert client == mock_instance
+
+
+def test_ensure_kite_session_reuses_env_token_from_peer_strategy():
+    from kite.client import ensure_kite_session
+    old_kite = MagicMock()
+    old_kite.access_token = "old_expired_token"
+    old_kite.profile.side_effect = Exception("Incorrect `api_key` or `access_token`.")
+
+    cfg_with_new_token = KiteConfig(
+        api_key="mock_api_key",
+        api_secret="mock_secret",
+        user_id="mock_user",
+        password="mock_password",
+        totp_key="JBSWY3DPEHPK3PXP",
+        access_token="new_valid_token_from_other_strategy"
+    )
+
+    valid_peer_client = MagicMock()
+    valid_peer_client.profile.return_value = {"user_id": "mock_user"}
+
+    with patch("kite.client.load_config", return_value=cfg_with_new_token), \
+         patch("kite.client._validate_token", return_value=valid_peer_client), \
+         patch("kite.client.get_kite_client") as mock_get_client:
+
+        result_client = ensure_kite_session(kite=old_kite, force_login=False)
+        assert old_kite.set_access_token.called
+        old_kite.set_access_token.assert_called_with("new_valid_token_from_other_strategy")
+        mock_get_client.assert_not_called()
+

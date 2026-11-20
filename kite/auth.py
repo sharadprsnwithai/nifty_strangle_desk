@@ -63,65 +63,19 @@ def login_with_totp(
     target_env = Path(env_path) if env_path else DEFAULT_ENV_PATH
     if target_env.exists():
         try:
-            mtime = target_env.stat().st_mtime
-            if time.time() - mtime < 30.0:
-                for line in target_env.read_text(encoding="utf-8").splitlines():
-                    if line.strip().startswith("KITE_ACCESS_TOKEN="):
-                        cached_token = line.strip().split("=", 1)[1].strip()
-                        if cached_token:
-                            test_kite = KiteConnect(api_key=config.api_key)
-                            test_kite.set_access_token(cached_token)
-                            try:
-                                test_kite.profile()
-                                logger.info("Detected fresh access token from concurrent container in .env. Reusing token.")
-                                os.environ["KITE_ACCESS_TOKEN"] = cached_token
-                                return cached_token
-                            except Exception:
-                                pass
-        except Exception:
-            pass
-
-    # Check if another container recently updated .env with a valid token
-    target_env = Path(env_path) if env_path else DEFAULT_ENV_PATH
-    if target_env.exists():
-        try:
-            mtime = target_env.stat().st_mtime
-            if time.time() - mtime < 30.0:
-                for line in target_env.read_text(encoding="utf-8").splitlines():
-                    if line.strip().startswith("KITE_ACCESS_TOKEN="):
-                        cached_token = line.strip().split("=", 1)[1].strip()
-                        if cached_token:
-                            test_kite = KiteConnect(api_key=config.api_key)
-                            test_kite.set_access_token(cached_token)
-                            try:
-                                test_kite.profile()
-                                logger.info("Detected fresh access token from concurrent container in .env. Reusing token.")
-                                os.environ["KITE_ACCESS_TOKEN"] = cached_token
-                                return cached_token
-                            except Exception:
-                                pass
-        except Exception:
-            pass
-
-    # Check if another container recently updated .env with a valid token
-    target_env = Path(env_path) if env_path else DEFAULT_ENV_PATH
-    if target_env.exists():
-        try:
-            mtime = target_env.stat().st_mtime
-            if time.time() - mtime < 30.0:
-                for line in target_env.read_text(encoding="utf-8").splitlines():
-                    if line.strip().startswith("KITE_ACCESS_TOKEN="):
-                        cached_token = line.strip().split("=", 1)[1].strip()
-                        if cached_token:
-                            test_kite = KiteConnect(api_key=config.api_key)
-                            test_kite.set_access_token(cached_token)
-                            try:
-                                test_kite.profile()
-                                logger.info("Detected fresh access token from concurrent container in .env. Reusing token.")
-                                os.environ["KITE_ACCESS_TOKEN"] = cached_token
-                                return cached_token
-                            except Exception:
-                                pass
+            for line in target_env.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("KITE_ACCESS_TOKEN="):
+                    cached_token = line.strip().split("=", 1)[1].strip()
+                    if cached_token:
+                        test_kite = KiteConnect(api_key=config.api_key)
+                        test_kite.set_access_token(cached_token)
+                        try:
+                            test_kite.profile()
+                            logger.info("Detected fresh access token from concurrent container in .env. Reusing token.")
+                            os.environ["KITE_ACCESS_TOKEN"] = cached_token
+                            return cached_token
+                        except Exception:
+                            pass
         except Exception:
             pass
 

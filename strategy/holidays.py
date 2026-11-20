@@ -62,6 +62,14 @@ def is_trading_holiday(check_date: Optional[date] = None) -> Tuple[bool, Optiona
     return False, None
 
 
+def is_nse_holiday(check_date: Optional[date] = None) -> bool:
+    """
+    Returns True if check_date is a non-trading day on NSE (weekend or holiday).
+    """
+    is_holiday, _ = is_trading_holiday(check_date)
+    return is_holiday
+
+
 def is_mcx_trading_holiday(check_date: Optional[date] = None, session: str = "EVENING") -> Tuple[bool, Optional[str]]:
     """
     Checks if a given date is a non-trading day on MCX for the specified session (MORNING or EVENING).

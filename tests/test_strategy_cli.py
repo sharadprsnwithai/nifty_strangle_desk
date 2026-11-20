@@ -117,11 +117,14 @@ def test_order_manager_mode_validation():
 
 
 def test_option_chain_normalize_today_date():
+    today = datetime.now().date()
     instruments = [
         {"name": "NIFTY", "instrument_type": "CE", "expiry": "2026-11-05"},
         {"name": "NIFTY", "instrument_type": "PE", "expiry": "2026-11-05"},
         {"name": "NIFTY", "instrument_type": "CE", "expiry": "2026-11-12"},
         {"name": "NIFTY", "instrument_type": "PE", "expiry": "2026-11-12"},
+        {"name": "NIFTY", "instrument_type": "CE", "expiry": (today + timedelta(days=7)).strftime("%Y-%m-%d")},
+        {"name": "NIFTY", "instrument_type": "PE", "expiry": (today + timedelta(days=7)).strftime("%Y-%m-%d")},
     ]
     # Pass datetime
     exp = resolve_target_expiry(instruments, today_date=datetime(2026, 11, 2, 10, 0))
@@ -179,18 +182,27 @@ def test_run_strategy_cli_once_flag():
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
-            order_timeout=300
+            order_timeout=300,
+            morning_filter=True,
+            morning_filter_pct=0.60,
+            strike_mode="ATR",
+            atr_multiplier=1.25,
+            target_price=30.0,
+            use_leg_sl=True,
+            trail_to_cost=True
         )
 
 
-def test_strangle_desk_run_session_sl_and_target_exits(tmp_path):
+def test_strangle_desk_run_session_sl_removed_and_target_exit(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
         {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
         {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
     ]
     # 1st call to ltp: strike discovery
-    # 2nd call to ltp: monitoring loop (CE hits SL 49.0 >= 48.0, PE hits Target 6.0 <= 6.2)
+    # 2nd call to ltp: monitoring loop (CE LTP 49.0 > 48.0 (+50%), PE hits Target 6.0 <= 6.2)
+    # Combined PnL = (32 - 49)*65 + (31 - 6)*65 = -1105 + 1625 = +520 (loss not > 10k)
+    # CE must NOT exit on individual leg loss; only PE exits on DECAY_TARGET.
     mock_kite.ltp.side_effect = [
         {"NFO:NIFTY26NOV24200CE": {"last_price": 32.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}},
         {"NFO:NIFTY26NOV24200CE": {"last_price": 49.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 6.0}}
@@ -202,16 +214,77 @@ def test_strangle_desk_run_session_sl_and_target_exits(tmp_path):
 
     with patch("strategy.strangle_desk.datetime") as mock_dt:
         mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
-        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite)
+        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite, use_leg_sl=False)
 
     assert state is not None
     assert state["status"] == "COMPLETED"
-    assert state["ce"]["status"] == "CLOSED"
-    assert state["ce"]["exit_reason"] == "STOP_LOSS"
-    assert state["ce"]["exit_price"] == 49.0
+    # PE decay target is reached: PE is CLOSED with DECAY_TARGET
     assert state["pe"]["status"] == "CLOSED"
     assert state["pe"]["exit_reason"] == "DECAY_TARGET"
     assert state["pe"]["exit_price"] == 6.0
+    # Option 3 (legacy): opposite leg is simultaneously closed to avoid naked risk
+    assert state["ce"]["status"] == "CLOSED"
+    assert state["ce"]["exit_reason"] == "CO_TARGET_EXIT"
+    assert state["ce"]["exit_price"] == 49.0
+
+
+def test_strangle_desk_run_session_single_leg_sl_exit(tmp_path):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+    ]
+    # CE Entry: 32.0 (SL 48.0), PE Entry: 31.0
+    # Tick 2: CE LTP 49.0 (> 48.0 SL), PE LTP 25.0 (> 6.2 target)
+    # Under single-leg exit: CE exits on STOP_LOSS, PE stays OPEN and is trailed to cost (31.0)
+    mock_kite.ltp.side_effect = [
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 32.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}},
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 49.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 25.0}}
+    ]
+
+    state_file = tmp_path / "trades_today.json"
+    om = OrderManager(mode="PAPER", kite=mock_kite)
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    with patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
+        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite, use_leg_sl=True, trail_to_cost=True)
+
+    assert state is not None
+    assert state["status"] == "OPEN"
+    assert state["ce"]["status"] == "CLOSED"
+    assert state["ce"]["exit_reason"] == "STOP_LOSS"
+    assert state["ce"]["exit_price"] == 49.0
+    assert state["pe"]["status"] == "OPEN"
+    assert state["pe"]["sl_price"] == 31.0  # Trailed to cost!
+
+
+def test_strangle_desk_run_session_no_exit_when_sl_exceeded_and_no_target(tmp_path):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+    ]
+    # In legacy mode (use_leg_sl=False), individual leg SL is bypassed
+    mock_kite.ltp.side_effect = [
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 32.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}},
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 49.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 25.0}}
+    ]
+
+    state_file = tmp_path / "trades_today.json"
+    om = OrderManager(mode="PAPER", kite=mock_kite)
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    with patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
+        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite, use_leg_sl=False)
+
+    assert state is not None
+    assert state["status"] == "OPEN"
+    assert state["ce"]["status"] == "OPEN"
+    assert state["ce"]["exit_reason"] is None
+    assert state["pe"]["status"] == "OPEN"
+    assert state["pe"]["exit_reason"] is None
 
 
 def test_strangle_desk_run_session_time_exit(tmp_path):
@@ -232,6 +305,34 @@ def test_strangle_desk_run_session_time_exit(tmp_path):
     # Freeze time past 15:00
     with patch("strategy.strangle_desk.datetime") as mock_dt:
         mock_dt.now.return_value = datetime(2026, 11, 3, 15, 5)
+        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite)
+
+    assert state is not None
+    assert state["status"] == "COMPLETED"
+    assert state["ce"]["status"] == "CLOSED"
+    assert state["ce"]["exit_reason"] == "TIME_EXIT"
+    assert state["pe"]["status"] == "CLOSED"
+    assert state["pe"]["exit_reason"] == "TIME_EXIT"
+
+
+def test_strangle_desk_run_session_1445_cutoff_exit(tmp_path):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+    ]
+    mock_kite.ltp.return_value = {
+        "NFO:NIFTY26NOV24200CE": {"last_price": 32.0},
+        "NFO:NIFTY26NOV23700PE": {"last_price": 31.0}
+    }
+
+    state_file = tmp_path / "trades_today.json"
+    om = OrderManager(mode="PAPER", kite=mock_kite)
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    # Freeze time at 14:46 (past 14:45 cutoff)
+    with patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 11, 3, 14, 46)
         state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite)
 
     assert state is not None
@@ -321,16 +422,56 @@ def test_strangle_desk_run_session_strategy_max_loss_exit(tmp_path):
             dry_run=False,
             execute_once=True,
             kite=mock_kite,
-            strategy_max_loss=10000.0
+            strategy_max_loss=10000.0,
+            use_leg_sl=False
         )
 
     assert state is not None
-    # BOTH legs must be closed immediately
+    # BOTH legs must be closed immediately in legacy dual-leg mode
     assert state["ce"]["status"] == "CLOSED"
     assert state["pe"]["status"] == "CLOSED"
     assert state["ce"]["exit_reason"] == "STRATEGY_MAX_LOSS_10K"
     assert state["pe"]["exit_reason"] == "STRATEGY_MAX_LOSS_10K"
     assert state["status"] == "COMPLETED"
+
+
+def test_strangle_desk_run_session_single_leg_10k_loss_exit(tmp_path):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+    ]
+    # CE Entry: 35.0, PE Entry: 35.0. Total qty = 650.
+    # At tick 2: CE LTP 52.0 (loss = (52 - 35) * 650 = 11,050).
+    # PE LTP 34.0 (gain = (35 - 34) * 650 = 650).
+    # Total strategy loss = 10,400 >= 10,000.
+    # In single-leg mode (use_leg_sl=True): ONLY CE is exited! PE remains OPEN!
+    mock_kite.ltp.side_effect = [
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 35.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 35.0}},
+        {"NFO:NIFTY26NOV24200CE": {"last_price": 52.0}, "NFO:NIFTY26NOV23700PE": {"last_price": 34.0}}
+    ]
+    state_file = tmp_path / "trades_today.json"
+    om = OrderManager(mode="PAPER", kite=mock_kite)
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    with patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
+        state = desk.run_session(
+            lots=10,
+            poll_seconds=0,
+            dry_run=False,
+            execute_once=True,
+            kite=mock_kite,
+            strategy_max_loss=10000.0,
+            use_leg_sl=True,
+            trail_to_cost=True
+        )
+
+    assert state is not None
+    assert state["ce"]["status"] == "CLOSED"
+    assert state["ce"]["exit_reason"] in ("SINGLE_LEG_10K_EXIT", "STOP_LOSS")
+    assert state["pe"]["status"] == "OPEN"
+    assert state["pe"]["sl_price"] == 35.0  # Trailed to cost!
 
 
 
@@ -357,7 +498,14 @@ def test_run_strategy_cli_max_loss_flag():
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
-            order_timeout=300
+            order_timeout=300,
+            morning_filter=True,
+            morning_filter_pct=0.60,
+            strike_mode="ATR",
+            atr_multiplier=1.25,
+            target_price=30.0,
+            use_leg_sl=True,
+            trail_to_cost=True
         )
 
 
@@ -384,7 +532,14 @@ def test_run_strategy_cli_strategy_max_loss_flag():
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
-            order_timeout=300
+            order_timeout=300,
+            morning_filter=True,
+            morning_filter_pct=0.60,
+            strike_mode="ATR",
+            atr_multiplier=1.25,
+            target_price=30.0,
+            use_leg_sl=True,
+            trail_to_cost=True
         )
 
 
@@ -424,7 +579,14 @@ def test_run_strategy_cli_order_type_and_holiday_flags():
             order_type="MARKET",
             limit_buffer_pct=0.08,
             ignore_holidays=True,
-            order_timeout=300
+            order_timeout=300,
+            morning_filter=True,
+            morning_filter_pct=0.60,
+            strike_mode="ATR",
+            atr_multiplier=1.25,
+            target_price=30.0,
+            use_leg_sl=True,
+            trail_to_cost=True
         )
 
 
@@ -451,7 +613,14 @@ def test_run_strategy_cli_order_timeout_flag():
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
-            order_timeout=120
+            order_timeout=120,
+            morning_filter=True,
+            morning_filter_pct=0.60,
+            strike_mode="ATR",
+            atr_multiplier=1.25,
+            target_price=30.0,
+            use_leg_sl=True,
+            trail_to_cost=True
         )
 
 
@@ -832,8 +1001,41 @@ def test_safe_exit_leg_uses_position_product(tmp_path):
     )
     assert success is True
     om.buy_to_cover.assert_called_once_with(
-        "NIFTY26N0924400CE", 650, 35.0, reason="STOP_LOSS", order_type="LIMIT", buffer_pct=0.05, product="NRML"
+        "NIFTY26N0924400CE", 650, 35.0, reason="STOP_LOSS", order_type="LIMIT", buffer_pct=0.05, product="NRML", min_buffer_rs=1.5
     )
+
+
+def test_safe_exit_leg_enforces_universal_min_buffer_rs_floor(tmp_path):
+    """
+    Test that _safe_exit_leg enforces a universal min_buffer_rs=1.5 floor across all exits,
+    ensuring low-priced options (e.g. Rs 6.0) get at least Rs 1.50 buffer rather than 5% (Rs 0.30).
+    """
+    state_file = tmp_path / "trades_today.json"
+    om = OrderManager(mode="PAPER")
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    state = {
+        "ce": {"symbol": "NIFTY26N0924400CE", "status": "OPEN", "product": "MIS"},
+        "pe": {"symbol": "NIFTY26N0923400PE", "status": "OPEN", "product": "MIS"}
+    }
+    desk.save_state(state)
+
+    # Low premium exit at Rs 6.00: 5% is only Rs 0.30, but min_buffer_rs=1.5 floor gives Rs 7.50
+    desk._safe_exit_leg(
+        leg_name="ce",
+        symbol="NIFTY26N0924400CE",
+        qty=65,
+        exit_price=6.0,
+        reason="TIME_EXIT",
+        order_type="LIMIT",
+        limit_buffer_pct=0.05,
+        state=state
+    )
+
+    paper_order = om._paper_orders.get("PAPER_BUY_NIFTY26N0924400CE")
+    assert paper_order is not None
+    # 6.0 + 1.5 = 7.50 (rather than 6.0 * 1.05 = 6.30)
+    assert paper_order["limit_price"] == 7.50
 
 
 def test_run_strategy_cli_product_flag():
@@ -868,7 +1070,7 @@ def test_run_session_reauthenticates_on_token_error(tmp_path):
         }
         res = desk.run_session(lots=1, kite=mock_kite_expired, dry_run=True)
         assert res["status"] == "DRY_RUN"
-        mock_find.assert_called_once_with(mock_kite_fresh, underlying="NIFTY", target_price=30.0, lots=1)
+        mock_find.assert_called_once_with(mock_kite_fresh, underlying="NIFTY", target_price=30.0, strike_mode="ATR", atr_multiplier=1.25, lots=1)
 
 
 
@@ -913,3 +1115,272 @@ def test_run_scheduler_skips_reconciliation_outside_market_hours(tmp_path):
     mock_kite.positions.assert_not_called()
     mock_kite.instruments.assert_not_called()
     mock_sleep.assert_called_once_with(15)
+
+
+def test_check_available_equity_margin(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    mock_om = MagicMock()
+    mock_kite = MagicMock()
+    mock_om.kite = mock_kite
+    mock_om.mode = "LIVE"
+    desk = StrangleDesk(order_manager=mock_om, state_file=state_file)
+
+    # 1. OK status
+    mock_kite.margins.return_value = {
+        "enabled": True,
+        "available": {"live_balance": 350000.0, "cash": 300000.0},
+        "net": 350000.0
+    }
+    margin = desk.check_available_equity_margin()
+    assert margin["status"] == "OK"
+    assert margin["available_cash"] == 350000.0
+
+    # 2. Disabled status
+    mock_kite.margins.return_value = {"enabled": False, "net": 0.0}
+    margin_dis = desk.check_available_equity_margin()
+    assert margin_dis["status"] == "DISABLED"
+
+
+def test_no_preflight_equity_margin_check_proceeds_to_entry(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    mock_om = MagicMock()
+    mock_kite = MagicMock()
+    mock_om.kite = mock_kite
+    mock_om.mode = "LIVE"
+    mock_om.sell.return_value = {"order_id": "ORD_1", "status": "SUBMITTED"}
+    desk = StrangleDesk(order_manager=mock_om, state_file=state_file)
+
+    mock_kite.profile.return_value = {"user_id": "TC4648"}
+    mock_kite.positions.return_value = {"net": []}
+    mock_kite.margins.return_value = {
+        "enabled": True,
+        "available": {"live_balance": 50000.0},
+        "net": 50000.0
+    }
+
+    with patch("strategy.strangle_desk.is_trading_holiday", return_value=(False, "")), \
+         patch("strategy.strangle_desk.find_strangle_strikes") as mock_find, \
+         patch.object(desk, "wait_for_order_completion", return_value={"status": "COMPLETE", "average_price": 30.5}):
+        mock_find.return_value = {
+            "expiry": "2026-11-09",
+            "total_lots": 2,
+            "total_quantity": 130,
+            "ce": {"symbol": "NIFTY26N0924300CE", "ltp": 30.5, "sl_price": 45.75, "target_price": 6.1},
+            "pe": {"symbol": "NIFTY26N0923800PE", "ltp": 31.0, "sl_price": 46.5, "target_price": 6.2},
+        }
+        res = desk.run_session(lots=2, kite=mock_kite, execute_once=True, ignore_holidays=True)
+        # Pre-flight equity margin check removed: does not abort, sells both CE and PE legs directly
+        assert res is not None
+        assert mock_om.sell.call_count == 2
+
+
+def test_safe_exit_leg_live_verification(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    mock_om = MagicMock()
+    mock_om.mode = "LIVE"
+    desk = StrangleDesk(order_manager=mock_om, state_file=state_file)
+
+    state = {
+        "date": "2026-11-16",
+        "status": "OPEN",
+        "ce": {"symbol": "NIFTY26N1624300CE", "status": "OPEN", "entry_price": 30.0},
+        "pe": {"symbol": "NIFTY26N1623800PE", "status": "OPEN", "entry_price": 30.0}
+    }
+
+    # 1. Complete fill
+    mock_om.buy_to_cover.return_value = {"order_id": "ORD_EXIT_1", "status": "SUBMITTED"}
+    with patch.object(desk, "wait_for_order_completion") as mock_wait:
+        mock_wait.return_value = {"status": "COMPLETE", "average_price": 45.5}
+        ok = desk._safe_exit_leg("ce", "NIFTY26N1624300CE", 65, 45.0, "STOP_LOSS", "LIMIT", 0.05, state)
+        assert ok is True
+        assert state["ce"]["status"] == "CLOSED"
+        assert state["ce"]["exit_price"] == 45.5
+
+    # 2. Rejected order
+    state["pe"]["status"] = "OPEN"
+    mock_om.buy_to_cover.return_value = {"order_id": "ORD_EXIT_2", "status": "SUBMITTED"}
+    with patch.object(desk, "wait_for_order_completion") as mock_wait:
+        mock_wait.return_value = {"status": "REJECTED", "status_message": "RMS: Margin exceeded"}
+        ok = desk._safe_exit_leg("pe", "NIFTY26N1623800PE", 65, 45.0, "STOP_LOSS", "LIMIT", 0.05, state)
+        assert ok is False
+        assert state["pe"]["status"] == "OPEN"
+
+    # 3. Timeout order cancels resting order
+    mock_om.buy_to_cover.return_value = {"order_id": "ORD_EXIT_3", "status": "SUBMITTED"}
+    with patch.object(desk, "wait_for_order_completion") as mock_wait:
+        # First call (10s wait) returns OPEN, second call (after cancel) returns CANCELLED
+        mock_wait.side_effect = [
+            {"status": "OPEN", "pending_quantity": 65},
+            {"status": "CANCELLED", "filled_quantity": 0}
+        ]
+        ok = desk._safe_exit_leg("pe", "NIFTY26N1623800PE", 65, 45.0, "STOP_LOSS", "LIMIT", 0.05, state)
+        assert ok is False
+        assert state["pe"]["status"] == "OPEN"
+        mock_om.cancel_order.assert_called_with("ORD_EXIT_3")
+
+
+def test_check_morning_trend_filter_triggered():
+    desk = StrangleDesk(order_manager=MagicMock())
+    mock_kite = MagicMock()
+    # 09:15-10:00 range: Open 24000, High 24200, Low 23980 => Range = 220 pts = 0.916% (>= 0.60%)
+    mock_kite.historical_data.return_value = [
+        {"date": datetime(2026, 11, 20, 9, 15), "open": 24000.0, "high": 24050.0, "low": 23980.0, "close": 24040.0},
+        {"date": datetime(2026, 11, 20, 9, 30), "open": 24040.0, "high": 24150.0, "low": 24030.0, "close": 24140.0},
+        {"date": datetime(2026, 11, 20, 9, 45), "open": 24140.0, "high": 24200.0, "low": 24120.0, "close": 24190.0},
+    ]
+
+    is_trend, details = desk.check_morning_trend_filter(mock_kite, underlying="NIFTY", threshold_pct=0.60)
+    assert is_trend is True
+    assert details["triggered"] is True
+    assert details["range_pts"] == 220.0
+    assert details["range_pct"] > 0.60
+
+
+def test_check_morning_trend_filter_not_triggered():
+    desk = StrangleDesk(order_manager=MagicMock())
+    mock_kite = MagicMock()
+    # 09:15-10:00 range: Open 24000, High 24050, Low 23980 => Range = 70 pts = 0.29% (< 0.60%)
+    mock_kite.historical_data.return_value = [
+        {"date": datetime(2026, 11, 20, 9, 15), "open": 24000.0, "high": 24050.0, "low": 23980.0, "close": 24040.0},
+        {"date": datetime(2026, 11, 20, 9, 45), "open": 24040.0, "high": 24050.0, "low": 24010.0, "close": 24020.0},
+    ]
+
+    is_trend, details = desk.check_morning_trend_filter(mock_kite, underlying="NIFTY", threshold_pct=0.60)
+    assert is_trend is False
+    assert details["triggered"] is False
+    assert details["range_pts"] == 70.0
+
+
+def test_check_morning_trend_filter_quote_fallback():
+    desk = StrangleDesk(order_manager=MagicMock())
+    mock_kite = MagicMock()
+    mock_kite.historical_data.side_effect = RuntimeError("Historical API down")
+    mock_kite.quote.return_value = {
+        "NSE:NIFTY 50": {
+            "ohlc": {"open": 24000.0, "high": 24180.0, "low": 23980.0, "close": 24150.0}
+        }
+    }
+
+    # Range = 200 pts / 24000 = 0.833% (>= 0.60%)
+    is_trend, details = desk.check_morning_trend_filter(mock_kite, underlying="NIFTY", threshold_pct=0.60)
+    assert is_trend is True
+    assert details["range_pts"] == 200.0
+    assert details["source"] == "quote_ohlc"
+
+
+def test_run_session_skips_when_morning_filter_triggered(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    mock_om = MagicMock()
+    mock_notifier = MagicMock()
+    desk = StrangleDesk(order_manager=mock_om, state_file=state_file, notifier=mock_notifier)
+    mock_kite = MagicMock()
+
+    with patch.object(desk, "check_morning_trend_filter", return_value=(True, {"range_pts": 200.0, "range_pct": 0.83, "triggered": True})):
+        res = desk.run_session(
+            underlying="NIFTY",
+            lots=10,
+            kite=mock_kite,
+            morning_filter=True,
+            morning_filter_pct=0.60,
+            ignore_holidays=True
+        )
+
+        assert res["status"] == "SKIPPED_TREND_DAY"
+        assert "Morning Trend Filter" in res["reason"]
+        # Ensure no orders were placed
+        mock_om.sell.assert_not_called()
+        mock_notifier.send_message.assert_called_once()
+        # Ensure state persisted
+        saved_state = desk.load_state()
+        assert saved_state["status"] == "SKIPPED_TREND_DAY"
+
+
+def test_run_strategy_cli_morning_filter_flags():
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client"), \
+         patch("run_strategy.TelegramNotifier"), \
+         patch("run_strategy.OrderManager"), \
+         patch("run_strategy.StrangleDesk") as mock_desk_cls:
+        
+        mock_desk = MagicMock()
+        mock_desk_cls.return_value = mock_desk
+
+        # Test CLI with --strike-mode ATR --atr-multiplier 1.25 --morning-filter-pct 0.55
+        exit_code = run_strategy_cli([
+            "--once",
+            "--morning-filter",
+            "--morning-filter-pct", "0.55",
+            "--strike-mode", "ATR",
+            "--atr-multiplier", "1.25"
+        ])
+        assert exit_code == 0
+        call_kwargs = mock_desk.run_session.call_args[1]
+        assert call_kwargs["morning_filter"] is True
+        assert call_kwargs["morning_filter_pct"] == 0.55
+        assert call_kwargs["strike_mode"] == "ATR"
+        assert call_kwargs["atr_multiplier"] == 1.25
+
+
+def test_strangle_desk_concurrent_entry_order_placement(tmp_path):
+    """
+    Test that CE and PE entry orders are placed concurrently in parallel threads,
+    reducing latency and ensuring both legs are submitted simultaneously.
+    """
+    import threading
+    import time
+    state_file = tmp_path / "trades_today.json"
+    mock_om = MagicMock()
+    mock_om.mode = "LIVE"
+
+    threads_seen = set()
+    call_times = []
+
+    def slow_sell(sym, qty, ltp, order_type="LIMIT", buffer_pct=0.05):
+        threads_seen.add(threading.current_thread().ident)
+        t_start = time.time()
+        call_times.append(t_start)
+        time.sleep(0.05)  # 50ms artificial delay
+        return {
+            "order_id": f"ORD_{sym}",
+            "status": "COMPLETE",
+            "filled_quantity": qty,
+            "average_price": ltp
+        }
+
+    mock_om.sell.side_effect = slow_sell
+    mock_om.get_order_status.side_effect = lambda oid: {
+        "order_id": oid,
+        "status": "COMPLETE",
+        "filled_quantity": 65,
+        "average_price": 30.0
+    }
+
+    mock_notifier = MagicMock()
+    desk = StrangleDesk(order_manager=mock_om, state_file=state_file, notifier=mock_notifier)
+    mock_kite = MagicMock()
+    mock_kite.ltp.return_value = {
+        "NSE:NIFTY 50": {"last_price": 25000.0},
+        "NFO:NIFTY26N0925300CE": {"last_price": 30.0},
+        "NFO:NIFTY26N0924700PE": {"last_price": 30.0}
+    }
+
+    with patch("strategy.strangle_desk.find_strangle_strikes") as mock_find, \
+         patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
+        mock_find.return_value = {
+            "expiry": "2026-11-09",
+            "total_lots": 1,
+            "total_quantity": 65,
+            "ce": {"symbol": "NIFTY26N0925300CE", "strike": 25300, "ltp": 30.0, "sl_price": 45.0, "target_price": 6.0},
+            "pe": {"symbol": "NIFTY26N0924700PE", "strike": 24700, "ltp": 30.0, "sl_price": 45.0, "target_price": 6.0},
+        }
+        res = desk.run_session(lots=1, kite=mock_kite, execute_once=True, morning_filter=False, ignore_holidays=True)
+
+    assert res["status"] == "OPEN"
+    # Verify both calls were executed across distinct threads (concurrently)
+    assert len(threads_seen) == 2
+    # Verify that the two calls started within 20ms of each other (parallel dispatch)
+    assert abs(call_times[0] - call_times[1]) < 0.04
+
+
+

@@ -1,7 +1,7 @@
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import MagicMock
 import pytest
-from strategy.option_chain import resolve_target_expiry, find_strangle_strikes
+from strategy.option_chain import resolve_target_expiry, find_strangle_strikes, fetch_daily_atr
 
 @pytest.fixture
 def mock_nfo_instruments():
@@ -110,3 +110,60 @@ def test_find_strangle_strikes_auth_failure_raises():
     mock_kite.ltp.side_effect = Exception("Incorrect `api_key` or `access_token`.")
     with pytest.raises(Exception, match="Incorrect `api_key` or `access_token`"):
         find_strangle_strikes(mock_kite, target_date=date(2026, 11, 2))
+
+
+def test_fetch_daily_atr_success():
+    mock_kite = MagicMock()
+    # 5 daily candles with high-low of ~160 points
+    mock_kite.historical_data.return_value = [
+        {"date": datetime(2026, 11, 1), "open": 24000.0, "high": 24150.0, "low": 23990.0, "close": 24100.0},
+        {"date": datetime(2026, 11, 2), "open": 24100.0, "high": 24260.0, "low": 24080.0, "close": 24200.0},
+        {"date": datetime(2026, 11, 3), "open": 24200.0, "high": 24350.0, "low": 24180.0, "close": 24300.0},
+    ]
+    atr = fetch_daily_atr(mock_kite, instrument_token=256265, period=14)
+    assert 160.0 <= atr <= 180.0
+
+
+def test_fetch_daily_atr_fallback_on_error():
+    mock_kite = MagicMock()
+    mock_kite.historical_data.side_effect = RuntimeError("Historical API down")
+    atr = fetch_daily_atr(mock_kite, instrument_token=256265, period=14)
+    assert atr == 150.0  # safe fallback default
+
+
+def test_find_strangle_strikes_atr_mode_success():
+    mock_kite = MagicMock()
+    # Spot is 24000.0, ATR is 160.0 -> target offset = 160 * 1.25 = 200 pts
+    # Target CE strike = 24200.0, Target PE strike = 23800.0
+    mock_kite.ltp.side_effect = lambda query: {
+        "NSE:NIFTY 50": {"last_price": 24000.0},
+        "NFO:NIFTY26NOV24200CE": {"last_price": 28.5},
+        "NFO:NIFTY26NOV23800PE": {"last_price": 31.0},
+    } if any("NSE:" in q for q in query) else {
+        "NFO:NIFTY26NOV24200CE": {"last_price": 28.5},
+        "NFO:NIFTY26NOV23800PE": {"last_price": 31.0},
+    }
+    mock_kite.historical_data.return_value = [
+        {"date": datetime(2026, 11, 1), "open": 24000.0, "high": 24160.0, "low": 24000.0, "close": 24100.0},
+        {"date": datetime(2026, 11, 2), "open": 24100.0, "high": 24260.0, "low": 24100.0, "close": 24200.0},
+    ]
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "strike": 24200.0, "expiry": date(2026, 11, 3), "tradingsymbol": "NIFTY26NOV24200CE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23800.0, "expiry": date(2026, 11, 3), "tradingsymbol": "NIFTY26NOV23800PE", "lot_size": 65},
+    ]
+
+    result = find_strangle_strikes(
+        mock_kite,
+        underlying="NIFTY",
+        strike_mode="ATR",
+        atr_multiplier=1.25,
+        target_date=date(2026, 11, 2)
+    )
+
+    assert result["ce"]["strike"] == 24200.0
+    assert result["pe"]["strike"] == 23800.0
+    assert result["ce"]["symbol"] == "NIFTY26NOV24200CE"
+    assert result["pe"]["symbol"] == "NIFTY26NOV23800PE"
+    assert result["ce"]["ltp"] == 28.5
+    assert result["pe"]["ltp"] == 31.0
+
