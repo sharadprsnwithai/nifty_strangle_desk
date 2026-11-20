@@ -131,7 +131,7 @@ class StrangleDesk:
         order_type: str,
         limit_buffer_pct: float,
         state: Dict[str, Any],
-        min_buffer_rs: float = 0.0
+        min_buffer_rs: float = 1.5
     ) -> bool:
         """
         Safely executes buy_to_cover for a single strangle leg.
@@ -1047,10 +1047,10 @@ class StrangleDesk:
                 pe_ltp = self._extract_ltp(quotes, pe_sym, default=state["pe"]["entry_price"])
 
                 if state["ce"].get("status") == "OPEN":
-                    self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "TIME_EXIT", order_type, limit_buffer_pct, state)
+                    self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "TIME_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
 
                 if state["pe"].get("status") == "OPEN":
-                    self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "TIME_EXIT", order_type, limit_buffer_pct, state)
+                    self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "TIME_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
 
                 if state["ce"].get("status") == "CLOSED" and state["pe"].get("status") == "CLOSED":
                     state["status"] = "COMPLETED"
@@ -1115,9 +1115,9 @@ class StrangleDesk:
                     abs(total_strategy_pnl), effective_max_loss
                 )
                 if state["ce"].get("status") == "OPEN":
-                    self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state)
+                    self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
                 if state["pe"].get("status") == "OPEN":
-                    self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state)
+                    self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
                 if self.notifier:
                     total_day_pnl = self._get_current_day_pnl(state, qty)
                     self.notifier.send_message(
@@ -1134,7 +1134,7 @@ class StrangleDesk:
                     if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
                         # Close opposite PE leg simultaneously to avoid naked single-leg risk
                         if state["pe"].get("status") == "OPEN":
-                            self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state)
+                            self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
                         if self.notifier:
                             ce_entry = float(state["ce"]["entry_price"])
                             leg_pnl = (ce_entry - ce_ltp) * qty
@@ -1155,7 +1155,7 @@ class StrangleDesk:
                     if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
                         # Close opposite CE leg simultaneously to avoid naked single-leg risk
                         if state["ce"].get("status") == "OPEN":
-                            self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state)
+                            self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
                         if self.notifier:
                             pe_entry = float(state["pe"]["entry_price"])
                             leg_pnl = (pe_entry - pe_ltp) * qty

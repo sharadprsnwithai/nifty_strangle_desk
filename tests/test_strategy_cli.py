@@ -923,8 +923,41 @@ def test_safe_exit_leg_uses_position_product(tmp_path):
     )
     assert success is True
     om.buy_to_cover.assert_called_once_with(
-        "NIFTY26N0924400CE", 650, 35.0, reason="STOP_LOSS", order_type="LIMIT", buffer_pct=0.05, product="NRML"
+        "NIFTY26N0924400CE", 650, 35.0, reason="STOP_LOSS", order_type="LIMIT", buffer_pct=0.05, product="NRML", min_buffer_rs=1.5
     )
+
+
+def test_safe_exit_leg_enforces_universal_min_buffer_rs_floor(tmp_path):
+    """
+    Test that _safe_exit_leg enforces a universal min_buffer_rs=1.5 floor across all exits,
+    ensuring low-priced options (e.g. Rs 6.0) get at least Rs 1.50 buffer rather than 5% (Rs 0.30).
+    """
+    state_file = tmp_path / "trades_today.json"
+    om = OrderManager(mode="PAPER")
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+
+    state = {
+        "ce": {"symbol": "NIFTY26N0924400CE", "status": "OPEN", "product": "MIS"},
+        "pe": {"symbol": "NIFTY26N0923400PE", "status": "OPEN", "product": "MIS"}
+    }
+    desk.save_state(state)
+
+    # Low premium exit at Rs 6.00: 5% is only Rs 0.30, but min_buffer_rs=1.5 floor gives Rs 7.50
+    desk._safe_exit_leg(
+        leg_name="ce",
+        symbol="NIFTY26N0924400CE",
+        qty=65,
+        exit_price=6.0,
+        reason="TIME_EXIT",
+        order_type="LIMIT",
+        limit_buffer_pct=0.05,
+        state=state
+    )
+
+    paper_order = om._paper_orders.get("PAPER_BUY_NIFTY26N0924400CE")
+    assert paper_order is not None
+    # 6.0 + 1.5 = 7.50 (rather than 6.0 * 1.05 = 6.30)
+    assert paper_order["limit_price"] == 7.50
 
 
 def test_run_strategy_cli_product_flag():
