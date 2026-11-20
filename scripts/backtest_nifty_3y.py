@@ -7,13 +7,15 @@ sys.path.insert(0, os.path.abspath("."))
 from strategy.backtest import run_backtest_simulation
 
 print("=" * 115)
-print("     NIFTY 10:00 AM INTRADAY STRANGLE: 3-YEAR BACKTEST (10 LOTS | RS 10,000 PORTFOLIO SL)")
+print("     NIFTY 10:00 AM ADAPTIVE STRANGLE (1.25x ATR + MORNING FILTER): 3-YEAR BACKTEST")
+print("                     (10 LOTS | RS 10,000 PORTFOLIO MAX LOSS)")
 print("=" * 115)
 
 df = pd.read_parquet("data/nifty_5m_3y.parquet")
 print(f"Loaded {len(df)} 5m bars from {df['date'].min()} to {df['date'].max()}")
 
 # Run backtest with 10 lots (lot_size=65 -> 650 qty), strategy_max_loss=10,000, slippage=0.50
+# Uses default adaptive logic: 1.25x ATR Strikes + Morning Range Trend Filter (0.60%)
 res = run_backtest_simulation(
     df,
     slippage=0.50,
@@ -21,7 +23,11 @@ res = run_backtest_simulation(
     lot_size=65,
     iv=0.13,
     r=0.065,
-    strategy_max_loss=10000.0
+    strategy_max_loss=10000.0,
+    use_atr_strikes=True,
+    atr_multiplier=1.25,
+    morning_filter=True,
+    morning_filter_threshold_pct=0.60
 )
 
 summary = res["summary"]

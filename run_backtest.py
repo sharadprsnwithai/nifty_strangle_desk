@@ -93,6 +93,11 @@ def run_backtest_cli(args=None) -> int:
     parser.add_argument("--exit-cutoff", type=str, default="14:45", help="Intraday square-off cutoff time HH:MM (default: 14:45)")
     parser.add_argument("--expiry-weekday", type=int, default=1, help="Expiry weekday (0=Mon, 1=Tue, ..., 3=Thu. Default: 1 for Tuesday)")
     parser.add_argument("--iv", type=float, default=0.13, help="Option IV (default: 0.13)")
+    parser.add_argument("--strike-mode", choices=["ATR", "PRICE"], default="ATR", help="Strike selection mode (ATR: 1.25x ATR distance, PRICE: Rs 30 premium, default: ATR)")
+    parser.add_argument("--atr-multiplier", type=float, default=1.25, help="ATR multiplier for strike distance (default: 1.25)")
+    parser.add_argument("--morning-filter", dest="morning_filter", action="store_true", default=True, help="Enable 09:15-10:00 AM range trend filter (default: True)")
+    parser.add_argument("--no-morning-filter", dest="morning_filter", action="store_false", help="Disable morning trend filter")
+    parser.add_argument("--morning-filter-pct", type=float, default=0.60, help="Morning range percentage threshold to skip session (default: 0.60)")
     parser.add_argument("--output", type=str, default="data/backtest_trade_log.csv", help="CSV trade log path")
     parser.add_argument("--force-fetch", action="store_true", help="Force fresh fetch from Kite Connect API, bypassing local cache")
 
@@ -113,7 +118,11 @@ def run_backtest_cli(args=None) -> int:
             expiry_weekday=parsed.expiry_weekday,
             strategy_max_loss=parsed.strategy_max_loss,
             use_leg_sl=parsed.use_leg_sl,
-            exit_cutoff_time=exit_cutoff
+            exit_cutoff_time=exit_cutoff,
+            morning_filter=parsed.morning_filter,
+            morning_filter_threshold_pct=parsed.morning_filter_pct,
+            use_atr_strikes=(parsed.strike_mode.upper() == "ATR"),
+            atr_multiplier=parsed.atr_multiplier
         )
 
         summary = results["summary"]
