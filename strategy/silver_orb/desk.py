@@ -233,13 +233,13 @@ class SilverORBDesk:
     # -------------------------------------------------------------------------
     # Market Data & Signal Processing
     # -------------------------------------------------------------------------
-    def fetch_recent_candles(self, token: int, num_candles: int = 70) -> Optional[pd.DataFrame]:
-        """Fetches recent 15m candles from Kite Connect."""
+    def fetch_recent_candles(self, token: int, num_days: int = 35) -> Optional[pd.DataFrame]:
+        """Fetches recent 15m candles from Kite Connect for multi-week time-slot volume profiling."""
         if not self.kite:
             return None
         try:
             to_d = datetime.now()
-            from_d = to_d - timedelta(days=6)
+            from_d = to_d - timedelta(days=num_days)
             records = self.kite.historical_data(token, from_d.strftime("%Y-%m-%d"), to_d.strftime("%Y-%m-%d"), "15minute")
             if not records:
                 return None
@@ -277,7 +277,7 @@ class SilverORBDesk:
     ) -> Optional[Dict[str, Any]]:
         """
         Evaluates whether the last closed 15m candle forms a valid 18:00 breakout
-        confirmed by 50 EMA trend filter and 1.2x volume average.
+        confirmed by 50 EMA trend filter and time-slot specific volume profiling (Point 4).
         Only completed candles are considered (ignoring currently forming bars).
         """
         if df is None or len(df) < 50:
@@ -306,7 +306,9 @@ class SilverORBDesk:
         if len(work_df) < 50:
             return None
 
-        work_df["vol_sma20"] = work_df["volume"].rolling(20).mean().shift(1)
+        if "time" not in work_df.columns:
+            work_df["time"] = pd.to_datetime(work_df["date"]).dt.time
+
         work_df["ema50"] = work_df["close"].ewm(span=50, adjust=False).mean()
 
         latest_bar = work_df.iloc[-1]
@@ -315,7 +317,19 @@ class SilverORBDesk:
         b_close = float(latest_bar["close"])
         b_open = float(latest_bar["open"])
         b_vol = float(latest_bar["volume"])
-        vol_avg = float(latest_bar["vol_sma20"]) if not np.isnan(latest_bar["vol_sma20"]) else 100.0
+        latest_time = latest_bar["time"]
+
+        # Time-slot specific volume profiling (Point 4):
+        # Compare volume of current breakout candle against the historical 20-day average for the SAME time slot.
+        # Exclude the currently evaluated candle itself (iloc[:-1]).
+        slot_bars = work_df.iloc[:-1][work_df.iloc[:-1]["time"] == latest_time]
+        if len(slot_bars) >= 5:
+            vol_avg = float(slot_bars["volume"].tail(20).mean())
+        else:
+            # Fallback to rolling 20 SMA if slot history has fewer than 5 samples (e.g. newly added contract or short test mock)
+            work_df["vol_sma20"] = work_df["volume"].rolling(20).mean().shift(1)
+            vol_avg = float(work_df.iloc[-1]["vol_sma20"]) if not np.isnan(work_df.iloc[-1]["vol_sma20"]) else 100.0
+
         ema50_val = float(latest_bar["ema50"])
 
         vol_ok = b_vol >= self.config.vol_multiplier * vol_avg

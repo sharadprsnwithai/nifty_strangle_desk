@@ -747,5 +747,129 @@ def test_silver_exchange_sl_race_condition_broker_qty_zero_prevents_secondary_ex
     mock_om.place_exit.assert_not_called()
 
 
+def test_time_slot_volume_profiling_rejects_subpar_volume():
+    """
+    Point 4: Breakout candle has 350 volume.
+    Afternoon volume is 100 (so rolling 20 SMA is ~100).
+    Under Baseline, 350 >= 1.2 * 100 = 120, so it would have triggered.
+    Under Point 4, previous 10 days of 18:00 candle averaged 500 volume.
+    Required volume is 1.2 * 500 = 600.
+    Since 350 < 600, Point 4 correctly rejects the false breakout.
+    """
+    cfg = SilverORBConfig(use_trend_filter=True, vol_multiplier=1.2)
+    desk = SilverORBDesk(config=cfg, kite=None)
+
+    # Build 10 days of historical data, each with 18:00 bar having volume 500
+    rows = []
+    base_date = datetime(2026, 10, 20, 9, 0)
+    for d in range(10):
+        day_start = base_date + timedelta(days=d)
+        for h in range(9, 23):
+            for m in (0, 15, 30, 45):
+                bar_dt = day_start.replace(hour=h, minute=m)
+                # Afternoon bars volume 100, 18:00 bars volume 500
+                vol = 500.0 if (h == 18 and m == 0) else 100.0
+                rows.append({
+                    "date": bar_dt,
+                    "time": bar_dt.time(),
+                    "open": 180000.0,
+                    "high": 180100.0,
+                    "low": 179900.0,
+                    "close": 180050.0,
+                    "volume": vol,
+                })
+
+    # Add today's 18:00 breakout candle: high=182600 > ref_h=182500, close=182550 > ref_h, volume=350
+    today_1800 = (base_date + timedelta(days=10)).replace(hour=18, minute=0)
+    rows.append({
+        "date": today_1800,
+        "time": today_1800.time(),
+        "open": 182400.0,
+        "high": 182600.0,
+        "low": 182350.0,
+        "close": 182550.0,
+        "volume": 350.0,  # Below 1.2 * 500 = 600
+    })
+
+    df = pd.DataFrame(rows)
+    ref_h = 182500.0
+    ref_l = 182000.0
+
+    eval_dt = today_1800.replace(minute=15, second=5)
+    sig = desk.evaluate_breakout_signal(df, ref_h, ref_l, dt_time(18, 15), current_dt=eval_dt)
+    # Signal must be REJECTED because volume 350 is below time-slot requirement of 600
+    assert sig is None
+
+
+def test_time_slot_volume_profiling_accepts_conviction_volume():
+    """
+    Point 4: Breakout candle has 650 volume (> 1.2 * 500 = 600).
+    Signal must be ACCEPTED with LONG direction.
+    """
+    cfg = SilverORBConfig(use_trend_filter=True, vol_multiplier=1.2)
+    desk = SilverORBDesk(config=cfg, kite=None)
+
+    rows = []
+    base_date = datetime(2026, 10, 20, 9, 0)
+    for d in range(10):
+        day_start = base_date + timedelta(days=d)
+        for h in range(9, 23):
+            for m in (0, 15, 30, 45):
+                bar_dt = day_start.replace(hour=h, minute=m)
+                vol = 500.0 if (h == 18 and m == 0) else 100.0
+                rows.append({
+                    "date": bar_dt,
+                    "time": bar_dt.time(),
+                    "open": 180000.0,
+                    "high": 180100.0,
+                    "low": 179900.0,
+                    "close": 180050.0,
+                    "volume": vol,
+                })
+
+    today_1800 = (base_date + timedelta(days=10)).replace(hour=18, minute=0)
+    rows.append({
+        "date": today_1800,
+        "time": today_1800.time(),
+        "open": 182400.0,
+        "high": 182600.0,
+        "low": 182350.0,
+        "close": 182550.0,
+        "volume": 650.0,  # Above 1.2 * 500 = 600
+    })
+
+    df = pd.DataFrame(rows)
+    ref_h = 182500.0
+    ref_l = 182000.0
+
+    eval_dt = today_1800.replace(minute=15, second=5)
+    sig = desk.evaluate_breakout_signal(df, ref_h, ref_l, dt_time(18, 15), current_dt=eval_dt)
+    assert sig is not None
+    assert sig["direction"] == "LONG"
+    assert sig["trigger_price"] == ref_h + 5.0
+
+
+def test_fetch_recent_candles_uses_35_days_for_slot_profiling():
+    """Verify fetch_recent_candles defaults to 35 days for multi-week slot volume history."""
+    mock_kite = MagicMock()
+    mock_kite.historical_data.return_value = [
+        {"date": "2026-11-01 09:15:00", "open": 100, "high": 105, "low": 95, "close": 102, "volume": 500}
+    ]
+    desk = SilverORBDesk(kite=mock_kite)
+    df = desk.fetch_recent_candles(token=123668487)
+    assert df is not None
+    assert len(df) == 1
+
+    # Verify call args had ~35 days difference
+    call_args = mock_kite.historical_data.call_args[0]
+    token_arg, from_str, to_str, interval_arg = call_args
+    assert token_arg == 123668487
+    assert interval_arg == "15minute"
+    from_d = datetime.strptime(from_str, "%Y-%m-%d")
+    to_d = datetime.strptime(to_str, "%Y-%m-%d")
+    assert (to_d - from_d).days == 35
+
+
+
 
 
