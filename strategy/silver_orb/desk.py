@@ -433,6 +433,46 @@ class SilverORBDesk:
             if broker_qty is not None:
                 has_valid_pos = (direction == "SHORT" and broker_qty < 0) or (direction == "LONG" and broker_qty > 0)
                 if not has_valid_pos:
+                    # Check if the resting broker SL filled on exchange causing position to become flat
+                    if broker_qty == 0 and sl_order_id:
+                        for _ in range(4):
+                            sl_stat = self.order_manager.get_order_status(sl_order_id)
+                            if sl_stat.get("status") == "COMPLETE":
+                                fill_p = float(sl_stat.get("average_price") or current_sl)
+                                loss_pts = (entry - fill_p) if direction == "LONG" else (fill_p - entry)
+                                trade_loss = -loss_pts * self.config.point_value_per_lot * trade["lots_open"]
+                                trade["status"] = "CLOSED"
+                                trade["lot1_closed"] = True
+                                trade["lot2_closed"] = True
+                                trade["lot1_exit_price"] = fill_p
+                                trade["lot2_exit_price"] = fill_p
+                                trade["lots_open"] = 0
+                                state["status"] = "COMPLETED"
+                                state["realized_pnl_rs"] += trade_loss
+                                self.save_state(state)
+                                logger.warning("[EXCHANGE SL TRIGGERED ON FLAT RECONCILE] Broker Stop Loss %s executed on exchange @ Rs %.1f (Loss: Rs %.2f)", sl_order_id, fill_p, trade_loss)
+                                self._notify_sl(trade, fill_p, trade_loss, state["realized_pnl_rs"])
+                                return
+
+                        # If price has breached SL level and position is already flat, reconcile as SL closed
+                        hit_sl_test = (direction == "LONG" and current_ltp <= current_sl) or (direction == "SHORT" and current_ltp >= current_sl)
+                        if hit_sl_test:
+                            fill_p = current_sl
+                            loss_pts = (entry - fill_p) if direction == "LONG" else (fill_p - entry)
+                            trade_loss = -loss_pts * self.config.point_value_per_lot * trade["lots_open"]
+                            trade["status"] = "CLOSED"
+                            trade["lot1_closed"] = True
+                            trade["lot2_closed"] = True
+                            trade["lot1_exit_price"] = fill_p
+                            trade["lot2_exit_price"] = fill_p
+                            trade["lots_open"] = 0
+                            state["status"] = "COMPLETED"
+                            state["realized_pnl_rs"] += trade_loss
+                            self.save_state(state)
+                            logger.info("[SL RECONCILED ON POSITION FLAT] Broker position is 0 and price breached SL. Position reconciled as CLOSED.")
+                            self._notify_sl(trade, fill_p, trade_loss, state["realized_pnl_rs"])
+                            return
+
                     logger.critical(
                         "[DESYNC ERROR] Position mismatch for %s! Strategy expects active %s position (%d lots), but Kite net quantity is %d. Aborting exit order to prevent naked trade.",
                         sym, direction, trade.get("lots_open", 0), broker_qty
@@ -489,16 +529,46 @@ class SilverORBDesk:
                 return
 
             elif hit_sl_early:
-                # Cancel broker SL before placing market exit (or let it fire)
-                if sl_order_id:
-                    self.order_manager.cancel_broker_sl(sl_order_id)
-                exit_price = current_sl
-                try:
-                    exit_res = self.order_manager.place_exit(sym, direction, trade["lots_total"], exit_price, reason="INITIAL_STOP_LOSS")
-                except Exception as exit_err:
-                    logger.error("Failed to place Stop Loss exit order for %s: %s", sym, exit_err, exc_info=True)
-                    return
-                fill_p = float(exit_res.get("average_price") or exit_price) if isinstance(exit_res, dict) else exit_price
+                fill_p = current_sl
+                executed_on_exchange = False
+
+                # 1. In LIVE mode with an active broker SL order, check if exchange already executed
+                if sl_order_id and self.config.mode == "LIVE":
+                    sl_stat = self.order_manager.get_order_status(sl_order_id)
+                    if sl_stat.get("status") == "COMPLETE":
+                        fill_p = float(sl_stat.get("average_price") or current_sl)
+                        executed_on_exchange = True
+                    elif sl_stat.get("status") in ("TRIGGER PENDING", "OPEN"):
+                        # Price breached trigger; wait briefly for exchange matching engine fill
+                        for _ in range(4):
+                            time.sleep(0.5)
+                            sl_stat = self.order_manager.get_order_status(sl_order_id)
+                            if sl_stat.get("status") == "COMPLETE":
+                                fill_p = float(sl_stat.get("average_price") or current_sl)
+                                executed_on_exchange = True
+                                break
+
+                if not executed_on_exchange:
+                    # Cancel broker SL before placing emergency market/limit exit
+                    if sl_order_id:
+                        self.order_manager.cancel_broker_sl(sl_order_id)
+
+                    # Safeguard: check broker position before submitting secondary exit order
+                    if self.config.mode == "LIVE" and self.kite is not None:
+                        broker_qty = self.check_broker_position_qty(sym)
+                        if broker_qty is not None and broker_qty == 0:
+                            logger.info("[SL RECONCILED] Broker position is already 0 for %s. Exchange SL filled during cancellation.", sym)
+                            executed_on_exchange = True
+
+                    if not executed_on_exchange:
+                        exit_price = current_sl
+                        try:
+                            exit_res = self.order_manager.place_exit(sym, direction, trade["lots_total"], exit_price, reason="INITIAL_STOP_LOSS")
+                        except Exception as exit_err:
+                            logger.error("Failed to place Stop Loss exit order for %s: %s", sym, exit_err, exc_info=True)
+                            return
+                        fill_p = float(exit_res.get("average_price") or exit_price) if isinstance(exit_res, dict) else exit_price
+
                 loss_pts = (entry - fill_p) if direction == "LONG" else (fill_p - entry)
                 trade_loss = -loss_pts * self.config.point_value_per_lot * trade["lots_total"]
                 trade["status"] = "CLOSED"
@@ -512,7 +582,11 @@ class SilverORBDesk:
                 state["status"] = "COMPLETED"
                 state["realized_pnl_rs"] += trade_loss
                 self.save_state(state)
-                logger.warning("Stop loss hit on all %d lots @ Rs %.1f (Loss: Rs %.2f)", trade["lots_total"], fill_p, trade_loss)
+                logger.warning(
+                    "Stop loss hit on all %d lots @ Rs %.1f (Loss: Rs %.2f, Source: %s)",
+                    trade["lots_total"], fill_p, trade_loss,
+                    "EXCHANGE_SL" if executed_on_exchange else "ORDER_MANAGER_EXIT"
+                )
                 self._notify_sl(trade, fill_p, trade_loss, state["realized_pnl_rs"])
                 return
 
@@ -524,23 +598,59 @@ class SilverORBDesk:
             hit_eod = current_time >= self.config.session_cutoff_time
 
             if hit_be_sl:
-                if sl_order_id:
-                    self.order_manager.cancel_broker_sl(sl_order_id)
-                exit_price = current_sl
-                lot2_pnl = 0.0  # Stopped out flat at cost
-                try:
-                    self.order_manager.place_exit(sym, direction, lot2_lots, exit_price, reason="TRAILED_BREAKEVEN_EXIT")
-                except Exception as exit_err:
-                    logger.error("Failed to place Breakeven exit order for %s: %s", sym, exit_err, exc_info=True)
-                    return
+                fill_p = current_sl
+                executed_on_exchange = False
+
+                # 1. In LIVE mode with an active broker SL order for the runner, check if exchange already executed
+                if sl_order_id and self.config.mode == "LIVE":
+                    sl_stat = self.order_manager.get_order_status(sl_order_id)
+                    if sl_stat.get("status") == "COMPLETE":
+                        fill_p = float(sl_stat.get("average_price") or current_sl)
+                        executed_on_exchange = True
+                    elif sl_stat.get("status") in ("TRIGGER PENDING", "OPEN"):
+                        for _ in range(4):
+                            time.sleep(0.5)
+                            sl_stat = self.order_manager.get_order_status(sl_order_id)
+                            if sl_stat.get("status") == "COMPLETE":
+                                fill_p = float(sl_stat.get("average_price") or current_sl)
+                                executed_on_exchange = True
+                                break
+
+                if not executed_on_exchange:
+                    if sl_order_id:
+                        self.order_manager.cancel_broker_sl(sl_order_id)
+
+                    # Safeguard: check broker position before submitting secondary exit order
+                    if self.config.mode == "LIVE" and self.kite is not None:
+                        broker_qty = self.check_broker_position_qty(sym)
+                        if broker_qty is not None and broker_qty == 0:
+                            logger.info("[BE RECONCILED] Broker position is already 0 for %s. Exchange SL filled during cancellation.", sym)
+                            executed_on_exchange = True
+
+                    if not executed_on_exchange:
+                        exit_price = current_sl
+                        try:
+                            exit_res = self.order_manager.place_exit(sym, direction, lot2_lots, exit_price, reason="TRAILED_BREAKEVEN_EXIT")
+                        except Exception as exit_err:
+                            logger.error("Failed to place Breakeven exit order for %s: %s", sym, exit_err, exc_info=True)
+                            return
+                        fill_p = float(exit_res.get("average_price") or exit_price) if isinstance(exit_res, dict) else exit_price
+
+                pts = (fill_p - entry) if direction == "LONG" else (entry - fill_p)
+                lot2_pnl = pts * self.config.point_value_per_lot * lot2_lots
                 trade["status"] = "CLOSED"
                 trade["lot2_closed"] = True
-                trade["lot2_exit_price"] = exit_price
+                trade["lot2_exit_price"] = fill_p
                 trade["lot2_pnl_rs"] = lot2_pnl
                 trade["lots_open"] = 0
                 state["status"] = "COMPLETED"
+                state["realized_pnl_rs"] += lot2_pnl
                 self.save_state(state)
-                logger.info("Runner (%d lots) stopped out at Breakeven (Rs %.1f). Trade completed.", lot2_lots, exit_price)
+                logger.info(
+                    "Runner (%d lots) stopped out at Breakeven @ Rs %.1f (P&L: Rs %.2f, Source: %s). Trade completed.",
+                    lot2_lots, fill_p, lot2_pnl,
+                    "EXCHANGE_SL" if executed_on_exchange else "ORDER_MANAGER_EXIT"
+                )
                 self._notify_runner_exit(trade, "TRAILED_BREAKEVEN_EXIT", state["realized_pnl_rs"])
                 return
 

@@ -757,14 +757,36 @@ class StrangleDesk:
             pe_info = strikes["pe"]
             total_qty = strikes["total_quantity"]
 
+            # Place CE and PE entry orders concurrently to eliminate execution latency & unhedged delta
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _place_leg_order(leg_sym: str, leg_ltp: float) -> Dict[str, Any]:
+                return self.order_manager.sell(
+                    leg_sym, total_qty, leg_ltp, order_type=order_type, buffer_pct=limit_buffer_pct
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_ce = executor.submit(_place_leg_order, ce_info["symbol"], ce_info["ltp"])
+                future_pe = executor.submit(_place_leg_order, pe_info["symbol"], pe_info["ltp"])
+
             ce_order = None
             pe_order = None
+            ce_err = None
+            pe_err = None
+
             try:
-                ce_order = self.order_manager.sell(
-                    ce_info["symbol"], total_qty, ce_info["ltp"], order_type=order_type, buffer_pct=limit_buffer_pct
-                )
+                ce_order = future_ce.result()
             except Exception as e:
-                err_msg = f"Failed to place CE entry order ({ce_info['symbol']}): {e}"
+                ce_err = e
+
+            try:
+                pe_order = future_pe.result()
+            except Exception as e:
+                pe_err = e
+
+            # Handle failures
+            if ce_err and pe_err:
+                err_msg = f"Failed to place CE entry order ({ce_info['symbol']}): {ce_err} (PE also failed: {pe_err})"
                 logger.error(err_msg)
                 if self.notifier:
                     import html
@@ -779,12 +801,41 @@ class StrangleDesk:
                 self.save_state(aborted_state)
                 return aborted_state
 
-            try:
-                pe_order = self.order_manager.sell(
-                    pe_info["symbol"], total_qty, pe_info["ltp"], order_type=order_type, buffer_pct=limit_buffer_pct
-                )
-            except Exception as e:
-                err_msg = f"Failed to place PE entry order ({pe_info['symbol']}) after CE placed: {e}. Squaring off CE leg..."
+            if ce_err and not pe_err:
+                err_msg = f"Failed to place CE entry order ({ce_info['symbol']}): {ce_err}. Squaring off PE leg..."
+                logger.error(err_msg)
+                if self.notifier:
+                    import html
+                    self.notifier.send_message(f"🚨 <b>Strangle Desk Error</b>: {html.escape(err_msg)}")
+                pe_id = pe_order.get("order_id") if isinstance(pe_order, dict) else None
+                if pe_id:
+                    try:
+                        self.order_manager.cancel_order(pe_id)
+                        pe_status = self.wait_for_order_completion(pe_id, timeout_seconds=5, poll_seconds=1, execute_once=True)
+                        pe_filled = int(pe_status.get("filled_quantity") or 0)
+                        if pe_filled > 0:
+                            logger.warning("PE leg was partially/fully filled (%d qty). Buying back to close exposure...", pe_filled)
+                            self.order_manager.buy_to_cover(
+                                symbol=pe_info["symbol"],
+                                quantity=pe_filled,
+                                price=pe_info["ltp"] * 1.05,
+                                reason="ABORT_CLEANUP",
+                                order_type=order_type
+                            )
+                    except Exception as clean_err:
+                        logger.error("Failed to clean up PE leg after CE entry failure: %s", clean_err)
+                aborted_state = {
+                    "status": "ABORTED",
+                    "reason": err_msg,
+                    "date": today_str,
+                    "underlying": underlying,
+                    "expiry": str(strikes.get("expiry")) if isinstance(strikes, dict) else None,
+                }
+                self.save_state(aborted_state)
+                return aborted_state
+
+            if pe_err and not ce_err:
+                err_msg = f"Failed to place PE entry order ({pe_info['symbol']}) after CE placed: {pe_err}. Squaring off CE leg..."
                 logger.error(err_msg)
                 if self.notifier:
                     import html

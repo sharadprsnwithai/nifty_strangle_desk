@@ -501,6 +501,7 @@ def test_exchange_stop_loss_trigger_detection(tmp_path):
     state_file = tmp_path / "silver_state.json"
     notifier_mock = MagicMock()
     mock_kite = MagicMock()
+    mock_kite.positions.return_value = {"net": [{"tradingsymbol": "SILVERM26NOVFUT", "quantity": -2}]}
     mock_om = MagicMock()
 
     # Simulate broker SL executed on Kite directly
@@ -627,6 +628,124 @@ def test_default_order_type_is_limit_with_buffer():
     call_kwargs = mock_kite.place_order.call_args[1]
     assert call_kwargs["order_type"] == mock_kite.ORDER_TYPE_LIMIT
     assert call_kwargs["price"] == 164607.0 - 80.0  # 164527.0
+
+
+def test_silver_exchange_sl_race_condition_trigger_pending_to_complete(tmp_path):
+    """
+    Test that when price breaches SL in LIVE mode, if the exchange SL order
+    transitions from TRIGGER PENDING to COMPLETE during the wait window,
+    the desk adopts the fill and does NOT place a secondary exit order.
+    """
+    state_file = tmp_path / "silver_state.json"
+    notifier_mock = MagicMock()
+    mock_kite = MagicMock()
+    mock_kite.positions.return_value = {"net": [{"tradingsymbol": "SILVERM26NOVFUT", "quantity": -2}]}
+    mock_om = MagicMock()
+
+    # Initial tick status is TRIGGER PENDING, then transitions to COMPLETE
+    mock_om.get_order_status.side_effect = [
+        {"status": "TRIGGER PENDING"},
+        {"status": "TRIGGER PENDING"},
+        {"status": "COMPLETE", "average_price": 172108.0, "filled_quantity": 2},
+    ]
+
+    cfg = SilverORBConfig(state_file=str(state_file), mode="LIVE", lots=2, initial_sl_pts=500.0)
+    desk = SilverORBDesk(config=cfg, kite=mock_kite, order_manager=mock_om, notifier=notifier_mock)
+
+    desk.state = {
+        "date": "2026-11-16",
+        "status": "ACTIVE_TRADE",
+        "contract": {"tradingsymbol": "SILVERM26NOVFUT", "instrument_token": 123},
+        "realized_pnl_rs": 0.0,
+        "trade": {
+            "symbol": "SILVERM26NOVFUT",
+            "direction": "SHORT",
+            "entry_price": 171600.0,
+            "initial_sl": 172100.0,
+            "current_sl": 172100.0,
+            "target1_price": 170800.0,
+            "lots_total": 2,
+            "lots_open": 2,
+            "lot1_closed": False,
+            "lot1_exit_price": None,
+            "lot1_pnl_rs": 0.0,
+            "lot2_closed": False,
+            "lot2_exit_price": None,
+            "lot2_pnl_rs": 0.0,
+            "be_moved": False,
+            "status": "OPEN",
+            "sl_order_id": "SL_ORDER_777",
+        },
+    }
+    desk.save_state(desk.state)
+
+    with patch("time.sleep", return_value=None):
+        desk.monitor_active_trade(current_ltp=172110.0, current_time=dt_time(19, 10))
+
+    trade = desk.state["trade"]
+    assert trade["status"] == "CLOSED"
+    assert trade["lots_open"] == 0
+    assert trade["lot1_exit_price"] == 172108.0
+    assert desk.state["status"] == "COMPLETED"
+    # Never call place_exit - adopted exchange order directly!
+    mock_om.place_exit.assert_not_called()
+
+
+def test_silver_exchange_sl_race_condition_broker_qty_zero_prevents_secondary_exit(tmp_path):
+    """
+    Test that when price breaches SL in LIVE mode, if exchange SL status is not complete,
+    but broker net position quantity is already 0, the desk reconciles without placing an exit order.
+    """
+    state_file = tmp_path / "silver_state.json"
+    notifier_mock = MagicMock()
+    mock_kite = MagicMock()
+    mock_kite.positions.return_value = {"net": [{"tradingsymbol": "SILVERM26NOVFUT", "quantity": -2}]}
+    mock_om = MagicMock()
+
+    mock_om.get_order_status.return_value = {"status": "OPEN"}
+    # Broker position shows flat 0 qty
+    mock_kite.positions.return_value = {"net": []}
+
+    cfg = SilverORBConfig(state_file=str(state_file), mode="LIVE", lots=2, initial_sl_pts=500.0)
+    desk = SilverORBDesk(config=cfg, kite=mock_kite, order_manager=mock_om, notifier=notifier_mock)
+
+    desk.state = {
+        "date": "2026-11-16",
+        "status": "ACTIVE_TRADE",
+        "contract": {"tradingsymbol": "SILVERM26NOVFUT", "instrument_token": 123},
+        "realized_pnl_rs": 0.0,
+        "trade": {
+            "symbol": "SILVERM26NOVFUT",
+            "direction": "LONG",
+            "entry_price": 185000.0,
+            "initial_sl": 184500.0,
+            "current_sl": 184500.0,
+            "target1_price": 185800.0,
+            "lots_total": 2,
+            "lots_open": 2,
+            "lot1_closed": False,
+            "lot1_exit_price": None,
+            "lot1_pnl_rs": 0.0,
+            "lot2_closed": False,
+            "lot2_exit_price": None,
+            "lot2_pnl_rs": 0.0,
+            "be_moved": False,
+            "status": "OPEN",
+            "sl_order_id": "SL_ORDER_888",
+        },
+    }
+    desk.save_state(desk.state)
+
+    with patch("time.sleep", return_value=None):
+        desk.monitor_active_trade(current_ltp=184490.0, current_time=dt_time(19, 10))
+
+    trade = desk.state["trade"]
+    assert trade["status"] == "CLOSED"
+    assert trade["lots_open"] == 0
+    assert desk.state["status"] == "COMPLETED"
+    # Never call place_exit - detected broker position is already flat!
+    mock_om.place_exit.assert_not_called()
+
 
 
 

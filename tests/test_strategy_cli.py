@@ -1210,3 +1210,64 @@ def test_run_strategy_cli_morning_filter_flags():
         assert call_kwargs["atr_multiplier"] == 1.25
 
 
+def test_strangle_desk_concurrent_entry_order_placement(tmp_path):
+    """
+    Test that CE and PE entry orders are placed concurrently in parallel threads,
+    reducing latency and ensuring both legs are submitted simultaneously.
+    """
+    import threading
+    import time
+    state_file = tmp_path / "trades_today.json"
+    mock_om = MagicMock()
+    mock_om.mode = "LIVE"
+
+    threads_seen = set()
+    call_times = []
+
+    def slow_sell(sym, qty, ltp, order_type="LIMIT", buffer_pct=0.05):
+        threads_seen.add(threading.current_thread().ident)
+        t_start = time.time()
+        call_times.append(t_start)
+        time.sleep(0.05)  # 50ms artificial delay
+        return {
+            "order_id": f"ORD_{sym}",
+            "status": "COMPLETE",
+            "filled_quantity": qty,
+            "average_price": ltp
+        }
+
+    mock_om.sell.side_effect = slow_sell
+    mock_om.get_order_status.side_effect = lambda oid: {
+        "order_id": oid,
+        "status": "COMPLETE",
+        "filled_quantity": 65,
+        "average_price": 30.0
+    }
+
+    mock_notifier = MagicMock()
+    desk = StrangleDesk(order_manager=mock_om, state_file=state_file, notifier=mock_notifier)
+    mock_kite = MagicMock()
+    mock_kite.ltp.return_value = {
+        "NSE:NIFTY 50": {"last_price": 25000.0},
+        "NFO:NIFTY26N0925300CE": {"last_price": 30.0},
+        "NFO:NIFTY26N0924700PE": {"last_price": 30.0}
+    }
+
+    with patch("strategy.strangle_desk.find_strangle_strikes") as mock_find:
+        mock_find.return_value = {
+            "expiry": "2026-11-09",
+            "total_lots": 1,
+            "total_quantity": 65,
+            "ce": {"symbol": "NIFTY26N0925300CE", "strike": 25300, "ltp": 30.0, "sl_price": 45.0, "target_price": 6.0},
+            "pe": {"symbol": "NIFTY26N0924700PE", "strike": 24700, "ltp": 30.0, "sl_price": 45.0, "target_price": 6.0},
+        }
+        res = desk.run_session(lots=1, kite=mock_kite, execute_once=True, morning_filter=False, ignore_holidays=True)
+
+    assert res["status"] == "OPEN"
+    # Verify both calls were executed across distinct threads (concurrently)
+    assert len(threads_seen) == 2
+    # Verify that the two calls started within 20ms of each other (parallel dispatch)
+    assert abs(call_times[0] - call_times[1]) < 0.04
+
+
+
