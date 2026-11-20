@@ -1,13 +1,12 @@
 """Multi-Timeframe Technical Signal Engine for MCX Silver Options Desk.
 
 Implements:
-- 14-period Wilder's / Exponential RSI calculation.
-- Daily RSI Bullish/Bearish Divergence detection (e.g. daily RSI < 25 or > 70).
+- 14-period Wilder's / Exponential RSI calculation with boundary-safe zero-loss handling.
+- Daily RSI Bullish/Bearish Divergence detection (e.g. daily RSI < 25 or > 70) with 5-20 bar lookback.
 - Hourly 20 EMA confirmation for trend alignment / timing.
 - End-to-end multi-timeframe signal evaluation.
 """
 
-from typing import Optional
 import numpy as np
 import pandas as pd
 
@@ -16,7 +15,13 @@ from strategy.silver_options.models import SignalType
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Compute RSI using standard Wilder's exponential moving average."""
+    """Compute RSI using standard Wilder's exponential moving average.
+
+    Handles edge cases:
+    - If avg_loss == 0 and avg_gain > 0: RSI = 100.0
+    - If avg_loss == 0 and avg_gain == 0: RSI = 50.0
+    - If avg_gain == 0 and avg_loss > 0: RSI = 0.0
+    """
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0).copy()
     loss = (-delta.where(delta < 0, 0.0)).copy()
@@ -25,12 +30,19 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     avg_loss = loss.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
+    standard_rsi = 100.0 - (100.0 / (1.0 + rs))
+
+    conditions = [
+        (avg_loss == 0) & (avg_gain > 0),
+        (avg_loss == 0) & (avg_gain == 0),
+    ]
+    choices = [100.0, 50.0]
+    rsi = pd.Series(np.select(conditions, choices, default=standard_rsi), index=series.index)
     return rsi.fillna(50.0)
 
 
 def detect_rsi_divergence(daily_df: pd.DataFrame, config: SilverConfig) -> SignalType:
-    """Detect Bullish or Bearish RSI Divergence on Daily candles.
+    """Detect Bullish or Bearish RSI Divergence on Daily candles over trailing 5-20 bars.
 
     Bullish Reversal Divergence:
     - Prior lowest price in window had RSI <= daily_rsi_oversold.
@@ -49,7 +61,7 @@ def detect_rsi_divergence(daily_df: pd.DataFrame, config: SilverConfig) -> Signa
         daily_df = daily_df.copy()
         daily_df["rsi"] = compute_rsi(daily_df["close"], period=config.daily_rsi_period)
 
-    recent = daily_df.tail(10)
+    recent = daily_df.tail(20)
     current_close = float(recent["close"].iloc[-1])
     current_rsi = float(recent["rsi"].iloc[-1])
 
@@ -86,8 +98,10 @@ def verify_hourly_confirmation(
 
     For BEARISH_BREAKDOWN:
     - Hourly close must be below 20 EMA, and either crossing below or expanding downward.
+
+    Returns False for NO_SIGNAL or invalid data.
     """
-    if len(hourly_df) < 2:
+    if len(hourly_df) < 2 or daily_signal == SignalType.NO_SIGNAL:
         return False
 
     df = hourly_df.copy()
@@ -105,7 +119,7 @@ def verify_hourly_confirmation(
     if daily_signal == SignalType.BEARISH_BREAKDOWN:
         return bool(curr_close < curr_ema and (prev_close >= prev_ema or curr_close < prev_close))
 
-    return True
+    return False
 
 
 def evaluate_technical_signal(
