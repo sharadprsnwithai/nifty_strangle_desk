@@ -107,3 +107,50 @@ def test_no_spread_on_unsupported_signal(mock_chain):
     profile = build_option_chain_profile(153800.0, mock_chain, cfg)
     assert select_spread(SignalType.NO_SIGNAL, profile, mock_chain, cfg) is None
     assert select_spread(SignalType.RANGE_BOUND, profile, mock_chain, cfg) is None
+
+def test_trading_symbol_assignment():
+    cfg = SilverConfig(max_debit_width_ratio=0.35)
+    chain = [
+        {"strike": 148000, "ce_oi": 200, "pe_oi": 2000, "ce_ltp": 6000.0, "pe_ltp": 1200.0, "pe_tradingsymbol": "SILVERM26NOV148000PE"},
+        {"strike": 155000, "ce_oi": 2500, "pe_oi": 1000, "ce_ltp": 1400.0, "pe_ltp": 2500.0, "ce_tradingsymbol": "SILVERM26NOV155000CE", "pe_tradingsymbol": "SILVERM26NOV155000PE"},
+        {"strike": 160000, "ce_oi": 3500, "pe_oi": 300, "ce_ltp": 600.0, "pe_ltp": 6500.0, "ce_tradingsymbol": "SILVERM26NOV160000CE"},
+    ]
+    profile = build_option_chain_profile(155000.0, chain, cfg)
+
+    # Bull Call Spread
+    bull_spread = select_spread(SignalType.BULLISH_REVERSAL, profile, chain, cfg)
+    assert bull_spread is not None
+    assert bull_spread.legs[0].trading_symbol == "SILVERM26NOV155000CE"
+    assert bull_spread.legs[1].trading_symbol == "SILVERM26NOV160000CE"
+
+    # Bear Put Spread
+    bear_spread = select_spread(SignalType.BEARISH_BREAKDOWN, profile, chain, cfg)
+    assert bear_spread is not None
+    assert bear_spread.legs[0].trading_symbol == "SILVERM26NOV155000PE"
+    assert bear_spread.legs[1].trading_symbol == "SILVERM26NOV148000PE"
+
+def test_reject_zero_or_non_positive_ltp():
+    cfg = SilverConfig(max_debit_width_ratio=0.50)
+    # 1. Zero long LTP
+    zero_long_chain = [
+        {"strike": 155000, "ce_oi": 2500, "pe_oi": 1000, "ce_ltp": 0.0, "pe_ltp": 2500.0},
+        {"strike": 160000, "ce_oi": 3500, "pe_oi": 300, "ce_ltp": 600.0, "pe_ltp": 6500.0},
+    ]
+    prof1 = build_option_chain_profile(155000.0, zero_long_chain, cfg)
+    assert select_spread(SignalType.BULLISH_REVERSAL, prof1, zero_long_chain, cfg) is None
+
+    # 2. Zero short LTP
+    zero_short_chain = [
+        {"strike": 155000, "ce_oi": 2500, "pe_oi": 1000, "ce_ltp": 1400.0, "pe_ltp": 2500.0},
+        {"strike": 160000, "ce_oi": 3500, "pe_oi": 300, "ce_ltp": 0.0, "pe_ltp": 6500.0},
+    ]
+    prof2 = build_option_chain_profile(155000.0, zero_short_chain, cfg)
+    assert select_spread(SignalType.BULLISH_REVERSAL, prof2, zero_short_chain, cfg) is None
+
+    # 3. Negative LTP
+    neg_chain = [
+        {"strike": 155000, "ce_oi": 2500, "pe_oi": 1000, "ce_ltp": -10.0, "pe_ltp": 2500.0},
+        {"strike": 160000, "ce_oi": 3500, "pe_oi": 300, "ce_ltp": 600.0, "pe_ltp": 6500.0},
+    ]
+    prof3 = build_option_chain_profile(155000.0, neg_chain, cfg)
+    assert select_spread(SignalType.BULLISH_REVERSAL, prof3, neg_chain, cfg) is None

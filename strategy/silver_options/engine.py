@@ -1,3 +1,4 @@
+import logging
 from datetime import time
 from typing import List, Optional, Dict
 import pandas as pd
@@ -8,6 +9,8 @@ from strategy.silver_options.chain_analyzer import build_option_chain_profile
 from strategy.silver_options.spread_selector import select_spread
 from strategy.silver_options.risk_manager import check_exit_conditions
 from strategy.silver_options.order_manager import execute_spread_entry, execute_spread_exit
+
+logger = logging.getLogger("silver_options.engine")
 
 class SilverOptionsEngine:
     def __init__(self, kite_client, config: Optional[SilverConfig] = None, is_paper: bool = True):
@@ -29,19 +32,17 @@ class SilverOptionsEngine:
         # 1. If we have an active position, monitor exit conditions
         if self.active_position:
             chain_by_strike = {r["strike"]: r for r in chain_data}
-            legs = self.active_position.legs
-            long_leg = next(l for l in legs if l.action == "BUY")
-            short_leg = next(l for l in legs if l.action == "SELL")
+            current_spread_value = 0.0
+            for leg in self.active_position.legs:
+                row = chain_by_strike.get(leg.strike, {})
+                ltp = row.get(f"{leg.option_type.lower()}_ltp")
+                if ltp is None:
+                    ltp = leg.premium
+                if leg.action == "BUY":
+                    current_spread_value += ltp
+                elif leg.action == "SELL":
+                    current_spread_value -= ltp
 
-            long_ltp = chain_by_strike.get(long_leg.strike, {}).get(f"{long_leg.option_type.lower()}_ltp")
-            if long_ltp is None:
-                long_ltp = long_leg.premium
-
-            short_ltp = chain_by_strike.get(short_leg.strike, {}).get(f"{short_leg.option_type.lower()}_ltp")
-            if short_ltp is None:
-                short_ltp = short_leg.premium
-
-            current_spread_value = long_ltp - short_ltp
             self.active_position.current_value = current_spread_value
 
             should_exit, reason = check_exit_conditions(
@@ -52,10 +53,13 @@ class SilverOptionsEngine:
                 config=self.config,
             )
             if should_exit and reason:
-                execute_spread_exit(self.kite_client, self.active_position, reason, is_paper=self.is_paper)
-                self.active_position.realized_pnl = (current_spread_value - self.active_position.entry_net_debit) * self.config.lot_size
-                self.closed_positions.append(self.active_position)
-                self.active_position = None
+                if execute_spread_exit(self.kite_client, self.active_position, reason, is_paper=self.is_paper):
+                    self.active_position.realized_pnl = (current_spread_value - self.active_position.entry_net_debit) * self.config.lot_size
+                    self.closed_positions.append(self.active_position)
+                    self.active_position = None
+                else:
+                    self.active_position.status = "EXIT_FAILED"
+                    logger.error("Failed to execute spread exit; holding active position for retry.")
             return
 
         # 2. If idle, check for entry signals

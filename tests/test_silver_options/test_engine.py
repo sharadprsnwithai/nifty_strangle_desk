@@ -245,3 +245,80 @@ def test_engine_live_execution_entry_failure(sample_market_data):
 
     assert engine.active_position is None
     assert len(engine.closed_positions) == 0
+
+def test_engine_live_execution_exit_failure(sample_market_data):
+    daily_df, hourly_df, chain_data = sample_market_data
+    cfg = SilverConfig()
+    mock_kite = MagicMock()
+    # Entry succeeds (2 orders), but exit fails
+    mock_kite.place_order.side_effect = ["ORD_BUY_1", "ORD_SELL_1", Exception("Order rejected by RMS")]
+    engine = SilverOptionsEngine(kite_client=mock_kite, config=cfg, is_paper=False)
+
+    # 1. Entry succeeds
+    engine.on_market_tick(
+        spot_price=153800.0,
+        daily_df=daily_df,
+        hourly_df=hourly_df,
+        chain_data=chain_data,
+        current_time=time(14, 0),
+        is_expiry_day=False,
+    )
+    assert engine.active_position is not None
+    assert engine.active_position.status == "ACTIVE"
+
+    # 2. Trigger exit condition (Take Profit)
+    updated_chain = [
+        {"strike": 155000, "ce_oi": 2500, "pe_oi": 1100, "ce_ltp": 4500.0, "pe_ltp": 800.0},
+        {"strike": 160000, "ce_oi": 3800, "pe_oi": 400, "ce_ltp": 500.0, "pe_ltp": 4800.0},
+    ]
+    engine.on_market_tick(
+        spot_price=159000.0,
+        daily_df=daily_df,
+        hourly_df=hourly_df,
+        chain_data=updated_chain,
+        current_time=time(15, 0),
+        is_expiry_day=False,
+    )
+
+    # Position is retained for retry because exit failed!
+    assert engine.active_position is not None
+    assert engine.active_position.status == "EXIT_FAILED"
+    assert len(engine.closed_positions) == 0
+
+def test_engine_multi_leg_spread_valuation():
+    from strategy.silver_options.models import OptionLeg, SpreadPosition, SpreadType
+    cfg = SilverConfig()
+    engine = SilverOptionsEngine(kite_client=MagicMock(), config=cfg, is_paper=True)
+
+    leg_buy_1 = OptionLeg(strike=154000, option_type="CE", action="BUY", quantity=5, premium=2000.0)
+    leg_sell_1 = OptionLeg(strike=156000, option_type="CE", action="SELL", quantity=5, premium=1200.0)
+    leg_buy_2 = OptionLeg(strike=150000, option_type="PE", action="BUY", quantity=5, premium=1800.0)
+    leg_sell_2 = OptionLeg(strike=148000, option_type="PE", action="SELL", quantity=5, premium=900.0)
+
+    engine.active_position = SpreadPosition(
+        spread_type=SpreadType.IRON_CONDOR,
+        legs=[leg_buy_1, leg_sell_1, leg_buy_2, leg_sell_2],
+        entry_net_debit=1700.0,
+        max_profit=2000.0,
+        max_loss=1700.0,
+        status="ACTIVE",
+    )
+
+    tick_chain = [
+        {"strike": 154000, "ce_ltp": 2500.0},
+        {"strike": 156000, "ce_ltp": 1300.0},
+        {"strike": 150000, "pe_ltp": 1900.0},
+        {"strike": 148000, "pe_ltp": 800.0},
+    ]
+    # Sum of BUYs = 2500 + 1900 = 4400. Sum of SELLs = 1300 + 800 = 2100. Spread value = 2300.
+    engine.on_market_tick(
+        spot_price=153000.0,
+        daily_df=pd.DataFrame({"close": [153000.0] * 5, "low": [152000.0] * 5, "rsi": [50.0] * 5}),
+        hourly_df=pd.DataFrame({"close": [153000.0] * 5, "ema_20": [153000.0] * 5}),
+        chain_data=tick_chain,
+        current_time=time(11, 0),
+        is_expiry_day=False,
+    )
+
+    assert engine.active_position is not None
+    assert engine.active_position.current_value == 2300.0

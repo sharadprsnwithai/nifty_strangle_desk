@@ -35,6 +35,7 @@ def test_find_oi_walls(sample_chain):
 def test_compute_max_pain(sample_chain):
     max_pain = compute_max_pain(sample_chain)
     assert max_pain == 154000
+    assert isinstance(max_pain, int)
 
 def test_build_option_chain_profile(sample_chain):
     cfg = SilverConfig()
@@ -45,12 +46,16 @@ def test_build_option_chain_profile(sample_chain):
     assert profile.atm_strike == 154000
     assert 148000 <= profile.max_pain <= 160000
     assert profile.max_pain == 154000
+    assert isinstance(profile.max_pain, int)
     assert pytest.approx(profile.pcr, 0.01) == 0.854
 
 def test_empty_chain_edge_cases():
     assert compute_pcr([]) == 1.0
+    assert compute_pcr([{"strike": 150000, "ce_oi": 0, "pe_oi": 0}]) == 1.0
+    assert compute_pcr([{"strike": 150000, "ce_oi": 0, "pe_oi": 500}]) == float("inf")
     assert find_oi_walls([]) == (0, 0)
     assert compute_max_pain([]) == 0
+    assert isinstance(compute_max_pain([]), int)
 
     cfg = SilverConfig()
     profile = build_option_chain_profile(spot_price=150000.0, chain_data=[], config=cfg)

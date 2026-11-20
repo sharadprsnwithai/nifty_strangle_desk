@@ -3,18 +3,21 @@ import pytest
 from strategy.silver_options.config import SilverConfig
 from strategy.silver_options.models import SpreadType, OptionLeg, SpreadPosition
 from strategy.silver_options.contract_resolver import resolve_silver_symbols
-from strategy.silver_options.order_manager import execute_spread_entry, execute_spread_exit
+from strategy.silver_options.order_manager import execute_spread_entry, execute_spread_exit, place_order
 
 def test_resolve_silver_symbols():
     mock_instruments = [
         {"tradingsymbol": "SILVERM26NOVFUT", "instrument_type": "FUT", "segment": "MCX-FUT", "name": "SILVERM"},
         {"tradingsymbol": "SILVERM26NOV155000CE", "instrument_type": "CE", "strike": 155000, "segment": "MCX-OPT", "name": "SILVERM"},
         {"tradingsymbol": "SILVERM26NOV160000CE", "instrument_type": "CE", "strike": 160000, "segment": "MCX-OPT", "name": "SILVERM"},
+        {"tradingsymbol": "SILVERMIC26NOVFUT", "instrument_type": "FUT", "segment": "MCX-FUT", "name": "SILVERMIC"},
+        {"tradingsymbol": "SILVERMIC26NOV150000CE", "instrument_type": "CE", "strike": 150000, "segment": "MCX-OPT", "name": "SILVERMIC"},
         {"tradingsymbol": "GOLDM26NOVFUT", "instrument_type": "FUT", "segment": "MCX-FUT", "name": "GOLDM"},
     ]
     resolved = resolve_silver_symbols(mock_instruments, underlying="SILVERM")
     assert len(resolved) == 3
     assert all("SILVERM" in item["tradingsymbol"] for item in resolved)
+    assert not any("SILVERMIC" in item["tradingsymbol"] for item in resolved)
 
 def test_paper_execution_lifecycle():
     kite_mock = MagicMock()
@@ -107,6 +110,60 @@ def test_live_execution_failure_handling():
     assert success is False
     assert spread.status == "FAILED"
 
-    # Exit failure
+    # Exit failure sets spread.status to FAILED
+    spread.status = "ACTIVE"
+    kite_mock.place_order.side_effect = RuntimeError("RMS exit failure")
     success_exit = execute_spread_exit(kite_mock, spread, reason="STOP_LOSS", is_paper=False)
     assert success_exit is False
+    assert spread.status == "FAILED"
+
+def test_marketable_limit_orders():
+    kite_mock = MagicMock()
+    kite_mock.place_order.return_value = "ORD_123"
+
+    # BUY with limit buffer: 1400.0 + (1.0 * 2) = 1402.0
+    place_order(kite_mock, "SILVERM26NOV155000CE", "BUY", 5, price=1400.0, tick_size=1.0, slippage_buffer_ticks=2)
+    buy_call = kite_mock.place_order.call_args.kwargs
+    assert buy_call["order_type"] == "LIMIT"
+    assert buy_call["price"] == 1402.0
+    assert buy_call["transaction_type"] == "BUY"
+
+    # SELL with limit buffer: 1400.0 - (1.0 * 2) = 1398.0
+    place_order(kite_mock, "SILVERM26NOV155000CE", "SELL", 5, ltp=1400.0, tick_size=1.0, slippage_buffer_ticks=2)
+    sell_call = kite_mock.place_order.call_args.kwargs
+    assert sell_call["order_type"] == "LIMIT"
+    assert sell_call["price"] == 1398.0
+    assert sell_call["transaction_type"] == "SELL"
+
+    # Fallback to MARKET when price and ltp are None
+    place_order(kite_mock, "SILVERM26NOV155000CE", "BUY", 5, price=None, ltp=None)
+    mkt_call = kite_mock.place_order.call_args.kwargs
+    assert mkt_call["order_type"] == "MARKET"
+    assert "price" not in mkt_call
+
+def test_execute_spread_with_limit_orders():
+    kite_mock = MagicMock()
+    kite_mock.place_order.side_effect = ["ORD_BUY_LIMIT", "ORD_SELL_LIMIT"]
+
+    leg1 = OptionLeg(strike=155000, option_type="CE", action="BUY", quantity=5, premium=1400.0, trading_symbol="SILVERM26NOV155000CE")
+    leg2 = OptionLeg(strike=160000, option_type="CE", action="SELL", quantity=5, premium=600.0, trading_symbol="SILVERM26NOV160000CE")
+    spread = SpreadPosition(
+        spread_type=SpreadType.BULL_CALL_SPREAD,
+        legs=[leg1, leg2],
+        entry_net_debit=800.0,
+        max_profit=4200.0,
+        max_loss=800.0,
+    )
+
+    prices = {"SILVERM26NOV155000CE": 1400.0, "SILVERM26NOV160000CE": 600.0}
+    ok = execute_spread_entry(kite_mock, spread, is_paper=False, price=prices, tick_size=1.0, slippage_buffer_ticks=2)
+    assert ok is True
+    assert spread.status == "ACTIVE"
+
+    call1 = kite_mock.place_order.call_args_list[0].kwargs
+    assert call1["order_type"] == "LIMIT"
+    assert call1["price"] == 1402.0  # 1400 + 2
+
+    call2 = kite_mock.place_order.call_args_list[1].kwargs
+    assert call2["order_type"] == "LIMIT"
+    assert call2["price"] == 598.0   # 600 - 2

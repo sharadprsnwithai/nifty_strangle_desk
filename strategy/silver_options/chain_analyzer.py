@@ -8,7 +8,7 @@ def compute_pcr(chain_data: List[dict]) -> float:
     total_ce_oi = sum(row.get("ce_oi", 0) for row in chain_data)
     total_pe_oi = sum(row.get("pe_oi", 0) for row in chain_data)
     if total_ce_oi == 0:
-        return 1.0
+        return 1.0 if total_pe_oi == 0 else float("inf")
     return round(total_pe_oi / total_ce_oi, 3)
 
 
@@ -43,7 +43,7 @@ def compute_max_pain(chain_data: List[dict]) -> int:
             min_pain = total_pain
             max_pain_strike = k
 
-    return max_pain_strike
+    return int(max_pain_strike)
 
 
 def build_option_chain_profile(

@@ -23,7 +23,7 @@ def run_silver_backtest(trades: List[Dict], slippage_per_trade: float = 200.0) -
             "max_drawdown": 0.0,
         }
 
-    total_gross = 0.0
+    total_net_pnl = 0.0
     wins = 0
     total_wins = 0.0
     total_losses = 0.0
@@ -32,7 +32,7 @@ def run_silver_backtest(trades: List[Dict], slippage_per_trade: float = 200.0) -
 
     for t in trades:
         pnl = t["pnl"] - slippage_per_trade
-        total_gross += pnl
+        total_net_pnl += pnl
         current_cum += pnl
         cumulative_pnl.append(current_cum)
 
@@ -57,7 +57,7 @@ def run_silver_backtest(trades: List[Dict], slippage_per_trade: float = 200.0) -
 
     return {
         "total_trades": len(trades),
-        "net_pnl": round(total_gross, 2),
+        "net_pnl": round(total_net_pnl, 2),
         "win_rate": round(win_rate, 2),
         "profit_factor": round(profit_factor, 2),
         "max_drawdown": round(max_dd, 2),
