@@ -48,6 +48,13 @@ def run_strategy_cli(args=None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Perform single strike lookup and print plan without waiting")
     parser.add_argument("--once", action="store_true", help="Run single monitoring iteration and exit (default runs automated daemon)")
     parser.add_argument("--morning-login", action="store_true", help="Execute 08:00 AM TOTP morning login to renew credentials, notify Telegram, and exit")
+    morning_filter_default = os.getenv("STRANGLE_MORNING_FILTER", "true").lower() in ("true", "1", "yes")
+    parser.add_argument("--morning-filter", dest="morning_filter", action="store_true", default=morning_filter_default, help="Enable 09:15-10:00 AM range trend filter (default: True)")
+    parser.add_argument("--no-morning-filter", dest="morning_filter", action="store_false", help="Disable morning trend filter")
+    parser.add_argument("--morning-filter-pct", type=float, default=float(os.getenv("STRANGLE_MORNING_FILTER_PCT", "0.60")), help="Morning range percentage threshold to skip session (default: 0.60)")
+    parser.add_argument("--strike-mode", choices=["ATR", "PRICE"], default=os.getenv("STRANGLE_STRIKE_MODE", "ATR"), help="Strike selection mode (ATR: 1.25x ATR distance, PRICE: Rs 30 premium, default: ATR)")
+    parser.add_argument("--atr-multiplier", type=float, default=float(os.getenv("STRANGLE_ATR_MULTIPLIER", "1.25")), help="ATR multiplier for strike distance (default: 1.25)")
+    parser.add_argument("--target-price", type=float, default=float(os.getenv("STRANGLE_TARGET_PRICE", "30.0")), help="Target premium in Rs for PRICE mode or fallback (default: 30.0)")
 
     parsed = parser.parse_args(args)
     setup_logging(log_dir=parsed.log_dir, log_level=parsed.log_level)
@@ -83,7 +90,12 @@ def run_strategy_cli(args=None) -> int:
             "order_type": parsed.order_type,
             "limit_buffer_pct": parsed.limit_buffer_pct,
             "ignore_holidays": parsed.ignore_holidays,
-            "order_timeout": parsed.order_timeout
+            "order_timeout": parsed.order_timeout,
+            "morning_filter": parsed.morning_filter,
+            "morning_filter_pct": parsed.morning_filter_pct,
+            "strike_mode": parsed.strike_mode,
+            "atr_multiplier": parsed.atr_multiplier,
+            "target_price": parsed.target_price
         }
 
         if parsed.dry_run or parsed.once:

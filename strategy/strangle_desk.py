@@ -5,7 +5,7 @@ import time
 import tempfile
 from datetime import date, datetime, time as dt_time
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from kiteconnect import KiteConnect
 from kite.client import is_token_error
 from strategy.order_manager import OrderManager
@@ -527,6 +527,102 @@ class StrangleDesk:
             logger.warning("Failed to query equity margins from Kite: %s", e)
             return {"status": "ERROR", "error": str(e), "available_cash": 0.0}
 
+    def check_morning_trend_filter(
+        self,
+        kite: Any,
+        underlying: str = "NIFTY",
+        threshold_pct: float = 0.60
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Inspects 09:15 to 10:00 morning price action for underlying.
+        Returns (is_trend_day, details_dict).
+        If (high - low) / open >= threshold_pct, triggers trend day filter to skip session.
+        """
+        token = 256265 if underlying == "NIFTY" else None
+        now_dt = datetime.now()
+        today = now_dt.date()
+        from_dt = datetime.combine(today, dt_time(9, 15))
+        to_dt = datetime.combine(today, dt_time(10, 5))
+
+        try:
+            if token and hasattr(kite, "historical_data"):
+                candles = kite.historical_data(
+                    token,
+                    from_date=from_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    to_date=to_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    interval="5minute"
+                )
+                if candles:
+                    valid_candles = []
+                    for c in candles:
+                        c_dt = c.get("date")
+                        if isinstance(c_dt, str):
+                            try:
+                                c_dt = datetime.fromisoformat(c_dt)
+                            except Exception:
+                                pass
+                        if isinstance(c_dt, datetime) and c_dt.time() <= dt_time(10, 5):
+                            valid_candles.append(c)
+                    if not valid_candles:
+                        valid_candles = candles
+
+                    open_price = float(valid_candles[0]["open"])
+                    high_price = max(float(c["high"]) for c in valid_candles)
+                    low_price = min(float(c["low"]) for c in valid_candles)
+                    range_pts = high_price - low_price
+                    range_pct = (range_pts / open_price) * 100.0 if open_price > 0 else 0.0
+                    is_triggered = range_pct >= threshold_pct
+                    details = {
+                        "open": open_price,
+                        "high": high_price,
+                        "low": low_price,
+                        "range_pts": round(range_pts, 2),
+                        "range_pct": round(range_pct, 2),
+                        "threshold_pct": threshold_pct,
+                        "triggered": is_triggered,
+                        "source": "historical_5m"
+                    }
+                    logger.info(
+                        "Morning Trend Filter Check: Open=%.1f, High=%.1f, Low=%.1f => Range=%.1f pts (%.2f%%) vs Threshold=%.2f%% (Triggered: %s)",
+                        open_price, high_price, low_price, range_pts, range_pct, threshold_pct, is_triggered
+                    )
+                    return is_triggered, details
+        except Exception as e:
+            logger.warning("Failed to fetch 5m candles for morning filter (%s); checking quote OHLC...", e)
+
+        # Fallback to quote/OHLC
+        try:
+            sym = "NSE:NIFTY 50" if underlying == "NIFTY" else f"NSE:{underlying}"
+            if hasattr(kite, "quote"):
+                q_data = kite.quote([sym]).get(sym, {})
+                ohlc = q_data.get("ohlc", {})
+                open_price = float(ohlc.get("open") or 0.0)
+                high_price = float(ohlc.get("high") or 0.0)
+                low_price = float(ohlc.get("low") or 0.0)
+                if open_price > 0.0 and high_price > 0.0 and low_price > 0.0:
+                    range_pts = high_price - low_price
+                    range_pct = (range_pts / open_price) * 100.0
+                    is_triggered = range_pct >= threshold_pct
+                    details = {
+                        "open": open_price,
+                        "high": high_price,
+                        "low": low_price,
+                        "range_pts": round(range_pts, 2),
+                        "range_pct": round(range_pct, 2),
+                        "threshold_pct": threshold_pct,
+                        "triggered": is_triggered,
+                        "source": "quote_ohlc"
+                    }
+                    logger.info(
+                        "Morning Trend Filter (Quote OHLC): Open=%.1f, High=%.1f, Low=%.1f => Range=%.1f pts (%.2f%%) vs Threshold=%.2f%% (Triggered: %s)",
+                        open_price, high_price, low_price, range_pts, range_pct, threshold_pct, is_triggered
+                    )
+                    return is_triggered, details
+        except Exception as e:
+            logger.warning("Quote OHLC lookup failed for morning filter: %s", e)
+
+        return False, {"triggered": False, "reason": "No morning OHLC available"}
+
     def run_session(
         self,
         underlying: str = "NIFTY",
@@ -540,12 +636,17 @@ class StrangleDesk:
         limit_buffer_pct: float = 0.05,
         ignore_holidays: bool = False,
         order_timeout: int = 300,
-        check_market_hours: bool = False
+        check_market_hours: bool = False,
+        morning_filter: bool = True,
+        morning_filter_pct: float = 0.60,
+        strike_mode: str = "ATR",
+        atr_multiplier: float = 1.25,
+        target_price: float = 30.0
     ) -> Optional[Dict[str, Any]]:
         """
         Executes and monitors the 10:00 AM Short Strangle intraday session.
-        Handles holiday skip, strike discovery, dual-leg entry, live quote polling,
-        combined portfolio stop-loss (₹10k), decay target (closes both legs), and 2:45 PM time square-off.
+        Handles holiday skip, morning trend filter skip (>0.60% range), dynamic ATR strike discovery,
+        dual-leg entry, live quote polling, combined portfolio stop-loss (₹10k), decay target, and 2:45 PM square-off.
         """
         if not ignore_holidays:
             is_holiday, reason = is_trading_holiday()
@@ -575,7 +676,7 @@ class StrangleDesk:
                 logger.info("Existing state from prior date (%s != %s). Initializing fresh session.", state.get("date"), today_str)
                 self.clear_state()
                 state = None
-            elif state.get("status") in ("COMPLETED", "ABORTED"):
+            elif state.get("status") in ("COMPLETED", "ABORTED", "SKIPPED_TREND_DAY"):
                 logger.info("Session for today (%s) is already %s.", today_str, state.get("status"))
                 return state
 
@@ -592,14 +693,56 @@ class StrangleDesk:
 
             kite = self._ensure_kite_session(kite)
 
-            logger.info("Scanning option chain for strikes with LTP >= Rs 30 (0 DTE -> Next Week)...")
+            # Evaluate Morning Range Trend Filter (skips violent morning moves >= 0.60%)
+            if morning_filter and not dry_run:
+                is_trend_day, filter_details = self.check_morning_trend_filter(
+                    kite, underlying=underlying, threshold_pct=morning_filter_pct
+                )
+                if is_trend_day:
+                    err_msg = (
+                        f"Morning Trend Filter triggered: NIFTY 09:15-10:00 range was "
+                        f"{filter_details.get('range_pts')} pts ({filter_details.get('range_pct')}%) "
+                        f">= threshold {morning_filter_pct}%. Skipping session today to preserve capital."
+                    )
+                    logger.warning(err_msg)
+                    if self.notifier:
+                        self.notifier.send_message(
+                            f"⚠️ <b>Morning Trend Filter Triggered</b>: NIFTY 09:15–10:00 range was "
+                            f"<b>{filter_details.get('range_pts')} pts ({filter_details.get('range_pct')}%)</b> "
+                            f">= threshold {morning_filter_pct}%. Strangle entry skipped today to avoid trending momentum."
+                        )
+                    skipped_state = {
+                        "status": "SKIPPED_TREND_DAY",
+                        "reason": err_msg,
+                        "date": today_str,
+                        "underlying": underlying,
+                        "filter_details": filter_details
+                    }
+                    self.save_state(skipped_state)
+                    return skipped_state
+
+            logger.info("Discovering strikes (Mode: %s, ATR Mult: %.2fx, Target Price: Rs %.1f)...", strike_mode, atr_multiplier, target_price)
             try:
-                strikes = find_strangle_strikes(kite, underlying=underlying, target_price=30.0, lots=lots)
+                strikes = find_strangle_strikes(
+                    kite,
+                    underlying=underlying,
+                    target_price=target_price,
+                    strike_mode=strike_mode,
+                    atr_multiplier=atr_multiplier,
+                    lots=lots
+                )
             except Exception as e:
                 if is_token_error(e):
                     logger.warning("Token error during strike discovery (%s). Refreshing token and retrying...", e)
                     kite = self._ensure_kite_session(kite, force_login=True)
-                    strikes = find_strangle_strikes(kite, underlying=underlying, target_price=30.0, lots=lots)
+                    strikes = find_strangle_strikes(
+                        kite,
+                        underlying=underlying,
+                        target_price=target_price,
+                        strike_mode=strike_mode,
+                        atr_multiplier=atr_multiplier,
+                        lots=lots
+                    )
                 else:
                     raise
 
@@ -1016,7 +1159,12 @@ class StrangleDesk:
         entry_time_str: str = "10:00",
         exit_time_str: str = "14:45",
         idle_sleep_seconds: int = 15,
-        max_iterations: Optional[int] = None
+        max_iterations: Optional[int] = None,
+        morning_filter: bool = True,
+        morning_filter_pct: float = 0.60,
+        strike_mode: str = "ATR",
+        atr_multiplier: float = 1.25,
+        target_price: float = 30.0
     ) -> None:
         """
         Runs the automated daily daemon scheduler for the 10:00 AM Short Strangle Desk.
@@ -1103,14 +1251,19 @@ class StrangleDesk:
                         order_type=order_type,
                         limit_buffer_pct=limit_buffer_pct,
                         ignore_holidays=ignore_holidays,
-                        order_timeout=order_timeout
+                        order_timeout=order_timeout,
+                        morning_filter=morning_filter,
+                        morning_filter_pct=morning_filter_pct,
+                        strike_mode=strike_mode,
+                        atr_multiplier=atr_multiplier,
+                        target_price=target_price
                     )
                 except Exception as e:
                     logger.exception("Error during active strangle session: %s", e)
                 continue
 
-            # 2. If today's session is already completed or aborted, wait for next trading day
-            if state is not None and state.get("date") == today_str and state.get("status") in ("COMPLETED", "ABORTED"):
+            # 2. If today's session is already completed, aborted, or skipped by morning filter, wait for next trading day
+            if state is not None and state.get("date") == today_str and state.get("status") in ("COMPLETED", "ABORTED", "SKIPPED_TREND_DAY"):
                 time.sleep(idle_sleep_seconds)
                 continue
 
@@ -1156,9 +1309,14 @@ class StrangleDesk:
                         order_type=order_type,
                         limit_buffer_pct=limit_buffer_pct,
                         ignore_holidays=ignore_holidays,
-                        order_timeout=order_timeout
+                        order_timeout=order_timeout,
+                        morning_filter=morning_filter,
+                        morning_filter_pct=morning_filter_pct,
+                        strike_mode=strike_mode,
+                        atr_multiplier=atr_multiplier,
+                        target_price=target_price
                     )
-                    if isinstance(session_res, dict) and session_res.get("status") in ("ABORTED", "COMPLETED"):
+                    if isinstance(session_res, dict) and session_res.get("status") in ("ABORTED", "COMPLETED", "SKIPPED_TREND_DAY"):
                         logger.info("Strangle session returned %s. Pausing before next scheduler cycle.", session_res.get("status"))
                 except Exception as e:
                     logger.exception("Error during 10:00 AM strangle session: %s", e)

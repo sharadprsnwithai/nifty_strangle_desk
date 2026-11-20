@@ -1,9 +1,54 @@
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Dict, Any, Optional
 from kiteconnect import KiteConnect
 
 logger = logging.getLogger("strategy.chain")
+
+NIFTY_INDEX_TOKEN = 256265  # NSE:NIFTY 50 instrument token
+
+
+def fetch_daily_atr(
+    kite: KiteConnect,
+    instrument_token: int = NIFTY_INDEX_TOKEN,
+    period: int = 14,
+    default_atr: float = 150.0
+) -> float:
+    """
+    Fetches daily candles via Kite Connect and computes standard 14-day Average True Range (ATR).
+    Falls back gracefully to default_atr (150.0) upon any failure.
+    """
+    to_date = datetime.now()
+    from_date = to_date - timedelta(days=period * 3 + 10)
+    try:
+        candles = kite.historical_data(
+            instrument_token,
+            from_date=from_date.strftime("%Y-%m-%d"),
+            to_date=to_date.strftime("%Y-%m-%d"),
+            interval="day"
+        )
+        if not candles or len(candles) < 2:
+            logger.warning("Insufficient daily candles (%d) to compute ATR. Using default: %.1f", len(candles) if candles else 0, default_atr)
+            return default_atr
+
+        true_ranges = []
+        for i in range(1, len(candles)):
+            high = float(candles[i]["high"])
+            low = float(candles[i]["low"])
+            prev_close = float(candles[i - 1]["close"])
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            true_ranges.append(tr)
+
+        if not true_ranges:
+            return default_atr
+
+        sample = true_ranges[-period:] if len(true_ranges) >= period else true_ranges
+        calculated_atr = round(sum(sample) / len(sample), 2)
+        logger.info("Calculated %d-day Daily ATR: %.2f pts (sample size: %d days)", period, calculated_atr, len(sample))
+        return calculated_atr
+    except Exception as e:
+        logger.warning("Failed to fetch daily ATR (%s). Falling back to default ATR %.1f pts.", e, default_atr)
+        return default_atr
 
 
 def _normalize_date(d: Any) -> Optional[date]:
@@ -60,11 +105,17 @@ def find_strangle_strikes(
     kite: KiteConnect,
     underlying: str = "NIFTY",
     target_price: float = 30.0,
+    strike_mode: str = "ATR",
+    atr_multiplier: float = 1.25,
     target_date: Optional[date] = None,
     lots: int = 10
 ) -> Dict[str, Any]:
     """
-    Discovers 1 CE and 1 PE with LTP >= target_price (closest to target_price from above).
+    Discovers 1 CE and 1 PE contract:
+    - If strike_mode == 'ATR': Computes target strike distance = max(ATR * atr_multiplier, 150 pts),
+      discovers strikes closest to (Spot + distance) and (Spot - distance).
+      Falls back to PRICE mode upon failure.
+    - If strike_mode == 'PRICE': Discovers strikes with LTP >= target_price (closest from above).
     """
     try:
         instruments = kite.instruments("NFO")
@@ -95,7 +146,8 @@ def find_strangle_strikes(
     total_quantity = lots * lot_size
 
     # Batch query prices in chunks of 100 to avoid payload / URL length limits
-    symbols_to_query = [f"NFO:{c['tradingsymbol']}" for c in ce_contracts + pe_contracts]
+    spot_sym = "NSE:NIFTY 50" if underlying == "NIFTY" else f"NSE:{underlying}"
+    symbols_to_query = [spot_sym] + [f"NFO:{c['tradingsymbol']}" for c in ce_contracts + pe_contracts]
     quotes: Dict[str, Any] = {}
     for i in range(0, len(symbols_to_query), 100):
         batch = symbols_to_query[i:i + 100]
@@ -108,6 +160,57 @@ def find_strangle_strikes(
                 logger.error("Authentication failed querying batch LTP quotes for %d instruments: %s", len(batch), e)
                 raise
             logger.error("Failed to query batch LTP quotes for %d instruments: %s", len(batch), e)
+
+    # Try ATR-based strike discovery if requested and spot price was returned
+    if strike_mode.upper() == "ATR":
+        try:
+            spot = float(quotes.get(spot_sym, {}).get("last_price") or 0.0)
+            if spot > 0.0:
+                atr = fetch_daily_atr(kite, instrument_token=NIFTY_INDEX_TOKEN if underlying == "NIFTY" else None)
+                target_distance = max(atr * atr_multiplier, 150.0)
+                target_ce_strike = round((spot + target_distance) / 50.0) * 50.0
+                target_pe_strike = round((spot - target_distance) / 50.0) * 50.0
+
+                # Find closest available contracts to target strikes
+                chosen_ce = min(ce_contracts, key=lambda c: abs(float(c["strike"]) - target_ce_strike))
+                chosen_pe = min(pe_contracts, key=lambda p: abs(float(p["strike"]) - target_pe_strike))
+
+                ce_sym_key = f"NFO:{chosen_ce['tradingsymbol']}"
+                pe_sym_key = f"NFO:{chosen_pe['tradingsymbol']}"
+                chosen_ce_ltp = float(quotes.get(ce_sym_key, {}).get("last_price") or 0.0)
+                chosen_pe_ltp = float(quotes.get(pe_sym_key, {}).get("last_price") or 0.0)
+
+                if chosen_ce_ltp > 0.0 and chosen_pe_ltp > 0.0:
+                    logger.info(
+                        "ATR Strike Discovery: Spot=%.1f | ATR=%.1f (%.2fx -> Offset=%.1f pts) | CE Strike=%.0f (LTP=%.2f) | PE Strike=%.0f (LTP=%.2f)",
+                        spot, atr, atr_multiplier, target_distance, chosen_ce["strike"], chosen_ce_ltp, chosen_pe["strike"], chosen_pe_ltp
+                    )
+
+                    return {
+                        "expiry": target_expiry,
+                        "lot_size": lot_size,
+                        "total_lots": lots,
+                        "total_quantity": total_quantity,
+                        "strike_mode": "ATR",
+                        "atr": atr,
+                        "spot": spot,
+                        "ce": {
+                            "symbol": chosen_ce["tradingsymbol"],
+                            "strike": float(chosen_ce["strike"]),
+                            "ltp": chosen_ce_ltp,
+                            "sl_price": round(chosen_ce_ltp * 1.50, 2),
+                            "target_price": round(chosen_ce_ltp * 0.20, 2)
+                        },
+                        "pe": {
+                            "symbol": chosen_pe["tradingsymbol"],
+                            "strike": float(chosen_pe["strike"]),
+                            "ltp": chosen_pe_ltp,
+                            "sl_price": round(chosen_pe_ltp * 1.50, 2),
+                            "target_price": round(chosen_pe_ltp * 0.20, 2)
+                        }
+                    }
+        except Exception as e:
+            logger.warning("ATR strike selection failed (%s). Gracefully falling back to PRICE mode (target_price=%.1f)...", e, target_price)
 
     # Find CE >= target_price with lowest LTP
     valid_ce = []
@@ -142,6 +245,7 @@ def find_strangle_strikes(
         "lot_size": lot_size,
         "total_lots": lots,
         "total_quantity": total_quantity,
+        "strike_mode": "PRICE",
         "ce": {
             "symbol": chosen_ce["tradingsymbol"],
             "strike": float(chosen_ce["strike"]),

@@ -182,7 +182,12 @@ def test_run_strategy_cli_once_flag():
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
-            order_timeout=300
+            order_timeout=300,
+            morning_filter=True,
+            morning_filter_pct=0.60,
+            strike_mode="ATR",
+            atr_multiplier=1.25,
+            target_price=30.0
         )
 
 
@@ -423,7 +428,12 @@ def test_run_strategy_cli_max_loss_flag():
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
-            order_timeout=300
+            order_timeout=300,
+            morning_filter=True,
+            morning_filter_pct=0.60,
+            strike_mode="ATR",
+            atr_multiplier=1.25,
+            target_price=30.0
         )
 
 
@@ -450,7 +460,12 @@ def test_run_strategy_cli_strategy_max_loss_flag():
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
-            order_timeout=300
+            order_timeout=300,
+            morning_filter=True,
+            morning_filter_pct=0.60,
+            strike_mode="ATR",
+            atr_multiplier=1.25,
+            target_price=30.0
         )
 
 
@@ -490,7 +505,12 @@ def test_run_strategy_cli_order_type_and_holiday_flags():
             order_type="MARKET",
             limit_buffer_pct=0.08,
             ignore_holidays=True,
-            order_timeout=300
+            order_timeout=300,
+            morning_filter=True,
+            morning_filter_pct=0.60,
+            strike_mode="ATR",
+            atr_multiplier=1.25,
+            target_price=30.0
         )
 
 
@@ -517,7 +537,12 @@ def test_run_strategy_cli_order_timeout_flag():
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
-            order_timeout=120
+            order_timeout=120,
+            morning_filter=True,
+            morning_filter_pct=0.60,
+            strike_mode="ATR",
+            atr_multiplier=1.25,
+            target_price=30.0
         )
 
 
@@ -934,7 +959,7 @@ def test_run_session_reauthenticates_on_token_error(tmp_path):
         }
         res = desk.run_session(lots=1, kite=mock_kite_expired, dry_run=True)
         assert res["status"] == "DRY_RUN"
-        mock_find.assert_called_once_with(mock_kite_fresh, underlying="NIFTY", target_price=30.0, lots=1)
+        mock_find.assert_called_once_with(mock_kite_fresh, underlying="NIFTY", target_price=30.0, strike_mode="ATR", atr_multiplier=1.25, lots=1)
 
 
 
@@ -1081,4 +1106,107 @@ def test_safe_exit_leg_live_verification(tmp_path):
         assert ok is False
         assert state["pe"]["status"] == "OPEN"
         mock_om.cancel_order.assert_called_with("ORD_EXIT_3")
+
+
+def test_check_morning_trend_filter_triggered():
+    desk = StrangleDesk(order_manager=MagicMock())
+    mock_kite = MagicMock()
+    # 09:15-10:00 range: Open 24000, High 24200, Low 23980 => Range = 220 pts = 0.916% (>= 0.60%)
+    mock_kite.historical_data.return_value = [
+        {"date": datetime(2026, 11, 20, 9, 15), "open": 24000.0, "high": 24050.0, "low": 23980.0, "close": 24040.0},
+        {"date": datetime(2026, 11, 20, 9, 30), "open": 24040.0, "high": 24150.0, "low": 24030.0, "close": 24140.0},
+        {"date": datetime(2026, 11, 20, 9, 45), "open": 24140.0, "high": 24200.0, "low": 24120.0, "close": 24190.0},
+    ]
+
+    is_trend, details = desk.check_morning_trend_filter(mock_kite, underlying="NIFTY", threshold_pct=0.60)
+    assert is_trend is True
+    assert details["triggered"] is True
+    assert details["range_pts"] == 220.0
+    assert details["range_pct"] > 0.60
+
+
+def test_check_morning_trend_filter_not_triggered():
+    desk = StrangleDesk(order_manager=MagicMock())
+    mock_kite = MagicMock()
+    # 09:15-10:00 range: Open 24000, High 24050, Low 23980 => Range = 70 pts = 0.29% (< 0.60%)
+    mock_kite.historical_data.return_value = [
+        {"date": datetime(2026, 11, 20, 9, 15), "open": 24000.0, "high": 24050.0, "low": 23980.0, "close": 24040.0},
+        {"date": datetime(2026, 11, 20, 9, 45), "open": 24040.0, "high": 24050.0, "low": 24010.0, "close": 24020.0},
+    ]
+
+    is_trend, details = desk.check_morning_trend_filter(mock_kite, underlying="NIFTY", threshold_pct=0.60)
+    assert is_trend is False
+    assert details["triggered"] is False
+    assert details["range_pts"] == 70.0
+
+
+def test_check_morning_trend_filter_quote_fallback():
+    desk = StrangleDesk(order_manager=MagicMock())
+    mock_kite = MagicMock()
+    mock_kite.historical_data.side_effect = RuntimeError("Historical API down")
+    mock_kite.quote.return_value = {
+        "NSE:NIFTY 50": {
+            "ohlc": {"open": 24000.0, "high": 24180.0, "low": 23980.0, "close": 24150.0}
+        }
+    }
+
+    # Range = 200 pts / 24000 = 0.833% (>= 0.60%)
+    is_trend, details = desk.check_morning_trend_filter(mock_kite, underlying="NIFTY", threshold_pct=0.60)
+    assert is_trend is True
+    assert details["range_pts"] == 200.0
+    assert details["source"] == "quote_ohlc"
+
+
+def test_run_session_skips_when_morning_filter_triggered(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    mock_om = MagicMock()
+    mock_notifier = MagicMock()
+    desk = StrangleDesk(order_manager=mock_om, state_file=state_file, notifier=mock_notifier)
+    mock_kite = MagicMock()
+
+    with patch.object(desk, "check_morning_trend_filter", return_value=(True, {"range_pts": 200.0, "range_pct": 0.83, "triggered": True})):
+        res = desk.run_session(
+            underlying="NIFTY",
+            lots=10,
+            kite=mock_kite,
+            morning_filter=True,
+            morning_filter_pct=0.60,
+            ignore_holidays=True
+        )
+
+        assert res["status"] == "SKIPPED_TREND_DAY"
+        assert "Morning Trend Filter" in res["reason"]
+        # Ensure no orders were placed
+        mock_om.sell.assert_not_called()
+        mock_notifier.send_message.assert_called_once()
+        # Ensure state persisted
+        saved_state = desk.load_state()
+        assert saved_state["status"] == "SKIPPED_TREND_DAY"
+
+
+def test_run_strategy_cli_morning_filter_flags():
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client"), \
+         patch("run_strategy.TelegramNotifier"), \
+         patch("run_strategy.OrderManager"), \
+         patch("run_strategy.StrangleDesk") as mock_desk_cls:
+        
+        mock_desk = MagicMock()
+        mock_desk_cls.return_value = mock_desk
+
+        # Test CLI with --strike-mode ATR --atr-multiplier 1.25 --morning-filter-pct 0.55
+        exit_code = run_strategy_cli([
+            "--once",
+            "--morning-filter",
+            "--morning-filter-pct", "0.55",
+            "--strike-mode", "ATR",
+            "--atr-multiplier", "1.25"
+        ])
+        assert exit_code == 0
+        call_kwargs = mock_desk.run_session.call_args[1]
+        assert call_kwargs["morning_filter"] is True
+        assert call_kwargs["morning_filter_pct"] == 0.55
+        assert call_kwargs["strike_mode"] == "ATR"
+        assert call_kwargs["atr_multiplier"] == 1.25
+
 
