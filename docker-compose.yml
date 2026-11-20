@@ -68,46 +68,35 @@ services:
   #   command: ["--live", "--lots", "1", "--monthly-stop-loss", "0.03", "--monthly-target", "0.04", "--schedule-time", "15:20"]
   # ===================================================================================
 
-  orb-desk:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: orb_breakout_desk
-    image: ${DOCKER_USER:-sharadprsn}/nifty_strangle_desk:latest
-    restart: unless-stopped
-    entrypoint: ["python", "run_orb.py"]
-    env_file:
-      - .env
-    environment:
-      - TZ=Asia/Kolkata
-      - PYTHONUNBUFFERED=1
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "10"
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./.env:/app/.env
-    # -----------------------------------------------------------------------------------
-    # Option 3 Desk (Static 30 Stocks Universe):
-    # - Sizing: 2 Lots per stock (50% booked @ 1:1 R target, remaining 50% runner to 15:00)
-    # - Portfolio Circuit Breaker: Hard halt at -Rs 50,000 daily loss (for 2 lots)
-    # - Max Trades Cap: 5 trades per day
-    # - Marketable LIMIT execution with 0.2% price buffer
-    #
-    # 1. Paper Trading Mode (2 Lots simulated execution + Telegram alerts):
-    command: ["--paper", "--sizing-mode", "LOTS", "--lots", "2", "--daily-loss", "50000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
-    #
-    # 2. Paper Trading Mode (Fixed Risk ₹2,500 Risk-Parity):
-    # command: ["--paper", "--sizing-mode", "FIXED_RISK", "--risk", "2500", "--daily-loss", "10000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
-    #
-    # 3. Live Production Mode (Real Broker Order Execution via Kite Connect API + Telegram Alerts):
-    # command: ["--live", "--sizing-mode", "LOTS", "--lots", "2", "--daily-loss", "50000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
-    # -----------------------------------------------------------------------------------
+  # ===================================================================================
+  # STOCK ORB STRATEGY - DISABLED (Per user mandate to run exclusively Strangle + Silver)
+  # ===================================================================================
+  # orb-desk:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: orb_breakout_desk
+  #   image: ${DOCKER_USER:-sharadprsn}/nifty_strangle_desk:latest
+  #   restart: unless-stopped
+  #   entrypoint: ["python", "run_orb.py"]
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - TZ=Asia/Kolkata
+  #     - PYTHONUNBUFFERED=1
+  #     - LOG_LEVEL=${LOG_LEVEL:-INFO}
+  #     - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "10"
+  #   volumes:
+  #     - ./data:/app/data
+  #     - ./logs:/app/logs
+  #     - ./.env:/app/.env
+  #   command: ["--paper", "--sizing-mode", "LOTS", "--lots", "2", "--daily-loss", "50000", "--max-trades", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.002", "--poll", "5"]
+  # ===================================================================================
 
   silver-orb-desk:
     build:
