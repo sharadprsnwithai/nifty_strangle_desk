@@ -19,8 +19,9 @@ logger = logging.getLogger("silver_options.cli")
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MCX Silver Options Desk")
-    parser.add_argument("--paper", action="store_true", default=True, help="Run in paper trading mode")
-    parser.add_argument("--live", action="store_true", help="Run in live trading mode")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--paper", action="store_true", help="Run in paper trading mode (default)")
+    mode_group.add_argument("--live", action="store_true", help="Run in live trading mode")
     return parser
 
 
@@ -32,7 +33,16 @@ def main(args=None):
     logger.info(f"Starting MCX Silver Options Desk (Mode: {'PAPER' if is_paper else 'LIVE'})...")
 
     cfg = SilverConfig()
-    kite = get_kite_client()
+    kite = None
+    if is_paper:
+        try:
+            kite = get_kite_client()
+        except Exception as e:
+            logger.info("No live Kite credentials found; proceeding in simulated paper mode. (%s)", e)
+            kite = None
+    else:
+        kite = get_kite_client()
+
     engine = SilverOptionsEngine(kite_client=kite, config=cfg, is_paper=is_paper)
     logger.info(f"Initialized Silver Options Engine for {cfg.symbol} (Lot size: {cfg.lot_size} kg). Ready.")
     return engine
