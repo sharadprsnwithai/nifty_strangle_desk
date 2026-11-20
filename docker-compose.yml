@@ -28,14 +28,17 @@ services:
       # Code is baked into the image; rebuild to apply code changes: docker compose up -d --build
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Live Production (10 Lots, Rs 10k Portfolio Max Loss, Morning Trend Filter, ATR Strikes):
-    command: ["--live", "--lots", "10", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "10000", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
+    # 1. Live Production (10 Lots, Single-Leg Exit + Cost Trailing, Morning Trend Filter, ATR Strikes):
+    command: ["--live", "--lots", "10", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "10000", "--single-leg-exit", "--trail-cost", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
     #
-    # 2. Live Incubation (1 Lot, Rs 1k Portfolio Max Loss, Marketable Limit Orders):
-    # command: ["--live", "--lots", "1", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "1000", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
+    # 2. Live Conservative / Re-entry (5 Lots, Rs 5k Risk Cap, Single-Leg Exit + Cost Trailing):
+    # command: ["--live", "--lots", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "5000", "--single-leg-exit", "--trail-cost", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
     #
-    # 3. Paper Trading (Simulation):
-    # command: ["--paper", "--lots", "10", "--poll", "5", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
+    # 3. Live Incubation (1 Lot, Rs 1k Portfolio Max Loss, Marketable Limit Orders):
+    # command: ["--live", "--lots", "1", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "1000", "--single-leg-exit", "--trail-cost", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
+    #
+    # 4. Paper Trading (Simulation):
+    # command: ["--paper", "--lots", "10", "--poll", "5", "--single-leg-exit", "--trail-cost", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
     # -----------------------------------------------------------------------------------
 
   # ===================================================================================
