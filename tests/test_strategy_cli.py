@@ -1364,7 +1364,9 @@ def test_strangle_desk_concurrent_entry_order_placement(tmp_path):
         "NFO:NIFTY26N0924700PE": {"last_price": 30.0}
     }
 
-    with patch("strategy.strangle_desk.find_strangle_strikes") as mock_find:
+    with patch("strategy.strangle_desk.find_strangle_strikes") as mock_find, \
+         patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
         mock_find.return_value = {
             "expiry": "2026-11-09",
             "total_lots": 1,
