@@ -738,28 +738,8 @@ class SilverORBDesk:
             logger.debug("Pre-US window (%s). Waiting for 17:45 IST reference candle.", current_t.strftime("%H:%M:%S"))
             return state
 
-        # Step 1b: Pre-flight commodity margin check strictly between 17:45 and 18:00
+        # Step 1b: Between 17:45 and 18:00 IST, wait for 18:00 trigger window
         if current_t < self.config.trade_window_start:
-            if state.get("margin_checked") is None:
-                margin_info = self.check_available_margin()
-                state["margin_checked"] = margin_info.get("status")
-                state["available_commodity_cash"] = margin_info.get("available_cash")
-                self.save_state(state)
-                if margin_info.get("status") == "DISABLED":
-                    logger.error("MCX Commodity trading segment is disabled on your Zerodha account!")
-                    if self.notifier:
-                        self.notifier.send_message("⚠️ *MCX Alert:* Commodity trading segment appears disabled on your Zerodha account!")
-                elif margin_info.get("status") == "INSUFFICIENT_FUNDS":
-                    logger.warning("MCX Commodity cash balance is ₹0.00. Funds required to trade Silver Mini.")
-                    if self.notifier:
-                        self.notifier.send_message(
-                            "⚠️ *MCX Margin Alert:* Commodity cash balance is ₹0.00.\n"
-                            "Your MCX segment is active, but funds must be transferred from Equity to Commodity on Zerodha to trade Silver Mini."
-                        )
-                elif margin_info.get("status") == "OK":
-                    cash = float(margin_info.get("available_cash", 0.0))
-                    logger.info("Pre-flight commodity margin check: Rs %.2f available", cash)
-
             logger.debug("Pre-US window (%s). Waiting for 18:00 IST trigger window.", current_t.strftime("%H:%M:%S"))
             return state
 
