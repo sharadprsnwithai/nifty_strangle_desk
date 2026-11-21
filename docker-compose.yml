@@ -12,12 +12,12 @@ services:
       - TZ=Asia/Kolkata
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-5}
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
-        max-file: "10"
+        max-file: "5"
     volumes:
       # Mount data directory so trades_today.json state persists across container restarts
       - ./data:/app/data
@@ -54,7 +54,7 @@ services:
       - TZ=Asia/Kolkata
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-5}
       - SILVER_LOTS=${SILVER_LOTS:-2}
       - SILVER_SL_PER_LOT=${SILVER_SL_PER_LOT:-10000}
       - SILVER_DAILY_MAX_LOSS=${SILVER_DAILY_MAX_LOSS:-15000}
@@ -62,7 +62,7 @@ services:
       driver: "json-file"
       options:
         max-size: "10m"
-        max-file: "10"
+        max-file: "5"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -71,9 +71,9 @@ services:
     entrypoint: ["python", "scripts/run_silver_desk.py"]
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Paper Trading Simulation (Default, 2 Lots, Rs 10k/Lot SL, Rs 15k/Lot Daily Max Loss):
-    command: ["--paper", "--lots", "2", "--sl-per-lot", "10000", "--daily-max-loss", "15000"]
+    # 1. Live Trading (Active: 2 Lots, Rs 10k/Lot SL, Rs 15k/Lot Daily Max Loss):
+    command: ["--live", "--lots", "2", "--sl-per-lot", "10000", "--daily-max-loss", "15000"]
     #
-    # 2. Live Trading (2 Lots, Rs 10k/Lot SL, Rs 15k/Lot Daily Max Loss):
-    # command: ["--live", "--lots", "2", "--sl-per-lot", "10000", "--daily-max-loss", "15000"]
+    # 2. Paper Trading Simulation:
+    # command: ["--paper", "--lots", "2", "--sl-per-lot", "10000", "--daily-max-loss", "15000"]
     # -----------------------------------------------------------------------------------
