@@ -29,21 +29,6 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
                      |                                       |                                       |
                      +---------------------------------------+---------------------------------------+
                                                              |
-                                            +---------------------------------+
-                                            |             DESK 4              |
-                                            |   MTF Techno-Funda Breakout     |
-                                            |        (Swing Screener)         |
-                                            +---------------------------------+
-                                            | • Daily Trigger at 15:15 IST    |
-                                            | • Monthly RSI > 60 & Weekly > 60|
-                                            | • Daily RSI Crosses Above 65    |
-                                            | • TTM EBITDA Growth > 30%       |
-                                            | • Quarterly EBITDA Growth > 30% |
-                                            | • Debt-to-Equity < 1.0 (Clean)  |
-                                            | • Operating Margin >= 8%        |
-                                            | • Rich HTML Telegram Alerts     |
-                                            +---------------------------------+
-                                                             |
                                       +---------------------------------------------+
                                       |         Shared Core Infrastructure          |
                                       +---------------------------------------------+
@@ -52,7 +37,7 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
                                       | • NSE Trading Holiday & Market Hours Guards |
                                       | • Real-Time Rich HTML Telegram Notifier     |
                                       | • State Persistence (Crash-Resilient JSON)  |
-                                      | • Full Pytest Test Suite (192/192 Passing)  |
+                                      | • Full Pytest Test Suite (183/183 Passing)  |
                                       +---------------------------------------------+
 ```
 
@@ -82,20 +67,7 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
 - **Automated Paper Execution**: Auto-executes simulated ATM option buying, tracks 50% hard Stop Loss, 2x (100%) Target, and 2-Day max holding time exit.
 - Detailed specs: [docs/max_oi_option_buying.md](file:///d:/code/sharads_intraday_option_selling_desk/docs/max_oi_option_buying.md).
 
-### 4. Desk 4: Milind Upasani MTF Techno-Funda Breakout Desk
-- **Dow Theory Multi-Timeframe Momentum**:
-  - Monthly RSI(14) $> 60.0$ (Primary Bullish Trend)
-  - Weekly RSI(14) $> 60.0$ (Secondary Bullish Momentum)
-  - Daily RSI(14) crosses above $65.0$ (Breakout Acceleration & Retests without chasing)
-- **High-Growth Operational Fundamentals**:
-  - Trailing 12-Month (TTM) YoY EBITDA Growth $> 30\%$
-  - Quarterly YoY EBITDA Growth $> 30\%$
-  - Solvency / Low Debt: $\text{Debt-to-Equity} < 1.0$
-  - Operating Margin $\ge 8\%-9\%$
-- **Scheduled Trigger**: Runs daily at **15:15 IST** (before market close) to scan closing breakouts for next-day swing positioning and dispatches formatted Telegram alerts.
-- Detailed specs: [docs/techno_funda_scanner.md](file:///d:/code/sharads_intraday_option_selling_desk/docs/techno_funda_scanner.md).
-
-### 5. Zero-Hit Off-Market Safety & Auth Core
+### 4. Zero-Hit Off-Market Safety & Auth Core
 - **Zero Kite API Hits Off-Market**: All desks verify `is_market_open()` before hitting any Kite API endpoints. On weekends, holidays, and outside 09:15–15:30 IST, all background polling loops sleep automatically without touching broker infrastructure.
 - **Automated Headless TOTP**: Daily login via `pyotp` RFC 6238 without manual browser interaction. Proactive 08:00 AM IST token renewal.
 - **Atomic Inter-Process Lock**: Safe file-locking ensures concurrent desks do not conflict over TOTP logins or token files.
@@ -207,23 +179,6 @@ uv run python scripts/run_max_oi_scanner.py --now --ignore-holidays --stocks REL
 
 ---
 
-### 5. Desk 4: MTF Techno-Funda Breakout Scanner
-```bash
-# Execute immediate scan pass & output results
-uv run python scripts/run_techno_funda_scanner.py --now
-
-# Run Continuous Market-Hours Daemon (Triggers daily at 15:15 IST)
-uv run python scripts/run_techno_funda_scanner.py --loop --poll 30
-
-# Run Technical-Only scan (bypasses fundamental validation)
-uv run python scripts/run_techno_funda_scanner.py --now --tech-only
-
-# Off-Market / Weekend Test Mode (Passes holiday override)
-uv run python scripts/run_techno_funda_scanner.py --now --ignore-holidays --stocks TIPSMUSIC,MCX,AUROPHARMA
-```
-
----
-
 ## Docker & Container Deployment
 
 The platform is fully containerized using Docker and Docker Compose with `Asia/Kolkata` timezone pre-configured.
@@ -232,7 +187,6 @@ The platform is fully containerized using Docker and Docker Compose with `Asia/K
 - `strangle-desk`: NIFTY Adaptive Short Strangle Desk.
 - `stock-futures-desk`: Nifty 200 Momentum 30 Stock Futures Desk.
 - `max-oi-scanner`: Max OI Option Buying Scanner & Paper Desk.
-- `techno-funda-scanner`: MTF Techno-Funda Breakout Scanner (15:15 IST daily).
 
 ```bash
 # Start all desks in the background
@@ -245,7 +199,6 @@ docker compose build
 docker compose logs -f stock-futures-desk
 docker compose logs -f strangle-desk
 docker compose logs -f max-oi-scanner
-docker compose logs -f techno-funda-scanner
 
 # Stop all desks
 docker compose down
@@ -255,7 +208,7 @@ docker compose down
 
 ## Testing & Quality Assurance
 
-The codebase features comprehensive unit test coverage with **192 automated tests**:
+The codebase features comprehensive unit test coverage with **183 automated tests**:
 
 ```bash
 uv run pytest
@@ -267,7 +220,6 @@ uv run pytest
 - **Stock Futures**: C1–C5 consolidation base rules, volume ratio breakouts, order manager execution, and target/SL calculations.
 - **Max OI Strategy**: Monthly expiry resolution, snapshot persistence, strike proximity, panic unwinding triggers, paper buy lifecycle, and 2-day holding time exit.
 - **Adaptive Strangle**: Daily ATR strike calculation, single-leg stop outs, cost trailing, and 14:45 cutoff rules.
-- **Techno-Funda Strategy**: Multi-timeframe Wilder's RSI calculation, Dow Theory trend alignment (Monthly > 60, Weekly > 60, Daily crosses 65), EBITDA growth, solvency validation, and 15:15 IST daily scheduler.
 
 ---
 
