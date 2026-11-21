@@ -17,12 +17,12 @@ class StockFuturesEngine:
         """
         Evaluates 15-minute intraday bars for a symbol on the current trading day:
         1. Identifies C1 candle (09:15-09:30) range [L1, H1].
-        2. Validates consolidation: C2, C3, C4 (09:30, 09:45, 10:00) must close inside [L1, H1].
-        3. Scans trigger bars (10:15 onwards up to entry_cutoff_time, default 13:00):
+        2. Validates consolidation: C2, C3, C4, C5 (09:30, 09:45, 10:00, 10:15) must close inside [L1, H1].
+        3. Scans trigger bars (10:30 onwards up to entry_cutoff_time, default 13:00):
            - Breakout above H1 (LONG) or below L1 (SHORT).
            - Institutional Volume Surge: Volume >= vol_threshold * 20-period Volume MA.
         """
-        if df_day is None or len(df_day) < 4:
+        if df_day is None or len(df_day) < 5:
             return None
 
         # Ensure datetime sorting and time format
@@ -45,7 +45,7 @@ class StockFuturesEngine:
         h1 = float(c1_row['high'])
         l1 = float(c1_row['low'])
 
-        # 2. Consolidation candles (09:30, 09:45, 10:00)
+        # 2. Consolidation candles (09:30, 09:45, 10:00, 10:15)
         c_cons = df[df['time'].isin(self.config.consolidation_candles)]
         if len(c_cons) < len(self.config.consolidation_candles):
             # Not all consolidation candles have formed yet
@@ -61,7 +61,7 @@ class StockFuturesEngine:
         if 'vol_ma20' not in df.columns:
             df['vol_ma20'] = df['volume'].rolling(20, min_periods=5).mean()
 
-        # 3. Scan trigger bars from 10:15 up to cutoff
+        # 3. Scan trigger bars from 10:30 up to cutoff
         trigger_bars = df[df['time'] >= self.config.entry_start_time].reset_index(drop=True)
         for _, bar in trigger_bars.iterrows():
             bar_time = str(bar['time'])

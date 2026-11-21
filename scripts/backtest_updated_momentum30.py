@@ -115,16 +115,16 @@ def run_backtest(lots_per_trade=2, data_dir="data/cache_15m_1y", target_pct=0.01
             h1 = c0['high']
             l1 = c0['low']
 
-            # Consolidation Bars (09:30, 09:45, 10:00)
-            c_cons = day_bars[day_bars['time'].isin(['09:30', '09:45', '10:00'])]
-            if len(c_cons) < 3:
+            # Consolidation Bars (09:30, 09:45, 10:00, 10:15)
+            c_cons = day_bars[day_bars['time'].isin(['09:30', '09:45', '10:00', '10:15'])]
+            if len(c_cons) < 4:
                 continue
             # All consolidation bars must close inside [l1, h1]
             if not ((c_cons['close'] <= h1) & (c_cons['close'] >= l1)).all():
                 continue
 
-            # Breakout Scan (10:15 onwards up to cutoff)
-            trigger_bars = day_bars[day_bars['time'] >= '10:15'].reset_index(drop=True)
+            # Breakout Scan (10:30 onwards up to cutoff)
+            trigger_bars = day_bars[day_bars['time'] >= '10:30'].reset_index(drop=True)
             for idx, bar in trigger_bars.iterrows():
                 if bar['time'] > entry_cutoff:
                     break

@@ -6,21 +6,22 @@ from strategy.stock_futures.engine import StockFuturesEngine
 
 
 def make_dummy_bars(breakout_side=None, vol_mult=2.0, break_consolidation=False):
-    """Creates a sample 15m dataframe for testing signals."""
+    """Creates a sample 15m dataframe for testing signals (4 consolidation candles: 09:30, 09:45, 10:00, 10:15)."""
     rows = [
         {"time": "09:15", "open": 100.0, "high": 105.0, "low": 95.0, "close": 102.0, "volume": 1000},
         {"time": "09:30", "open": 102.0, "high": 104.0, "low": 96.0, "close": 106.0 if break_consolidation else 103.0, "volume": 500},
         {"time": "09:45", "open": 103.0, "high": 104.5, "low": 97.0, "close": 101.0, "volume": 400},
         {"time": "10:00", "open": 101.0, "high": 103.0, "low": 98.0, "close": 100.0, "volume": 450},
+        {"time": "10:15", "open": 100.5, "high": 103.5, "low": 98.5, "close": 101.5, "volume": 480},
     ]
 
     vol = int(500 * vol_mult)
     if breakout_side == "LONG":
-        rows.append({"time": "10:15", "open": 101.0, "high": 106.0, "low": 100.5, "close": 105.5, "volume": vol})
+        rows.append({"time": "10:30", "open": 101.0, "high": 106.0, "low": 100.5, "close": 105.5, "volume": vol})
     elif breakout_side == "SHORT":
-        rows.append({"time": "10:15", "open": 99.0, "high": 99.5, "low": 94.0, "close": 94.5, "volume": vol})
+        rows.append({"time": "10:30", "open": 99.0, "high": 99.5, "low": 94.0, "close": 94.5, "volume": vol})
     else:
-        rows.append({"time": "10:15", "open": 100.0, "high": 102.0, "low": 98.0, "close": 101.0, "volume": vol})
+        rows.append({"time": "10:30", "open": 100.0, "high": 102.0, "low": 98.0, "close": 101.0, "volume": vol})
 
     df = pd.DataFrame(rows)
     df["vol_ma20"] = 500.0  # mock 20-period volume MA

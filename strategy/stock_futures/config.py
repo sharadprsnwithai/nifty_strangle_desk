@@ -80,8 +80,8 @@ class StockFuturesConfig:
     sl_pct: float = 0.010           # -1.0% hard stop loss
     vol_threshold: float = 1.5      # 1.5x of 20-period volume MA
     c1_candle_time: str = "09:15"   # Opening 15m candle (09:15 - 09:30)
-    consolidation_candles: List[str] = field(default_factory=lambda: ["09:30", "09:45", "10:00"])
-    entry_start_time: str = "10:15" # Breakout scan starts at 10:15
+    consolidation_candles: List[str] = field(default_factory=lambda: ["09:30", "09:45", "10:00", "10:15"])
+    entry_start_time: str = "10:30" # Breakout scan starts at 10:30
     entry_cutoff_time: str = "13:00" # No new trades after 13:00
     squareoff_time: str = "15:00"   # Mandatory EOD square-off
     max_trades_per_stock_per_day: int = 1
