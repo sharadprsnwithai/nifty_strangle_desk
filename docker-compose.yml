@@ -84,3 +84,35 @@ services:
     # 2. Paper Trading Simulation:
     # command: ["--paper", "--lots", "2", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--target-pct", "0.0225", "--sl-pct", "0.010", "--vol-threshold", "1.5", "--entry-cutoff", "13:00", "--loop"]
     # -----------------------------------------------------------------------------------
+
+  max-oi-scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: max_oi_scanner
+    image: ${DOCKER_USER:-sharadprsn}/max_oi_scanner:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Kolkata
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-5}
+      - MAX_OI_PROXIMITY_PCT=${MAX_OI_PROXIMITY_PCT:-0.02}
+      - MAX_OI_UNWINDING_PCT=${MAX_OI_UNWINDING_PCT:-0.20}
+      - MAX_OI_SL_PCT=${MAX_OI_SL_PCT:-0.50}
+      - MAX_OI_HOLDING_DAYS=${MAX_OI_HOLDING_DAYS:-2}
+      - MAX_OI_POLL=${MAX_OI_POLL:-60}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    entrypoint: ["python", "scripts/run_max_oi_scanner.py"]
+    command: ["--loop"]
+

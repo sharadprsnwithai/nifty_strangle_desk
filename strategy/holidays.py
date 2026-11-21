@@ -114,13 +114,15 @@ def is_market_open(
     Checks if NSE Equity / F&O market is currently open for trading.
     Returns: (is_open: bool, reason: str)
     """
+    if ignore_holidays:
+        return True, "Market OPEN (Bypassed)"
+
     if now is None:
         now = datetime.now()
 
-    if not ignore_holidays:
-        is_holiday, reason = is_trading_holiday(now.date())
-        if is_holiday:
-            return False, f"Market closed today ({reason})"
+    is_holiday, reason = is_trading_holiday(now.date())
+    if is_holiday:
+        return False, f"Market closed today ({reason})"
 
     time_str = now.strftime("%H:%M")
     if time_str < market_open_time:
@@ -140,11 +142,12 @@ def is_premarket_window(
     """
     Returns True if today is a trading day and time is in pre-market preparation window (08:00 to 09:15 IST).
     """
+    if ignore_holidays:
+        return True
     if now is None:
         now = datetime.now()
-    if not ignore_holidays:
-        is_holiday, _ = is_trading_holiday(now.date())
-        if is_holiday:
-            return False
+    is_holiday, _ = is_trading_holiday(now.date())
+    if is_holiday:
+        return False
     time_str = now.strftime("%H:%M")
     return premarket_start <= time_str < market_open_time
