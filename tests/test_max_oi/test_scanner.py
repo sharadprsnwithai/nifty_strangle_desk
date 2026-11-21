@@ -293,3 +293,124 @@ def test_desk_monitoring_sl_and_target(tmp_path):
         assert closed[0].exit_price == 85.0
         mock_notifier.send_message.assert_called_once()
         assert "OPTION BUY TARGET HIT" in mock_notifier.send_message.call_args[0][0]
+
+
+def test_execute_paper_buy_and_deduplication(tmp_path):
+    mock_notifier = MagicMock()
+    state_file = tmp_path / "paper_state.json"
+    cfg = MaxOIConfig(state_file=state_file, max_concurrent_trades=2, lots_per_trade=1)
+    desk = MaxOIDesk(config=cfg, notifier=mock_notifier, mode="PAPER")
+
+    sig = OptionBuySignal(
+        symbol="RELIANCE",
+        side="CE",
+        spot_price=1305.0,
+        breached_strike=1300.0,
+        oi_unwinding_pct=-25.0,
+        atm_strike=1300.0,
+        atm_tradingsymbol="RELIANCE26NOV1300CE",
+        atm_token=101,
+        atm_ltp=35.0,
+        lot_size=250,
+        sl_price=17.50,
+        target_price=70.0,
+        trigger_time="09:35",
+        expiry_date="2026-11-26",
+        max_exit_date="2026-11-23",
+    )
+
+    # 1. Execute initial paper buy
+    pos = desk.execute_paper_buy(sig)
+    assert pos is not None
+    assert pos.status == "OPEN"
+    assert pos.quantity == 250
+    assert pos.entry_price == 35.0
+    assert pos.sl_price == 17.50
+    assert pos.target_price == 70.0
+    assert "PAPER_" in pos.order_id
+    assert pos.tradingsymbol in desk.positions
+    assert mock_notifier.send_message.called
+    assert "PAPER TRADING" in mock_notifier.send_message.call_args[0][0]
+
+    # 2. Duplicate order for same symbol should be blocked
+    pos_dup = desk.execute_paper_buy(sig)
+    assert pos_dup is None
+
+    # 3. Add second different symbol -> should succeed (max_concurrent_trades = 2)
+    sig2 = OptionBuySignal(
+        symbol="TCS",
+        side="PE",
+        spot_price=4100.0,
+        breached_strike=4150.0,
+        oi_unwinding_pct=-22.0,
+        atm_strike=4100.0,
+        atm_tradingsymbol="TCS26NOV4100PE",
+        atm_token=102,
+        atm_ltp=60.0,
+        lot_size=175,
+        sl_price=30.0,
+        target_price=120.0,
+        trigger_time="09:35",
+        expiry_date="2026-11-26",
+        max_exit_date="2026-11-23",
+    )
+    pos2 = desk.execute_paper_buy(sig2)
+    assert pos2 is not None
+
+    # 4. Third symbol should be blocked due to concurrency limit
+    sig3 = OptionBuySignal(
+        symbol="INFY",
+        side="CE",
+        spot_price=1850.0,
+        breached_strike=1840.0,
+        oi_unwinding_pct=-21.0,
+        atm_strike=1840.0,
+        atm_tradingsymbol="INFY26NOV1840CE",
+        atm_token=103,
+        atm_ltp=40.0,
+        lot_size=400,
+        sl_price=20.0,
+        target_price=80.0,
+        trigger_time="09:35",
+        expiry_date="2026-11-26",
+        max_exit_date="2026-11-23",
+    )
+    pos3 = desk.execute_paper_buy(sig3)
+    assert pos3 is None
+
+
+def test_desk_monitoring_time_exit_2d(tmp_path):
+    mock_notifier = MagicMock()
+    state_file = tmp_path / "time_state.json"
+    cfg = MaxOIConfig(state_file=state_file)
+    desk = MaxOIDesk(config=cfg, notifier=mock_notifier, mode="PAPER", ignore_holidays=True)
+
+    pos = OptionPosition(
+        symbol="POLYCAB",
+        side="CE",
+        tradingsymbol="POLYCAB26NOV7100CE",
+        strike=7100.0,
+        lot_size=125,
+        quantity=125,
+        entry_price=100.0,
+        sl_price=50.0,
+        target_price=200.0,
+        entry_time="09:35",
+        entry_date="2026-11-19",
+        max_exit_date="2026-11-21",  # Today
+        current_price=100.0,
+    )
+    desk.positions[pos.tradingsymbol] = pos
+
+    prices = {"POLYCAB26NOV7100CE": 110.0}  # Neither SL nor Target hit
+
+    with patch("strategy.max_oi.desk.datetime") as mock_dt:
+        mock_now = datetime(2026, 11, 21, 15, 10)  # After 15:00 on Day 2
+        mock_dt.now.return_value = mock_now
+        closed = desk.monitor_open_positions(prices=prices)
+        assert len(closed) == 1
+        assert closed[0].exit_reason == "TIME_EXIT_2D"
+        assert closed[0].exit_price == 110.0
+        assert closed[0].status == "CLOSED"
+        assert mock_notifier.send_message.called
+        assert "2-DAY TIME EXIT" in mock_notifier.send_message.call_args[0][0]

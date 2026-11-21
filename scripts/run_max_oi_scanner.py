@@ -44,6 +44,19 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Saurabh's Max OI Unwinding Option Buying Strategy Scanner & Alert Desk"
     )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--paper",
+        action="store_true",
+        default=True,
+        help="Run simulated PAPER trading execution (default: True)",
+    )
+    mode_group.add_argument(
+        "--alert-only",
+        action="store_true",
+        help="Run in alert-only mode without executing paper orders",
+    )
+
     run_group = parser.add_mutually_exclusive_group()
     run_group.add_argument(
         "--now", "--once",
@@ -58,6 +71,18 @@ def parse_args():
         help="Run continuously as daemon loop during market hours (default: True)",
     )
 
+    parser.add_argument(
+        "--lots",
+        type=int,
+        default=int(os.getenv("MAX_OI_LOTS", "1")),
+        help="Number of option lots per trade (default: 1)",
+    )
+    parser.add_argument(
+        "--max-trades",
+        type=int,
+        default=int(os.getenv("MAX_OI_MAX_TRADES", "3")),
+        help="Maximum concurrent open option positions (default: 3)",
+    )
     parser.add_argument(
         "--proximity",
         type=float,
@@ -173,11 +198,12 @@ def print_signals_table(signals: list[OptionBuySignal]) -> None:
 def main():
     args = parse_args()
     setup_logging(log_dir=args.log_dir, log_level=args.log_level, log_filename="max_oi_scanner.log")
+    mode = "ALERT_ONLY" if args.alert_only else "PAPER"
 
     logger.info("=" * 80)
-    logger.info("  SAURABH'S PUT-CALL PARITY MAX OI OPTION BUYING DESK")
-    logger.info("  Proximity: %.1f%% | Min Unwinding: %.0f%% | SL: %.0f%% | Holding: %d Days",
-                args.proximity * 100, args.min_unwinding * 100, args.sl_pct * 100, args.max_holding_days)
+    logger.info("  SAURABH'S PUT-CALL PARITY MAX OI OPTION BUYING DESK [%s MODE]", mode)
+    logger.info("  Lots: %d | Max Positions: %d | Proximity: %.1f%% | Min Unwinding: %.0f%% | SL: %.0f%% | Holding: %d Days",
+                args.lots, args.max_trades, args.proximity * 100, args.min_unwinding * 100, args.sl_pct * 100, args.max_holding_days)
     logger.info("=" * 80)
 
     # 1. Market Hours and Trading Holiday Guard
@@ -206,6 +232,9 @@ def main():
 
     data_dir = Path(args.data_dir)
     config = MaxOIConfig(
+        mode=mode,
+        lots_per_trade=args.lots,
+        max_concurrent_trades=args.max_trades,
         proximity_pct=args.proximity,
         unwinding_pct=args.min_unwinding,
         sl_pct=args.sl_pct,
@@ -222,18 +251,27 @@ def main():
         notifier=notifier,
         kite=kite,
         ignore_holidays=args.ignore_holidays,
+        mode=mode,
     )
 
     target_stocks = [s.strip().upper() for s in args.stocks.split(",")] if args.stocks else None
 
     # Single pass execution (--now / --once)
     if args.once:
-        logger.info("Executing immediate scan pass (--now)...")
-        result = scanner.scan(
-            stocks=target_stocks,
-            ignore_date_filter=args.ignore_date_filter,
-            ignore_holidays=args.ignore_holidays,
-        )
+        logger.info("Executing immediate scan pass (--now) [%s Mode]...", mode)
+        # If custom stocks provided, scanner can take them
+        if target_stocks:
+            result = scanner.scan(
+                stocks=target_stocks,
+                ignore_date_filter=args.ignore_date_filter,
+                ignore_holidays=args.ignore_holidays,
+            )
+            # Execute paper buy if signals found
+            if result.get("signals") and mode == "PAPER":
+                for sig in result["signals"]:
+                    desk.execute_paper_buy(sig)
+        else:
+            result = desk.run_scan_cycle(ignore_date_filter=args.ignore_date_filter)
 
         candidates = result.get("candidates", [])
         signals = result.get("signals", [])
@@ -246,15 +284,6 @@ def main():
 
         if signals:
             print_signals_table(signals)
-
-        # Dispatch alerts if notifier is active
-        if signals and notifier:
-            for sig in signals:
-                notifier.send_message(desk.format_signal_message(sig))
-                logger.info("[TELEGRAM] Dispatched breakout buy alert for %s %s", sig.symbol, sig.side)
-        elif candidates and notifier:
-            notifier.send_message(desk.format_candidate_summary_message(candidates, expiry))
-            logger.info("[TELEGRAM] Dispatched proximity watchlist summary (%d stocks)", len(candidates))
 
         return 0
 

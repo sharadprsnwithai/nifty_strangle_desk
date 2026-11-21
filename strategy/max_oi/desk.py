@@ -29,8 +29,10 @@ class MaxOIDesk:
         notifier: Optional[TelegramNotifier] = None,
         kite: Optional[KiteConnect] = None,
         ignore_holidays: bool = False,
+        mode: str = "PAPER",
     ):
         self.config = config or MaxOIConfig()
+        self.mode = mode or getattr(self.config, "mode", "PAPER")
         self.scanner = scanner or MaxOIScanner(kite=kite, config=self.config)
         self.notifier = notifier
         self.kite = kite
@@ -109,8 +111,71 @@ class MaxOIDesk:
             f"Expiry: <code>{signal.expiry_date}</code> | Time: <code>{signal.trigger_time} IST</code>"
         )
 
+    def execute_paper_buy(self, signal: OptionBuySignal) -> Optional[OptionPosition]:
+        """Simulates paper execution of an option buy order on breakout trigger."""
+        # 1. Deduplication: Check if open position already exists for this symbol or contract
+        for pos in self.positions.values():
+            if pos.status == "OPEN" and (pos.symbol == signal.symbol or pos.tradingsymbol == signal.atm_tradingsymbol):
+                logger.info("[PAPER] Position for %s (%s) already active. Skipping duplicate entry.", signal.symbol, pos.tradingsymbol)
+                return None
+
+        # 2. Concurrency limit
+        open_count = len([p for p in self.positions.values() if p.status == "OPEN"])
+        if open_count >= self.config.max_concurrent_trades:
+            logger.warning("[PAPER] Max concurrent positions limit (%d) reached. Skipping %s.", self.config.max_concurrent_trades, signal.symbol)
+            return None
+
+        # 3. Create simulated position
+        qty = signal.lot_size * self.config.lots_per_trade
+        today_str = date.today().strftime("%Y-%m-%d")
+        now_time = datetime.now().strftime("%H:%M")
+
+        pos = OptionPosition(
+            symbol=signal.symbol,
+            side=signal.side,
+            tradingsymbol=signal.atm_tradingsymbol,
+            strike=signal.atm_strike,
+            lot_size=signal.lot_size,
+            quantity=qty,
+            entry_price=signal.atm_ltp,
+            sl_price=signal.sl_price,
+            target_price=signal.target_price,
+            entry_time=now_time,
+            entry_date=today_str,
+            max_exit_date=signal.max_exit_date,
+            current_price=signal.atm_ltp,
+            status="OPEN",
+            order_id=f"PAPER_{int(time.time())}",
+        )
+
+        self.positions[pos.tradingsymbol] = pos
+        self.save_state()
+        logger.info("[PAPER] Executed paper buy for %s %s @ Rs %.2f (Qty: %d)", pos.symbol, pos.tradingsymbol, pos.entry_price, pos.quantity)
+
+        # 4. Dispatch Telegram Notification
+        if self.notifier:
+            direction = "BULLISH CALL BUY 🚀" if signal.side == "CE" else "BEARISH PUT BUY 📉"
+            approx_cost = signal.atm_ltp * qty
+            max_risk = (signal.atm_ltp - signal.sl_price) * qty
+            msg = (
+                f"📝 <b>[PAPER TRADING] OPTION BUY EXECUTED</b>\n\n"
+                f"Stock: <b>{signal.symbol}</b> ({direction})\n"
+                f"Contract: <code>{signal.atm_tradingsymbol}</code>\n"
+                f"Breached Strike: <b>{signal.breached_strike:.0f} {signal.side}</b> (Panic Unwinding: <b>{signal.oi_unwinding_pct:.1f}%</b>)\n\n"
+                f"Entry Premium: <b>Rs {signal.atm_ltp:.2f}</b>\n"
+                f"Quantity: <b>{qty}</b> ({self.config.lots_per_trade} Lot)\n"
+                f"Total Investment: Rs {approx_cost:,.2f} (Max Risk: <b>Rs {max_risk:,.2f}</b>)\n\n"
+                f"🛡️ 50% Hard SL: <b>Rs {signal.sl_price:.2f}</b>\n"
+                f"🎯 2x Target (100%): <b>Rs {signal.target_price:.2f}</b>\n"
+                f"⏳ Max Holding: <b>2 Days</b> (Time Exit: {signal.max_exit_date} 15:00 IST)\n"
+                f"Time: <code>{now_time} IST</code>"
+            )
+            self.notifier.send_message(msg)
+
+        return pos
+
     def run_scan_cycle(self, ignore_date_filter: bool = False) -> Dict[str, Any]:
-        """Runs single scan cycle and dispatches alerts."""
+        """Runs single scan cycle and dispatches alerts / executes paper orders."""
         result = self.scanner.scan(ignore_date_filter=ignore_date_filter, ignore_holidays=self.ignore_holidays)
 
         if result.get("status") == "MARKET_CLOSED":
@@ -124,12 +189,15 @@ class MaxOIDesk:
         signals = result.get("signals", [])
         expiry = result.get("expiry", "")
 
-        # 1. Send Signals Alerts (Highest Priority)
-        if signals and self.notifier:
+        # 1. Process Actionable Signals
+        if signals:
             for sig in signals:
-                msg = self.format_signal_message(sig)
-                self.notifier.send_message(msg)
-                logger.info("[ALERT] Sent Telegram signal alert for %s %s", sig.symbol, sig.side)
+                if self.mode == "PAPER":
+                    self.execute_paper_buy(sig)
+                elif self.notifier:
+                    msg = self.format_signal_message(sig)
+                    self.notifier.send_message(msg)
+                    logger.info("[ALERT] Sent Telegram signal alert for %s %s", sig.symbol, sig.side)
 
         # 2. Send Daily Proximity Summary if candidates found
         elif candidates and self.notifier:
@@ -139,27 +207,38 @@ class MaxOIDesk:
 
         return result
 
-    def monitor_open_positions(self) -> List[OptionPosition]:
-        """Monitors active option positions for 50% SL or 2-day holding time exit."""
+    def monitor_open_positions(self, prices: Optional[Dict[str, float]] = None) -> List[OptionPosition]:
+        """Monitors active option positions for 50% SL, 2x target, or 2-day holding time exit."""
         closed = []
-        if not self.positions or not self.kite:
+        if not self.positions:
             return closed
 
-        # Check market open
-        market_open, _ = is_market_open(ignore_holidays=self.ignore_holidays)
-        if not market_open:
-            return closed
+        # Check market open (unless prices dict provided for simulation)
+        if prices is None:
+            market_open, _ = is_market_open(ignore_holidays=self.ignore_holidays)
+            if not market_open:
+                return closed
 
         today_str = date.today().strftime("%Y-%m-%d")
         now_time = datetime.now().strftime("%H:%M")
 
-        quotes_to_fetch = [f"NFO:{pos.tradingsymbol}" for pos in self.positions.values() if pos.status == "OPEN"]
-        quotes = {}
-        try:
-            quotes = self.kite.quote(quotes_to_fetch)
-        except Exception as e:
-            logger.warning("Error fetching quotes to monitor positions: %s", e)
+        # Resolve quotes
+        quotes: Dict[str, Any] = {}
+        if prices is not None:
+            quotes = {f"NFO:{tsym}": {"last_price": p} for tsym, p in prices.items()}
+        elif self.kite:
+            quotes_to_fetch = [f"NFO:{pos.tradingsymbol}" for pos in self.positions.values() if pos.status == "OPEN"]
+            if not quotes_to_fetch:
+                return closed
+            try:
+                quotes = self.kite.quote(quotes_to_fetch)
+            except Exception as e:
+                logger.warning("Error fetching quotes to monitor positions: %s", e)
+                return closed
+        else:
             return closed
+
+        mode_badge = f"[{self.mode}] " if self.mode else ""
 
         for pos in list(self.positions.values()):
             if pos.status != "OPEN":
@@ -178,7 +257,7 @@ class MaxOIDesk:
                 closed.append(pos)
                 if self.notifier:
                     self.notifier.send_message(
-                        f"🔴 <b>OPTION BUY SL HIT (50%)</b>\n"
+                        f"🔴 <b>{mode_badge}OPTION BUY SL HIT (50%)</b>\n"
                         f"Contract: <code>{pos.tradingsymbol}</code>\n"
                         f"Exit Price: Rs {ltp:.2f} (Entry: Rs {pos.entry_price:.2f})\n"
                         f"Net Loss: <b>Rs {pos.net_pnl:+,.2f}</b>\n"
@@ -191,7 +270,7 @@ class MaxOIDesk:
                 closed.append(pos)
                 if self.notifier:
                     self.notifier.send_message(
-                        f"🟢 <b>OPTION BUY TARGET HIT (2x / 100%)</b>\n"
+                        f"🟢 <b>{mode_badge}OPTION BUY TARGET HIT (2x / 100%)</b>\n"
                         f"Contract: <code>{pos.tradingsymbol}</code>\n"
                         f"Exit Price: Rs {ltp:.2f} (Entry: Rs {pos.entry_price:.2f})\n"
                         f"Net Profit: <b>Rs {pos.net_pnl:+,.2f} 🚀</b>\n"
@@ -205,7 +284,7 @@ class MaxOIDesk:
                 if self.notifier:
                     pnl_emoji = "🟢" if pos.net_pnl > 0 else "🔴"
                     self.notifier.send_message(
-                        f"{pnl_emoji} <b>OPTION BUY 2-DAY TIME EXIT</b>\n"
+                        f"{pnl_emoji} <b>{mode_badge}OPTION BUY 2-DAY TIME EXIT</b>\n"
                         f"Contract: <code>{pos.tradingsymbol}</code>\n"
                         f"Exit Price: Rs {ltp:.2f} (Entry: Rs {pos.entry_price:.2f})\n"
                         f"Holding: 2 Days Reached (Avoiding Theta Decay)\n"

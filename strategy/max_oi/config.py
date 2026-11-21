@@ -13,6 +13,9 @@ class MaxOIConfig:
     max_holding_days: int = 2           # 2-day maximum holding period (avoids theta death)
     post_15_only: bool = True           # Restrict scanning to second half of expiry (after 15th)
     capital_allocation_pct: float = 0.02 # Maximum 2% capital allocated to option buying
+    mode: str = "PAPER"                 # Execution mode: "PAPER" or "LIVE"
+    lots_per_trade: int = 1             # Number of option lots per trade
+    max_concurrent_trades: int = 3      # Maximum concurrent open option positions
 
     # Scheduling & Timing
     scan_time: str = "09:30"            # Primary daily scan time IST
