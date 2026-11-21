@@ -9,8 +9,10 @@ Parameters:
   - Universe: 248 liquid equities from data/swing_daily_2y.parquet (2-year history)
 """
 
+import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 import pandas as pd
 import numpy as np
 
@@ -21,8 +23,8 @@ from strategy.techno_funda.technicals import calculate_rsi
 
 
 def run_techno_funda_cash_backtest(
-    sl_pct: float = 0.05,
-    target_pct: float = 0.10,
+    sl_pct: Optional[float] = 0.05,
+    target_pct: Optional[float] = 0.10,
     allocation_per_trade: float = 100000.0,
     max_holding_days: int = 45,
     monthly_rsi_min: float = 58.0,
@@ -33,9 +35,12 @@ def run_techno_funda_cash_backtest(
 ) -> pd.DataFrame:
     print("=" * 80)
     print("  MTF TECHNO-FUNDA CASH BUYING BACKTEST")
-    print(f"  SL: {sl_pct*100:.1f}% | Target: {target_pct*100:.1f}% (R:R 1:{target_pct/sl_pct:.1f})")
+    if sl_pct is not None and target_pct is not None:
+        print(f"  Mode: Fixed Risk-Reward (SL: {sl_pct*100:.1f}% | Target: {target_pct*100:.1f}% | R:R 1:{target_pct/sl_pct:.1f})")
+    else:
+        print("  Mode: PURE TIME EXIT (No Stop Loss, No Target)")
     print(f"  Monthly RSI: >={monthly_rsi_min:.0f} | Weekly RSI: >={weekly_rsi_min:.0f} | Daily Trigger: >={daily_rsi_trigger:.0f}")
-    print(f"  Capital Per Trade: Rs {allocation_per_trade:,.0f} | Max Holding: {max_holding_days} Days")
+    print(f"  Capital Per Trade: Rs {allocation_per_trade:,.0f} | Holding Period: {max_holding_days} Days")
     print("=" * 80)
 
     raw_df = pd.read_parquet(data_path)
@@ -92,8 +97,8 @@ def run_techno_funda_cash_backtest(
                     continue
 
                 actual_cost = shares * entry_price
-                sl_price = round(entry_price * (1.0 - sl_pct), 2)
-                target_price = round(entry_price * (1.0 + target_pct), 2)
+                sl_price = round(entry_price * (1.0 - sl_pct), 2) if sl_pct is not None else None
+                target_price = round(entry_price * (1.0 + target_pct), 2) if target_pct is not None else None
 
                 exit_price = None
                 exit_date = None
@@ -109,44 +114,45 @@ def run_techno_funda_cash_backtest(
                     bar_close = float(sub["close"].iloc[k])
                     curr_date = sub["date"].iloc[k]
 
-                    # Check Gaps at Open
-                    if bar_open >= target_price:
-                        exit_price = bar_open
-                        exit_date = curr_date
-                        exit_reason = "TARGET_GAP"
-                        break
-                    elif bar_open <= sl_price:
-                        exit_price = bar_open
-                        exit_date = curr_date
-                        exit_reason = "SL_GAP"
-                        break
+                    if target_price is not None and sl_price is not None:
+                        # Check Gaps at Open
+                        if bar_open >= target_price:
+                            exit_price = bar_open
+                            exit_date = curr_date
+                            exit_reason = "TARGET_GAP"
+                            break
+                        elif bar_open <= sl_price:
+                            exit_price = bar_open
+                            exit_date = curr_date
+                            exit_reason = "SL_GAP"
+                            break
 
-                    # Check Intraday Hits (Conservative: check SL first if both breach)
-                    hit_sl = bar_low <= sl_price
-                    hit_target = bar_high >= target_price
+                        # Check Intraday Hits (Conservative: check SL first if both breach)
+                        hit_sl = bar_low <= sl_price
+                        hit_target = bar_high >= target_price
 
-                    if hit_sl and hit_target:
-                        exit_price = sl_price
-                        exit_date = curr_date
-                        exit_reason = "SL_HIT"
-                        break
-                    elif hit_target:
-                        exit_price = target_price
-                        exit_date = curr_date
-                        exit_reason = "TARGET_HIT"
-                        break
-                    elif hit_sl:
-                        exit_price = sl_price
-                        exit_date = curr_date
-                        exit_reason = "SL_HIT"
-                        break
+                        if hit_sl and hit_target:
+                            exit_price = sl_price
+                            exit_date = curr_date
+                            exit_reason = "SL_HIT"
+                            break
+                        elif hit_target:
+                            exit_price = target_price
+                            exit_date = curr_date
+                            exit_reason = "TARGET_HIT"
+                            break
+                        elif hit_sl:
+                            exit_price = sl_price
+                            exit_date = curr_date
+                            exit_reason = "SL_HIT"
+                            break
 
                 # Max Holding Time Exit
                 if exit_price is None:
                     last_idx = min(entry_idx + max_holding_days - 1, n - 1)
                     exit_price = float(sub["close"].iloc[last_idx])
                     exit_date = sub["date"].iloc[last_idx]
-                    exit_reason = "TIME_EXIT_45D"
+                    exit_reason = f"TIME_EXIT_{max_holding_days}D"
 
                 gross_pnl = (exit_price - entry_price) * shares
                 # Cash Delivery statutory costs (~0.25% turnover + slippage 0.1% + DP Rs 15.93)
@@ -216,10 +222,11 @@ def print_performance_summary(trades_df: pd.DataFrame) -> None:
     print("  🏆 MTF TECHNO-FUNDA CASH SWING BACKTEST RESULTS (2-YEAR SIMULATION)")
     print("=" * 80)
     print(f"  Total Trades Taken:        {total_trades}")
-    print(f"  Target Hits (+10%):        {target_hits} ({target_hits/total_trades*100:.1f}%)")
-    print(f"  Stop Loss Hits (-5%):      {sl_hits} ({sl_hits/total_trades*100:.1f}%)")
-    print(f"  Time Exits (45D EOD):      {time_exits} ({time_exits/total_trades*100:.1f}%)")
-    print(f"  Win Rate (Net):            {win_rate:.1f}%")
+    if target_hits > 0 or sl_hits > 0:
+        print(f"  Target Hits:               {target_hits} ({target_hits/total_trades*100:.1f}%)")
+        print(f"  Stop Loss Hits:            {sl_hits} ({sl_hits/total_trades*100:.1f}%)")
+    print(f"  Time Exits:                {time_exits} ({time_exits/total_trades*100:.1f}%)")
+    print(f"  Win Rate (Net):            {win_rate:.1f}% ({len(win_trades)} wins / {len(loss_trades)} losses)")
     print("-" * 80)
     print(f"  Total Gross PnL:           Rs {total_gross:+,.2f}")
     print(f"  Total Statutory Charges:   Rs {total_charges:,.2f}")
@@ -229,7 +236,8 @@ def print_performance_summary(trades_df: pd.DataFrame) -> None:
     print(f"  Average Losing Trade:      Rs {avg_loss:+,.2f} ({loss_trades['return_pct'].mean():.2f}%)")
     print(f"  Average Holding Time:      {avg_hold:.1f} trading days (~{avg_hold/5:.1f} weeks)")
     print(f"  Maximum Drawdown:          Rs {max_dd:,.2f}")
-    print(f"  Return / Max Drawdown:     {abs(total_net/max_dd):.2f}x")
+    if max_dd != 0:
+        print(f"  Return / Max Drawdown:     {abs(total_net/max_dd):.2f}x")
     print("=" * 80 + "\n")
 
     # Sample winning and losing trades
@@ -240,7 +248,24 @@ def print_performance_summary(trades_df: pd.DataFrame) -> None:
 
 
 if __name__ == "__main__":
-    df = run_techno_funda_cash_backtest()
+    parser = argparse.ArgumentParser(description="Backtester for MTF Techno-Funda Cash Buying")
+    parser.add_argument("--time-only", action="store_true", help="Remove SL & Target, strictly exit on holding days")
+    parser.add_argument("--hold-days", type=int, default=45, help="Holding duration in trading days (default 45)")
+    parser.add_argument("--sl-pct", type=float, default=5.0, help="Stop Loss percentage (default 5.0)")
+    parser.add_argument("--target-pct", type=float, default=10.0, help="Target percentage (default 10.0)")
+    parser.add_argument("--capital", type=float, default=100000.0, help="Capital per trade (default 100000)")
+    parser.add_argument("--output", type=str, default="data/techno_funda_cash_backtest_trades.csv", help="CSV output path")
+    args = parser.parse_args()
+
+    sl = None if args.time_only else (args.sl_pct / 100.0)
+    tgt = None if args.time_only else (args.target_pct / 100.0)
+
+    df = run_techno_funda_cash_backtest(
+        sl_pct=sl,
+        target_pct=tgt,
+        allocation_per_trade=args.capital,
+        max_holding_days=args.hold_days,
+    )
     print_performance_summary(df)
-    df.to_csv("data/techno_funda_cash_backtest_trades.csv", index=False)
-    print("\nDetailed trade log saved to: data/techno_funda_cash_backtest_trades.csv")
+    df.to_csv(args.output, index=False)
+    print(f"\nDetailed trade log saved to: {args.output}")
