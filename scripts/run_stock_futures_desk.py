@@ -53,6 +53,7 @@ def parse_args():
     parser.add_argument("--poll", type=int, default=int(os.getenv("STOCK_FUTURES_POLL", "15")), help="Poll interval in seconds (default: 15)")
     parser.add_argument("--loop", action="store_true", default=True, help="Run continuously as daemon loop during market hours (default: True)")
     parser.add_argument("--once", action="store_true", help="Run single scan & monitor iteration and exit")
+    parser.add_argument("--ignore-holidays", action="store_true", help="Ignore weekends and official NSE holidays (useful for testing)")
     parser.add_argument("--state-file", type=str, default=os.getenv("STOCK_FUTURES_STATE_FILE"), help="Path to state JSON file")
     parser.add_argument("--data-dir", type=str, default=os.getenv("DATA_DIR", "data"), help="Directory for state data files (default: data)")
     parser.add_argument("--log-dir", type=str, default=os.getenv("LOG_DIR", "logs"), help="Directory for host log files (default: logs)")
@@ -130,7 +131,7 @@ def main():
         return 0
 
     logger.info("Launching daemon monitoring loop on 30 Momentum Stocks...")
-    desk.run_loop(poll_seconds=args.poll)
+    desk.run_loop(poll_seconds=args.poll, ignore_holidays=args.ignore_holidays)
     return 0
 
 

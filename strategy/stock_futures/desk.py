@@ -35,6 +35,11 @@ class StockFuturesDesk:
         self._last_universe_mtime: float = 0.0
         self._last_daily_rehydrate_date: Optional[str] = None
         self._last_eod_summary_date: Optional[str] = None
+        self._last_holiday_date: Optional[str] = None
+        self._last_premarket_log_date: Optional[str] = None
+        self._last_formation_log_date: Optional[str] = None
+        self._last_active_scan_log_date: Optional[str] = None
+        self._last_cutoff_log_date: Optional[str] = None
         if self.config.universe_file and self.config.universe_file.exists():
             try:
                 self._last_universe_mtime = self.config.universe_file.stat().st_mtime
@@ -298,35 +303,86 @@ class StockFuturesDesk:
         self.monitor_open_positions(prices=prices)
         self.scan_and_enter(candle_feed=candle_feed)
 
-    def run_loop(self, poll_seconds: int = 15) -> None:
+    def run_loop(
+        self,
+        poll_seconds: int = 15,
+        ignore_holidays: bool = False,
+        max_iterations: Optional[int] = None,
+    ) -> None:
         """Runs automated polling loop continuously during market hours."""
-        logger.info("Starting Stock Futures Desk daemon loop (Poll interval: %ds)...", poll_seconds)
+        logger.info(
+            "Starting Stock Futures Desk daemon scheduler (Poll: %ds, Entry: %s IST, Cutoff: %s IST, Square-off: %s IST)...",
+            poll_seconds, self.config.entry_start_time, self.config.entry_cutoff_time, self.config.squareoff_time
+        )
+        iteration = 0
         while True:
+            if max_iterations is not None and iteration >= max_iterations:
+                logger.info("Reached max iterations (%d). Stopping scheduler loop.", max_iterations)
+                break
+            iteration += 1
+
             try:
                 now = datetime.now()
                 now_time = now.strftime("%H:%M")
                 today_str = now.strftime("%Y-%m-%d")
 
-                # Check weekends and official NSE trading holidays
-                from strategy.holidays import is_trading_holiday
-                is_holiday, holiday_reason = is_trading_holiday(now.date())
-                if is_holiday:
-                    logger.debug("Market closed today (%s: %s). Sleeping 5 minutes...", now.date(), holiday_reason)
-                    time.sleep(300)
-                    continue
+                # 1. Check weekends and official NSE trading holidays
+                if not ignore_holidays:
+                    from strategy.holidays import is_trading_holiday
+                    is_holiday, holiday_reason = is_trading_holiday(now.date())
+                    if is_holiday:
+                        if self._last_holiday_date != today_str:
+                            logger.info(
+                                "[SCHEDULER] Exchange closed today (%s: %s). Scheduler paused. Waiting for next trading session...",
+                                today_str, holiday_reason
+                            )
+                            self._last_holiday_date = today_str
+                        time.sleep(30)
+                        continue
 
-                # Daily Pre-Market Auto-Rehydration Check (runs once every morning between 08:00 and 09:10 IST)
+                # Reset holiday date on trading days
+                self._last_holiday_date = None
+
+                # 2. Daily Pre-Market Auto-Rehydration Check (runs once every morning between 08:00 and 09:10 IST)
                 if "08:00" <= now_time <= "09:10" and self._last_daily_rehydrate_date != today_str:
                     self._last_daily_rehydrate_date = today_str
-                    self.perform_daily_rehydration()
+                    self.perform_daily_rehydration(ignore_holidays=ignore_holidays)
 
-                # Before market hours
+                # 3. Before Market Hours (Pre-market wait until 09:15 IST)
                 if now_time < "09:15":
-                    logger.debug("Market closed (%s). Sleeping until 09:15...", now_time)
-                    time.sleep(30)
+                    if self._last_premarket_log_date != today_str:
+                        logger.info(
+                            "[SCHEDULER] Pre-market hours (Current: %s IST). Regular trading opens at 09:15 IST. Waiting...",
+                            now_time
+                        )
+                        self._last_premarket_log_date = today_str
+                    time.sleep(15)
                     continue
 
-                # After square-off time (15:00 - 15:30)
+                # 4. Morning Formation Window (09:15 - 10:30 IST)
+                # C1 (09:15-09:30) defines [L1, H1] range, and C2-C5 (09:30-10:15) form consolidation base.
+                # Breakout entry scan starts strictly at entry_start_time (10:30 IST).
+                if now_time < self.config.entry_start_time:
+                    if self._last_formation_log_date != today_str:
+                        logger.info(
+                            "[SCHEDULER] Market opened (Current: %s IST). Range & Consolidation formation in progress (09:15–10:15). Breakout polling starts at %s IST.",
+                            now_time, self.config.entry_start_time
+                        )
+                        self._last_formation_log_date = today_str
+
+                    # Check universe file updates dynamically
+                    self.check_and_rehydrate_universe()
+
+                    # If open positions exist from earlier, monitor them
+                    has_open_positions = any(p.status == "OPEN" for p in self.order_manager.positions.values())
+                    if has_open_positions:
+                        self.monitor_open_positions()
+                        time.sleep(poll_seconds)
+                    else:
+                        time.sleep(15)
+                    continue
+
+                # 5. After square-off time (15:00 - 23:59 IST)
                 if now_time >= self.config.squareoff_time:
                     # Final check to square off any open positions
                     self.monitor_open_positions()
@@ -339,7 +395,10 @@ class StockFuturesDesk:
                         total_charges = sum(t.get("charges", 0.0) for t in today_trades)
                         wins = sum(1 for t in today_trades if t.get("net_pnl", 0.0) > 0)
                         losses = sum(1 for t in today_trades if t.get("net_pnl", 0.0) < 0)
-                        logger.info("Day complete. Trades today: %d, Net PnL: Rs %.2f", len(today_trades), total_pnl)
+                        logger.info(
+                            "[SCHEDULER] Trading day ended (%s IST). Total Trades Today: %d | Realized Net PnL: Rs %.2f. Waiting for next session.",
+                            now_time, len(today_trades), total_pnl
+                        )
                         if self.notifier:
                             summary_pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
                             self.notifier.send_message(
@@ -350,9 +409,31 @@ class StockFuturesDesk:
                                 f"{summary_pnl_emoji} <b>Net Realized P&L: Rs {total_pnl:+,.2f}</b>"
                             )
 
-                    logger.info("Past square-off time (%s). Day complete.", now_time)
                     time.sleep(60)
                     continue
+
+                # 6. Entry Cutoff Window (13:00 - 15:00 IST)
+                # No new entries allowed after 13:00 IST. Only monitor open positions.
+                if now_time >= self.config.entry_cutoff_time:
+                    if self._last_cutoff_log_date != today_str:
+                        logger.info(
+                            "[SCHEDULER] Entry cutoff (%s IST) reached. No new breakout entries allowed today. Monitoring active positions until %s square-off.",
+                            self.config.entry_cutoff_time, self.config.squareoff_time
+                        )
+                        self._last_cutoff_log_date = today_str
+
+                    self.check_and_rehydrate_universe()
+                    self.monitor_open_positions()
+                    time.sleep(poll_seconds)
+                    continue
+
+                # 7. Active Breakout Scanning & Trading Window (10:30 - 13:00 IST)
+                if self._last_active_scan_log_date != today_str:
+                    logger.info(
+                        "[SCHEDULER] %s IST reached. Active breakout scanning engaged across %d Momentum Stocks (Poll: %ds).",
+                        self.config.entry_start_time, len(self.config.symbols), poll_seconds
+                    )
+                    self._last_active_scan_log_date = today_str
 
                 self.run_cycle()
                 time.sleep(poll_seconds)
