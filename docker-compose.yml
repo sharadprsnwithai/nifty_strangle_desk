@@ -41,12 +41,12 @@ services:
     # command: ["--paper", "--lots", "10", "--poll", "5", "--single-leg-exit", "--trail-cost", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
     # -----------------------------------------------------------------------------------
 
-  silver-desk:
+  stock-futures-desk:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: silver_options_desk
-    image: ${DOCKER_USER:-sharadprsn}/silver_options_desk:latest
+    container_name: stock_futures_desk
+    image: ${DOCKER_USER:-sharadprsn}/stock_futures_desk:latest
     restart: unless-stopped
     env_file:
       - .env
@@ -55,9 +55,16 @@ services:
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-5}
-      - SILVER_LOTS=${SILVER_LOTS:-2}
-      - SILVER_SL_PER_LOT=${SILVER_SL_PER_LOT:-10000}
-      - SILVER_DAILY_MAX_LOSS=${SILVER_DAILY_MAX_LOSS:-15000}
+      - STOCK_FUTURES_LOTS=${STOCK_FUTURES_LOTS:-2}
+      - STOCK_FUTURES_ORDER_TYPE=${STOCK_FUTURES_ORDER_TYPE:-LIMIT}
+      - STOCK_FUTURES_LIMIT_BUFFER_PCT=${STOCK_FUTURES_LIMIT_BUFFER_PCT:-0.05}
+      - STOCK_FUTURES_TARGET_PCT=${STOCK_FUTURES_TARGET_PCT:-0.015}
+      - STOCK_FUTURES_SL_PCT=${STOCK_FUTURES_SL_PCT:-0.010}
+      - STOCK_FUTURES_VOL_THRESHOLD=${STOCK_FUTURES_VOL_THRESHOLD:-1.5}
+      - STOCK_FUTURES_ENTRY_CUTOFF=${STOCK_FUTURES_ENTRY_CUTOFF:-13:00}
+      - STOCK_FUTURES_SQUAREOFF_TIME=${STOCK_FUTURES_SQUAREOFF_TIME:-15:00}
+      - STOCK_FUTURES_STATE_FILE=/app/data/stock_futures_trades_today.json
+      - STOCK_FUTURES_POLL=${STOCK_FUTURES_POLL:-15}
     logging:
       driver: "json-file"
       options:
@@ -67,13 +74,13 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./.env:/app/.env
-    # Override default entrypoint to run the MCX Silver Options Desk
-    entrypoint: ["python", "scripts/run_silver_desk.py"]
+    # Override default entrypoint to run the Nifty 200 Momentum 30 Stock Futures Desk
+    entrypoint: ["python", "scripts/run_stock_futures_desk.py"]
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Live Trading (Active: 2 Lots, Rs 10k/Lot SL, Rs 15k/Lot Daily Max Loss):
-    command: ["--live", "--lots", "2", "--sl-per-lot", "10000", "--daily-max-loss", "15000"]
+    # 1. Live Production (2 Lots, Marketable Limit Orders with 5% Freak-Trade Protection, 1.5% Target, 1.0% SL, 1.5x Vol Filter, 13:00 Cutoff, 15:00 EOD):
+    command: ["--live", "--lots", "2", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--target-pct", "0.015", "--sl-pct", "0.010", "--vol-threshold", "1.5", "--entry-cutoff", "13:00", "--loop"]
     #
     # 2. Paper Trading Simulation:
-    # command: ["--paper", "--lots", "2", "--sl-per-lot", "10000", "--daily-max-loss", "15000"]
+    # command: ["--paper", "--lots", "2", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--target-pct", "0.015", "--sl-pct", "0.010", "--vol-threshold", "1.5", "--entry-cutoff", "13:00", "--loop"]
     # -----------------------------------------------------------------------------------

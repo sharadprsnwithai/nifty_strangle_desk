@@ -10,6 +10,7 @@ logs/*.log*
 .superpowers/
 data/*.json
 !data/positional_condor_state.json
+!data/momentum_30_universe.json
 data/*.parquet
 data/*.csv
 data/cache_15m/
