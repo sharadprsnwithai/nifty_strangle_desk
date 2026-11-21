@@ -76,11 +76,19 @@ def _validate_token(api_key: str, token: str) -> Optional[KiteConnect]:
         return None
 
 
-def get_kite_client(config: Optional[KiteConfig] = None, force_login: bool = False) -> KiteConnect:
+def get_kite_client(
+    config: Optional[KiteConfig] = None,
+    force_login: bool = False,
+    validate: Optional[bool] = None,
+    check_market_hours: bool = False,
+    ignore_holidays: bool = False,
+) -> KiteConnect:
     """
     Initializes and authenticates a KiteConnect client session.
-    1. Checks if a cached access_token exists and validates it using kite.profile().
-    2. If force_login=True or token is missing/expired, executes automated TOTP login.
+    1. If check_market_hours=True and market is closed, loads cached access_token
+       locally without making network API calls to kite.profile().
+    2. If market is active (or check_market_hours=False), validates token using kite.profile().
+    3. If force_login=True or token is missing/expired, executes automated TOTP login.
        Uses an inter-process lock and double-checked .env validation to prevent concurrent
        strategy processes from conflicting or invalidating each other's tokens.
     """
@@ -89,8 +97,22 @@ def get_kite_client(config: Optional[KiteConfig] = None, force_login: bool = Fal
 
     token = cfg.access_token
 
+    # Check if market is currently open or in pre-market window if check_market_hours is enabled
+    market_reason = "Market hours check disabled"
+    if check_market_hours:
+        from strategy.holidays import is_market_open, is_premarket_window
+        market_open, market_reason = is_market_open(ignore_holidays=ignore_holidays)
+        is_pre = is_premarket_window(ignore_holidays=ignore_holidays)
+        should_validate = validate if validate is not None else (market_open or is_pre or ignore_holidays)
+    else:
+        should_validate = validate if validate is not None else True
+
     if not force_login and token:
         kite.set_access_token(token)
+        if not should_validate:
+            logger.info("[KITE] Market is closed (%s). Loaded cached access token locally without API call.", market_reason)
+            return kite
+
         try:
             logger.info("Validating cached Kite access token...")
             profile = kite.profile()
@@ -100,6 +122,11 @@ def get_kite_client(config: Optional[KiteConfig] = None, force_login: bool = Fal
             logger.warning("Cached access token has expired or is invalid. Initiating fresh TOTP login...")
         except Exception as e:
             logger.warning("Validation failed (%s). Proceeding to re-authenticate...", e)
+
+    # If market is closed and no valid token, do not hit Kite auth when market is closed
+    if not should_validate and not force_login:
+        logger.info("[KITE] Market is closed (%s). Deferring TOTP login until market open / pre-market session.", market_reason)
+        return kite
 
     # Protect TOTP login with inter-process lock so multiple desks don't login concurrently
     with interprocess_auth_lock():
@@ -159,7 +186,12 @@ def is_token_error(e: Exception) -> bool:
     )
 
 
-def ensure_kite_session(kite: Optional[KiteConnect] = None, force_login: bool = False) -> KiteConnect:
+def ensure_kite_session(
+    kite: Optional[KiteConnect] = None,
+    force_login: bool = False,
+    check_market_hours: bool = False,
+    ignore_holidays: bool = False,
+) -> KiteConnect:
     """
     Validates active KiteConnect session by verifying connectivity with kite.profile().
     If expired, invalid, or force_login=True:
@@ -168,6 +200,14 @@ def ensure_kite_session(kite: Optional[KiteConnect] = None, force_login: bool = 
     2. If .env token is also expired/missing, acquires an inter-process lock and performs
        automated TOTP login, safely updating .env and returning the shared authenticated session.
     """
+    if check_market_hours and not force_login:
+        from strategy.holidays import is_market_open, is_premarket_window
+        market_open, market_reason = is_market_open(ignore_holidays=ignore_holidays)
+        is_pre = is_premarket_window(ignore_holidays=ignore_holidays)
+        if not (market_open or is_pre or ignore_holidays):
+            logger.info("[KITE] Market is closed (%s). Skipping session profile check.", market_reason)
+            return kite
+
     if kite is not None and not force_login:
         try:
             kite.profile()

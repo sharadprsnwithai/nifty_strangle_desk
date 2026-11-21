@@ -156,31 +156,43 @@ class UniverseRehydrator:
 
     DEFAULT_UNIVERSE_FILE = Path("data/momentum_30_universe.json")
 
-    def __init__(self, kite: Optional[KiteConnect] = None, universe_file: Optional[Path] = None):
+    def __init__(
+        self,
+        kite: Optional[KiteConnect] = None,
+        universe_file: Optional[Path] = None,
+        ignore_holidays: bool = False,
+    ):
         self.kite = kite
         self.universe_file = universe_file or self.DEFAULT_UNIVERSE_FILE
+        self.ignore_holidays = ignore_holidays
 
     def fetch_live_fno_lot_sizes(self, symbols: List[str]) -> Dict[str, int]:
         """
         Queries Kite Connect NFO instrument master to resolve exact, live lot sizes.
-        Falls back to known default lot sizes if Kite is unavailable.
+        Falls back to known default lot sizes if Kite is unavailable or market is closed.
         """
         lot_sizes: Dict[str, int] = {}
         if self.kite:
-            try:
-                logger.info("Fetching real-time F&O lot sizes from Kite Connect...")
-                instruments = self.kite.instruments("NFO")
-                now = datetime.now()
-                for inst in instruments:
-                    name = inst.get("name")
-                    if name in symbols and inst.get("instrument_type") == "FUT":
-                        exp = inst.get("expiry")
-                        if exp and exp >= now.date():
-                            if name not in lot_sizes:
-                                lot_sizes[name] = int(inst.get("lot_size", 0))
-                logger.info("Successfully fetched live lot sizes for %d symbols from Kite.", len(lot_sizes))
-            except Exception as e:
-                logger.warning("Failed to query Kite instruments for lot sizes: %s. Using cached lot sizes.", e)
+            from strategy.holidays import is_market_open, is_premarket_window
+            market_open, market_reason = is_market_open(ignore_holidays=self.ignore_holidays)
+            is_pre = is_premarket_window(ignore_holidays=self.ignore_holidays)
+            if not (market_open or is_pre or self.ignore_holidays):
+                logger.info("[REHYDRATOR] Market is closed (%s). Skipping live Kite instruments fetch; using cached lot sizes.", market_reason)
+            else:
+                try:
+                    logger.info("Fetching real-time F&O lot sizes from Kite Connect...")
+                    instruments = self.kite.instruments("NFO")
+                    now = datetime.now()
+                    for inst in instruments:
+                        name = inst.get("name")
+                        if name in symbols and inst.get("instrument_type") == "FUT":
+                            exp = inst.get("expiry")
+                            if exp and exp >= now.date():
+                                if name not in lot_sizes:
+                                    lot_sizes[name] = int(inst.get("lot_size", 0))
+                    logger.info("Successfully fetched live lot sizes for %d symbols from Kite.", len(lot_sizes))
+                except Exception as e:
+                    logger.warning("Failed to query Kite instruments for lot sizes: %s. Using cached lot sizes.", e)
 
         # Fallback to default lot sizes for any missing
         for sym in symbols:

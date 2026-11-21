@@ -102,3 +102,49 @@ def is_mcx_trading_holiday(check_date: Optional[date] = None, session: str = "EV
         return True, f"MCX Morning Holiday: {NSE_HOLIDAYS_2026[check_date]}"
 
     return False, None
+
+
+def is_market_open(
+    now: Optional[datetime] = None,
+    market_open_time: str = "09:15",
+    market_close_time: str = "15:30",
+    ignore_holidays: bool = False,
+) -> Tuple[bool, str]:
+    """
+    Checks if NSE Equity / F&O market is currently open for trading.
+    Returns: (is_open: bool, reason: str)
+    """
+    if now is None:
+        now = datetime.now()
+
+    if not ignore_holidays:
+        is_holiday, reason = is_trading_holiday(now.date())
+        if is_holiday:
+            return False, f"Market closed today ({reason})"
+
+    time_str = now.strftime("%H:%M")
+    if time_str < market_open_time:
+        return False, f"Pre-market (Current: {time_str} IST, opens at {market_open_time} IST)"
+    if time_str >= market_close_time:
+        return False, f"Post-market (Current: {time_str} IST, closed at {market_close_time} IST)"
+
+    return True, "Market OPEN"
+
+
+def is_premarket_window(
+    now: Optional[datetime] = None,
+    premarket_start: str = "08:00",
+    market_open_time: str = "09:15",
+    ignore_holidays: bool = False,
+) -> bool:
+    """
+    Returns True if today is a trading day and time is in pre-market preparation window (08:00 to 09:15 IST).
+    """
+    if now is None:
+        now = datetime.now()
+    if not ignore_holidays:
+        is_holiday, _ = is_trading_holiday(now.date())
+        if is_holiday:
+            return False
+    time_str = now.strftime("%H:%M")
+    return premarket_start <= time_str < market_open_time

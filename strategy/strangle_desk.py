@@ -278,7 +278,13 @@ class StrangleDesk:
         )
         return res.get(order_id, {})
 
-    def _ensure_kite_session(self, kite: Optional[Any] = None, force_login: bool = False) -> Any:
+    def _ensure_kite_session(
+        self,
+        kite: Optional[Any] = None,
+        force_login: bool = False,
+        check_market_hours: bool = False,
+        ignore_holidays: bool = False,
+    ) -> Any:
         """
         Validates that the provided KiteConnect client has a live, valid session.
         If the access token has expired or is invalidated, triggers automated TOTP re-authentication.
@@ -288,7 +294,12 @@ class StrangleDesk:
 
         from kite.client import ensure_kite_session
         try:
-            active_kite = ensure_kite_session(kite, force_login=force_login)
+            active_kite = ensure_kite_session(
+                kite,
+                force_login=force_login,
+                check_market_hours=check_market_hours,
+                ignore_holidays=ignore_holidays,
+            )
             if active_kite and hasattr(self, "order_manager") and self.order_manager is not None:
                 self.order_manager.kite = active_kite
             return active_kite or kite
@@ -1443,7 +1454,7 @@ class StrangleDesk:
                         should_reconcile = False
 
                 if should_reconcile:
-                    kite = self._ensure_kite_session(kite)
+                    kite = self._ensure_kite_session(kite, check_market_hours=True, ignore_holidays=ignore_holidays)
                     state = self.reconcile_with_broker(kite, state, underlying=underlying)
                     last_idle_reconcile_time = time.time()
                     if state is not None and state.get("date") == today_str and state.get("status") == "OPEN":
@@ -1458,7 +1469,7 @@ class StrangleDesk:
             if dt_time(entry_h, entry_m) <= current_t <= dt_time(entry_h, entry_m + 5):
                 logger.info("Triggering 10:00 AM Strangle entry for %s...", today_str)
                 try:
-                    kite = self._ensure_kite_session(kite)
+                    kite = self._ensure_kite_session(kite, check_market_hours=True, ignore_holidays=ignore_holidays)
                     session_res = self.run_session(
                         underlying=underlying,
                         lots=lots,

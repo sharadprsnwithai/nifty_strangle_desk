@@ -126,3 +126,40 @@ def test_ensure_kite_session_reuses_env_token_from_peer_strategy():
         old_kite.set_access_token.assert_called_with("new_valid_token_from_other_strategy")
         mock_get_client.assert_not_called()
 
+
+def test_get_kite_client_market_closed_skips_api_validation(mock_config):
+    with patch("kite.client.KiteConnect") as MockKite, \
+         patch("strategy.holidays.is_market_open", return_value=(False, "Market closed today (Weekend)")), \
+         patch("strategy.holidays.is_premarket_window", return_value=False):
+        mock_instance = MagicMock()
+        MockKite.return_value = mock_instance
+
+        client = get_kite_client(config=mock_config, check_market_hours=True)
+        assert client == mock_instance
+        mock_instance.set_access_token.assert_called_with("valid_cached_token")
+        mock_instance.profile.assert_not_called()
+
+
+def test_get_kite_client_market_open_validates_profile(mock_config):
+    with patch("kite.client.KiteConnect") as MockKite, \
+         patch("strategy.holidays.is_market_open", return_value=(True, "Market OPEN")), \
+         patch("strategy.holidays.is_premarket_window", return_value=False):
+        mock_instance = MagicMock()
+        mock_instance.profile.return_value = {"user_id": "mock_user"}
+        MockKite.return_value = mock_instance
+
+        client = get_kite_client(config=mock_config, check_market_hours=True)
+        assert client == mock_instance
+        mock_instance.profile.assert_called_once()
+
+
+def test_ensure_kite_session_market_closed_skips_profile():
+    from kite.client import ensure_kite_session
+    mock_kite = MagicMock()
+    with patch("strategy.holidays.is_market_open", return_value=(False, "Market closed")), \
+         patch("strategy.holidays.is_premarket_window", return_value=False):
+        res = ensure_kite_session(kite=mock_kite, force_login=False, check_market_hours=True)
+        assert res == mock_kite
+        mock_kite.profile.assert_not_called()
+
+

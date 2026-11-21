@@ -68,7 +68,13 @@ def run_strategy_cli(args=None) -> int:
 
     logger.info("Initializing 10:00 AM NIFTY Short Strangle Desk in [%s] mode...", mode)
     config = load_config()
-    kite = get_kite_client(config=config)
+    kite = get_kite_client(
+        config=config,
+        force_login=parsed.morning_login,
+        validate=True if parsed.morning_login else None,
+        check_market_hours=True,
+        ignore_holidays=parsed.ignore_holidays
+    )
 
     notifier = TelegramNotifier(bot_token=config.telegram_bot_token, chat_id=config.telegram_chat_id)
     om = OrderManager(mode=mode, kite=kite if mode == "LIVE" else None, product=parsed.product)

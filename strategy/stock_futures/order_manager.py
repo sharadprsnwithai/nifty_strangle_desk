@@ -52,6 +52,12 @@ class StockFuturesOrderManager:
             return self._futures_symbol_cache[symbol]
 
         if self.mode == "LIVE" and self.kite:
+            from strategy.holidays import is_market_open
+            if not is_market_open()[0]:
+                fallback = f"{symbol}_FUT"
+                self._futures_symbol_cache[symbol] = fallback
+                return fallback
+
             try:
                 # Query NFO instruments
                 instruments = self.kite.instruments("NFO")

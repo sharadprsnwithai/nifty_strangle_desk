@@ -25,12 +25,14 @@ class StockFuturesDesk:
         config: Optional[StockFuturesConfig] = None,
         notifier: Optional[TelegramNotifier] = None,
         kite: Optional[KiteConnect] = None,
+        ignore_holidays: bool = False,
     ):
         self.config = config or StockFuturesConfig()
         self.order_manager = order_manager
         self.engine = engine or StockFuturesEngine(self.config)
         self.notifier = notifier
         self.kite = kite
+        self.ignore_holidays = ignore_holidays
         self._instrument_token_cache: Dict[str, int] = {}
         self._last_universe_mtime: float = 0.0
         self._last_daily_rehydrate_date: Optional[str] = None
@@ -60,7 +62,7 @@ class StockFuturesDesk:
 
         logger.info("[SCHEDULED] Running daily pre-market universe rehydration check...")
         try:
-            rehydrator = UniverseRehydrator(kite=self.kite, universe_file=self.config.universe_file)
+            rehydrator = UniverseRehydrator(kite=self.kite, universe_file=self.config.universe_file, ignore_holidays=ignore_holidays)
             result = rehydrator.auto_rehydrate(save=True)
             reloaded = self.check_and_rehydrate_universe()
 
@@ -127,12 +129,30 @@ class StockFuturesDesk:
             logger.warning("Error checking universe rehydration: %s", e)
             return False
 
+    def ensure_kite(self) -> Optional[KiteConnect]:
+        """Ensures an active, authenticated KiteConnect session when market is active."""
+        if self.kite is not None:
+            return self.kite
+        if self.order_manager.mode != "LIVE":
+            return None
+
+        from kite.client import get_kite_client
+        logger.info("[KITE] Connecting to Kite Connect as market is active...")
+        self.kite = get_kite_client(validate=True, check_market_hours=True, ignore_holidays=self.ignore_holidays)
+        self.order_manager.kite = self.kite
+        return self.kite
+
     def get_equity_token(self, symbol: str) -> Optional[int]:
         """Looks up Kite instrument token for NSE cash underlying to fetch intraday 15m candles."""
         if symbol in self._instrument_token_cache:
             return self._instrument_token_cache[symbol]
 
         if not self.kite:
+            return None
+
+        # Guard: Never query instruments if market is closed
+        from strategy.holidays import is_market_open
+        if not is_market_open(ignore_holidays=self.ignore_holidays)[0]:
             return None
 
         try:
@@ -152,6 +172,12 @@ class StockFuturesDesk:
         """Fetches today's 15-minute candles for the symbol from Kite Connect."""
         if not self.kite:
             return None
+
+        # Guard: Never query historical candle API if market is closed
+        from strategy.holidays import is_market_open
+        if not is_market_open(ignore_holidays=self.ignore_holidays)[0]:
+            return None
+
         token = self.get_equity_token(symbol)
         if not token:
             return None
@@ -178,6 +204,12 @@ class StockFuturesDesk:
         """Fetches current LTP for underlying or future."""
         if not self.kite:
             return None
+
+        # Guard: Never query quote API if market is closed
+        from strategy.holidays import is_market_open
+        if not is_market_open(ignore_holidays=self.ignore_holidays)[0]:
+            return None
+
         try:
             nse_symbol = "GVT&D" if symbol == "GVT_D" else symbol
             quote_key = f"NSE:{nse_symbol}"
@@ -310,6 +342,7 @@ class StockFuturesDesk:
         max_iterations: Optional[int] = None,
     ) -> None:
         """Runs automated polling loop continuously during market hours."""
+        self.ignore_holidays = ignore_holidays
         logger.info(
             "Starting Stock Futures Desk daemon scheduler (Poll: %ds, Entry: %s IST, Cutoff: %s IST, Square-off: %s IST)...",
             poll_seconds, self.config.entry_start_time, self.config.entry_cutoff_time, self.config.squareoff_time
@@ -382,7 +415,33 @@ class StockFuturesDesk:
                         time.sleep(15)
                     continue
 
-                # 5. After square-off time (15:00 - 23:59 IST)
+                # 5. Market Closed / Post-Market (> 15:30 IST)
+                if now_time >= "15:30":
+                    if self._last_eod_summary_date != today_str:
+                        self._last_eod_summary_date = today_str
+                        today_trades = [t for t in self.order_manager.trades_history if t.get("date") == today_str]
+                        total_pnl = sum(t.get("net_pnl", 0.0) for t in today_trades)
+                        total_charges = sum(t.get("charges", 0.0) for t in today_trades)
+                        wins = sum(1 for t in today_trades if t.get("net_pnl", 0.0) > 0)
+                        losses = sum(1 for t in today_trades if t.get("net_pnl", 0.0) < 0)
+                        logger.info(
+                            "[SCHEDULER] Market closed for the day (%s IST). Total Trades Today: %d | Realized Net PnL: Rs %.2f. Waiting for next session.",
+                            now_time, len(today_trades), total_pnl
+                        )
+                        if self.notifier:
+                            summary_pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+                            self.notifier.send_message(
+                                f"🏁 <b>STOCK FUTURES EOD SUMMARY</b>\n"
+                                f"Date: <code>{today_str}</code>\n"
+                                f"Trades: <b>{len(today_trades)}</b> (Wins: {wins}, Losses: {losses})\n"
+                                f"Total Charges: Rs {total_charges:,.2f}\n"
+                                f"{summary_pnl_emoji} <b>Net Realized P&L: Rs {total_pnl:+,.2f}</b>"
+                            )
+
+                    time.sleep(60)
+                    continue
+
+                # 6. EOD Square-off Window (15:00 - 15:30 IST)
                 if now_time >= self.config.squareoff_time:
                     # Final check to square off any open positions
                     self.monitor_open_positions()
@@ -396,7 +455,7 @@ class StockFuturesDesk:
                         wins = sum(1 for t in today_trades if t.get("net_pnl", 0.0) > 0)
                         losses = sum(1 for t in today_trades if t.get("net_pnl", 0.0) < 0)
                         logger.info(
-                            "[SCHEDULER] Trading day ended (%s IST). Total Trades Today: %d | Realized Net PnL: Rs %.2f. Waiting for next session.",
+                            "[SCHEDULER] Square-off complete (%s IST). Total Trades Today: %d | Realized Net PnL: Rs %.2f.",
                             now_time, len(today_trades), total_pnl
                         )
                         if self.notifier:

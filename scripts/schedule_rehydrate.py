@@ -79,7 +79,7 @@ def main():
     notifier = None
     try:
         cfg = load_config()
-        kite = get_kite_client(config=cfg)
+        kite = get_kite_client(config=cfg, check_market_hours=True)
         if cfg.telegram_bot_token and cfg.telegram_chat_id:
             notifier = TelegramNotifier(bot_token=cfg.telegram_bot_token, chat_id=cfg.telegram_chat_id)
     except Exception as e:
@@ -102,9 +102,13 @@ def main():
             now_time = now.strftime("%H:%M")
             weekday = now.weekday()  # 0=Monday, 4=Friday, 5=Saturday, 6=Sunday
 
-            # Check if weekday (Mon-Fri) and matches scheduled time
-            if weekday < 5 and now_time == args.schedule_time and last_run_date != today_str:
+            # Check if weekday (Mon-Fri), not a holiday, and matches scheduled time
+            from strategy.holidays import is_trading_holiday
+            is_holiday, reason = is_trading_holiday(now.date())
+
+            if not is_holiday and weekday < 5 and now_time == args.schedule_time and last_run_date != today_str:
                 last_run_date = today_str
+                kite = get_kite_client(config=cfg, check_market_hours=True)
                 run_rehydration(universe_file=universe_path, kite=kite, notifier=notifier)
 
             time.sleep(20)

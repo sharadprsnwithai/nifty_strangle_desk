@@ -78,7 +78,7 @@ def main():
     try:
         app_config = load_config()
         if args.live:
-            kite = get_kite_client(config=app_config)
+            kite = get_kite_client(config=app_config, check_market_hours=True, ignore_holidays=args.ignore_holidays)
         if app_config.telegram_bot_token and app_config.telegram_chat_id:
             notifier = TelegramNotifier(bot_token=app_config.telegram_bot_token, chat_id=app_config.telegram_chat_id)
     except Exception as e:
@@ -123,6 +123,7 @@ def main():
         config=strategy_config,
         notifier=notifier,
         kite=kite,
+        ignore_holidays=args.ignore_holidays,
     )
 
     if args.once:
