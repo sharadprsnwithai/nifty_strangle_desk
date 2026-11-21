@@ -83,6 +83,12 @@ def main():
     except Exception as e:
         if args.live:
             logger.error("Failed to initialize Kite client for LIVE mode: %s", e)
+            if notifier:
+                try:
+                    import html
+                    notifier.send_message(f"🚨 <b>Stock Futures Desk Startup Failed</b>: Could not initialize Kite client: {html.escape(str(e))}")
+                except Exception:
+                    pass
             sys.exit(1)
         else:
             logger.info("Paper mode running without live Kite credentials.")

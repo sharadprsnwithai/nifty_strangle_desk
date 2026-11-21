@@ -1,3 +1,4 @@
+import html
 import logging
 import time
 from datetime import datetime, date
@@ -33,6 +34,7 @@ class StockFuturesDesk:
         self._instrument_token_cache: Dict[str, int] = {}
         self._last_universe_mtime: float = 0.0
         self._last_daily_rehydrate_date: Optional[str] = None
+        self._last_eod_summary_date: Optional[str] = None
         if self.config.universe_file and self.config.universe_file.exists():
             try:
                 self._last_universe_mtime = self.config.universe_file.stat().st_mtime
@@ -61,10 +63,10 @@ class StockFuturesDesk:
             if not changes.get("is_changed") and self.notifier:
                 # Send daily pre-market ready confirmation
                 msg = (
-                    "🌅 *STOCK FUTURES PRE-MARKET READY*\n"
-                    f"Date: `{today}`\n"
-                    f"Active Equities: {len(self.config.symbols)} Momentum Stocks\n"
-                    f"Lot Sizing: 2 Lots Verified (Kite Connect Live)\n"
+                    "🌅 <b>STOCK FUTURES PRE-MARKET READY</b>\n"
+                    f"Date: <code>{today}</code>\n"
+                    f"Active Equities: <b>{len(self.config.symbols)} Momentum Stocks</b>\n"
+                    f"Lot Sizing: <b>{self.config.lots_per_trade} Lots Verified</b> (Kite Connect Live)\n"
                     f"Status: Primed & Ready for 09:15 AM Open 🚀"
                 )
                 self.notifier.send_message(msg)
@@ -107,11 +109,11 @@ class StockFuturesDesk:
 
             if self.notifier and (added or removed):
                 msg = (
-                    "🔄 *MOMENTUM 30 UNIVERSE REHYDRATED*\n"
-                    f"Active Equities: {len(self.config.symbols)}\n"
-                    f"Added: {', '.join(added) if added else 'None'}\n"
-                    f"Removed: {', '.join(removed) if removed else 'None'}\n"
-                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    "🔄 <b>MOMENTUM 30 UNIVERSE REHYDRATED</b>\n"
+                    f"Active Equities: <b>{len(self.config.symbols)}</b>\n"
+                    f"Added: <code>{', '.join(added) if added else 'None'}</code>\n"
+                    f"Removed: <code>{', '.join(removed) if removed else 'None'}</code>\n"
+                    f"Time: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
                 )
                 self.notifier.send_message(msg)
 
@@ -215,15 +217,23 @@ class StockFuturesDesk:
                     new_positions.append(pos)
                     if self.notifier:
                         msg = (
-                            f"🚀 *STOCK FUTURES ENTRY*\n"
-                            f"Symbol: `{symbol}` ({pos.side})\n"
-                            f"Qty: {pos.quantity} ({pos.lots} Lots)\n"
+                            f"🚀 <b>STOCK FUTURES ENTRY</b>\n"
+                            f"Symbol: <code>{symbol}</code> ({pos.side})\n"
+                            f"Qty: <b>{pos.quantity}</b> ({pos.lots} Lots)\n"
                             f"Entry Price: Rs {pos.entry_price:.2f}\n"
                             f"Stop Loss: Rs {pos.sl_price:.2f} (-{self.config.sl_pct*100:.1f}%)\n"
                             f"Target: Rs {pos.target_price:.2f} (+{self.config.target_pct*100:.1f}%)\n"
-                            f"Time: {signal.trigger_time}"
+                            f"Trigger Time: <code>{signal.trigger_time}</code>"
                         )
                         self.notifier.send_message(msg)
+                else:
+                    logger.error("[ENTRY FAILED] Failed to enter position for %s upon %s breakout", symbol, signal.side)
+                    if self.notifier:
+                        self.notifier.send_message(
+                            f"⚠️ <b>STOCK FUTURES ENTRY FAILED</b>\n"
+                            f"Failed to enter <code>{symbol}</code> ({signal.side}) @ Rs {signal.entry_price:.2f}!\n"
+                            f"Check Kite Connect margin/broker connection."
+                        )
 
         return new_positions
 
@@ -259,14 +269,26 @@ class StockFuturesDesk:
                     if self.notifier:
                         pnl_emoji = "🟢" if closed_pos.net_pnl > 0 else "🔴"
                         msg = (
-                            f"{pnl_emoji} *STOCK FUTURES EXIT*\n"
-                            f"Symbol: `{symbol}` ({closed_pos.side})\n"
+                            f"{pnl_emoji} <b>STOCK FUTURES EXIT</b>\n"
+                            f"Symbol: <code>{symbol}</code> ({closed_pos.side})\n"
                             f"Exit Price: Rs {closed_pos.exit_price:.2f}\n"
-                            f"Reason: `{reason}`\n"
-                            f"Net PnL: Rs {closed_pos.net_pnl:,.2f}\n"
-                            f"Time: {now_time}"
+                            f"Reason: <code>{reason}</code>\n"
+                            f"Net PnL: Rs {closed_pos.net_pnl:+,.2f}\n"
+                            f"Time: <code>{now_time}</code>"
                         )
                         self.notifier.send_message(msg)
+                else:
+                    logger.critical(
+                        "[EXIT FAILED] Broker order failed for %s (%s @ Rs %.2f). Position remains OPEN to retry.",
+                        symbol, reason, exit_price
+                    )
+                    if self.notifier:
+                        self.notifier.send_message(
+                            f"🚨 <b>CRITICAL: EXIT ORDER FAILED</b>\n"
+                            f"Failed to submit exit order to broker for <code>{symbol}</code> ({pos.side}) @ Rs {exit_price:.2f}!\n"
+                            f"Reason: <code>{html.escape(reason)}</code>\n"
+                            f"Position remains <b>OPEN</b>. Automatic retry scheduled on next cycle. Please verify Kite terminal!"
+                        )
 
         return closed_positions
 
@@ -308,6 +330,26 @@ class StockFuturesDesk:
                 if now_time >= self.config.squareoff_time:
                     # Final check to square off any open positions
                     self.monitor_open_positions()
+
+                    # Send daily EOD summary alert once after market close
+                    if self._last_eod_summary_date != today_str:
+                        self._last_eod_summary_date = today_str
+                        today_trades = [t for t in self.order_manager.trades_history if t.get("date") == today_str]
+                        total_pnl = sum(t.get("net_pnl", 0.0) for t in today_trades)
+                        total_charges = sum(t.get("charges", 0.0) for t in today_trades)
+                        wins = sum(1 for t in today_trades if t.get("net_pnl", 0.0) > 0)
+                        losses = sum(1 for t in today_trades if t.get("net_pnl", 0.0) < 0)
+                        logger.info("Day complete. Trades today: %d, Net PnL: Rs %.2f", len(today_trades), total_pnl)
+                        if self.notifier:
+                            summary_pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+                            self.notifier.send_message(
+                                f"🏁 <b>STOCK FUTURES EOD SUMMARY</b>\n"
+                                f"Date: <code>{today_str}</code>\n"
+                                f"Trades: <b>{len(today_trades)}</b> (Wins: {wins}, Losses: {losses})\n"
+                                f"Total Charges: Rs {total_charges:,.2f}\n"
+                                f"{summary_pnl_emoji} <b>Net Realized P&L: Rs {total_pnl:+,.2f}</b>"
+                            )
+
                     logger.info("Past square-off time (%s). Day complete.", now_time)
                     time.sleep(60)
                     continue
@@ -319,4 +361,12 @@ class StockFuturesDesk:
                 break
             except Exception as e:
                 logger.exception("Error in Stock Futures Desk monitoring loop: %s", e)
+                if self.notifier:
+                    try:
+                        self.notifier.send_message(
+                            f"⚠️ <b>Stock Futures Desk Loop Error</b>: {html.escape(str(e))}\n"
+                            f"Desk loop is attempting automatic recovery. Check container logs."
+                        )
+                    except Exception:
+                        pass
                 time.sleep(10)

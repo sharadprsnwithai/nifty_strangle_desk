@@ -121,6 +121,14 @@ def run_strategy_cli(args=None) -> int:
             return 0
     except Exception as e:
         logger.error("Strategy session failed: %s", e, exc_info=True)
+        if 'notifier' in locals() and notifier:
+            try:
+                import html
+                notifier.send_message(
+                    f"🚨 <b>STRANGLE DESK FATAL ERROR</b>: {html.escape(str(e))}\nCheck container logs for full traceback."
+                )
+            except Exception:
+                pass
         return 1
 
 

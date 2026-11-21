@@ -199,6 +199,7 @@ class StockFuturesOrderManager:
                 logger.info("[LIVE] Placed exit order ID: %s", exit_order_id)
             except Exception as e:
                 logger.exception("[LIVE] Failed to place EXIT order for %s: %s", pos.tradingsymbol, e)
+                return None
 
         pos.close(exit_price=exit_price, exit_time=time_str, exit_reason=exit_reason, exit_order_id=exit_order_id)
 
