@@ -116,3 +116,37 @@ services:
     entrypoint: ["python", "scripts/run_max_oi_scanner.py"]
     command: ["--loop"]
 
+  techno-funda-scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: techno_funda_scanner
+    image: ${DOCKER_USER:-sharadprsn}/techno_funda_scanner:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Kolkata
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-5}
+      - TECHNO_FUNDA_SCAN_TIME=${TECHNO_FUNDA_SCAN_TIME:-15:15}
+      - TECHNO_FUNDA_MONTHLY_RSI=${TECHNO_FUNDA_MONTHLY_RSI:-60.0}
+      - TECHNO_FUNDA_WEEKLY_RSI=${TECHNO_FUNDA_WEEKLY_RSI:-60.0}
+      - TECHNO_FUNDA_DAILY_RSI=${TECHNO_FUNDA_DAILY_RSI:-65.0}
+      - TECHNO_FUNDA_MIN_GROWTH=${TECHNO_FUNDA_MIN_GROWTH:-0.30}
+      - TECHNO_FUNDA_MAX_DE=${TECHNO_FUNDA_MAX_DE:-1.0}
+      - TECHNO_FUNDA_POLL=${TECHNO_FUNDA_POLL:-30}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    entrypoint: ["python", "scripts/run_techno_funda_scanner.py"]
+    command: ["--loop"]
+
+
