@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import time
 
+
 @dataclass
 class SilverConfig:
     symbol: str = "SILVERM"
@@ -11,11 +12,13 @@ class SilverConfig:
     market_open: time = time(9, 0)
     market_close: time = time(23, 30)
     devolvement_cutoff: time = time(15, 30)
-    max_debit_width_ratio: float = 0.35
-    take_profit_ratio: float = 0.75
-    stop_loss_ratio: float = 0.50
-    daily_rsi_period: int = 14
-    daily_rsi_oversold: float = 25.0
-    daily_rsi_overbought: float = 75.0
-    hourly_ema_period: int = 20
+    williams_r_period: int = 70
+    ema_fast: int = 5
+    ema_mid: int = 15
+    ema_slow: int = 50
+    target_delta: float = 0.35
+    sl_multiplier: float = 1.5
+    session_start: time = time(9, 15)
+    session_end: time = time(18, 0)
+    eod_cutoff: time = time(23, 15)
     slippage_buffer_ticks: int = 2
