@@ -1,11 +1,14 @@
-"""Multi-Timeframe Technical Signal Engine for MCX Silver Options Desk.
+"""Intraday Technical Signal Engine for MCX Silver Options Desk.
 
 Implements:
-- 14-period Wilder's / Exponential RSI calculation with boundary-safe zero-loss handling.
-- Daily RSI Bullish/Bearish Divergence detection (e.g. daily RSI < 25 or > 70) with 5-20 bar lookback.
-- Hourly 20 EMA confirmation for trend alignment / timing.
-- End-to-end multi-timeframe signal evaluation.
+- 70-period Williams %R calculation with boundary-safe flat-line handling.
+- Triple Exponential Moving Average (5, 15, 50 EMA) trend filtering.
+- Intraday breakout/breakdown momentum signal evaluation.
+- Active short option position trend reversal detection (5 EMA / 50 EMA crossover with candle confirmation).
 """
+
+from datetime import time
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -22,6 +25,9 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     - If avg_loss == 0 and avg_gain == 0: RSI = 50.0
     - If avg_gain == 0 and avg_loss > 0: RSI = 0.0
     """
+    if series.empty:
+        return pd.Series(dtype=float)
+
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0).copy()
     loss = (-delta.where(delta < 0, 0.0)).copy()
@@ -41,94 +47,140 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi.fillna(50.0)
 
 
-def detect_rsi_divergence(daily_df: pd.DataFrame, config: SilverConfig) -> SignalType:
-    """Detect Bullish or Bearish RSI Divergence on Daily candles over trailing 5-20 bars.
+def compute_williams_r(df: pd.DataFrame, period: int = 70) -> pd.Series:
+    """Calculate Williams %R over the specified lookback period.
 
-    Bullish Reversal Divergence:
-    - Prior lowest price in window had RSI <= daily_rsi_oversold.
-    - Current price forms a lower low (close < prior min close).
-    - Current RSI forms a higher low (RSI > prior min RSI).
+    Formula:
+        ((highest_high - close) / (highest_high - lowest_low)) * -100.0
 
-    Bearish Breakdown Divergence:
-    - Prior highest price in window had RSI >= daily_rsi_overbought.
-    - Current price forms a higher high (close > prior max close).
-    - Current RSI forms a lower high (RSI < prior max RSI).
+    Values range from 0.0 (maximum overbought) to -100.0 (maximum oversold).
+    Handles flat lines (highest_high == lowest_low) or NaN by falling back to -50.0.
     """
-    if len(daily_df) < 5:
-        return SignalType.NO_SIGNAL
+    if df.empty or not {"high", "low", "close"}.issubset(df.columns):
+        return pd.Series(dtype=float)
 
-    if "rsi" not in daily_df.columns:
-        daily_df = daily_df.copy()
-        daily_df["rsi"] = compute_rsi(daily_df["close"], period=config.daily_rsi_period)
+    highest_high = df["high"].rolling(window=period, min_periods=1).max()
+    lowest_low = df["low"].rolling(window=period, min_periods=1).min()
+    denom = highest_high - lowest_low
 
-    recent = daily_df.tail(20)
-    current_close = float(recent["close"].iloc[-1])
-    current_rsi = float(recent["rsi"].iloc[-1])
-
-    prior_window = recent.iloc[:-1]
-
-    # Check for Bullish Divergence in oversold territory
-    prior_min_pos = int(np.argmin(prior_window["close"].values))
-    prior_min_close = float(prior_window["close"].iloc[prior_min_pos])
-    prior_min_rsi = float(prior_window["rsi"].iloc[prior_min_pos])
-
-    if prior_min_rsi <= config.daily_rsi_oversold:
-        if current_close < prior_min_close and current_rsi > prior_min_rsi:
-            return SignalType.BULLISH_REVERSAL
-
-    # Check for Bearish Divergence in overbought territory
-    prior_max_pos = int(np.argmax(prior_window["close"].values))
-    prior_max_close = float(prior_window["close"].iloc[prior_max_pos])
-    prior_max_rsi = float(prior_window["rsi"].iloc[prior_max_pos])
-
-    if prior_max_rsi >= config.daily_rsi_overbought:
-        if current_close > prior_max_close and current_rsi < prior_max_rsi:
-            return SignalType.BEARISH_BREAKDOWN
-
-    return SignalType.NO_SIGNAL
+    wr = ((highest_high - df["close"]) / denom.replace(0, np.nan)) * -100.0
+    return wr.fillna(-50.0)
 
 
-def verify_hourly_confirmation(
-    hourly_df: pd.DataFrame, daily_signal: SignalType, config: SilverConfig
-) -> bool:
-    """Verify whether hourly timeframe confirms the daily divergence signal.
-
-    For BULLISH_REVERSAL:
-    - Hourly close must be above 20 EMA, and either crossing above or expanding upward.
-
-    For BEARISH_BREAKDOWN:
-    - Hourly close must be below 20 EMA, and either crossing below or expanding downward.
-
-    Returns False for NO_SIGNAL or invalid data.
-    """
-    if len(hourly_df) < 2 or daily_signal == SignalType.NO_SIGNAL:
-        return False
-
-    df = hourly_df.copy()
-    if "ema_20" not in df.columns:
-        df["ema_20"] = df["close"].ewm(span=config.hourly_ema_period, adjust=False).mean()
-
-    curr_close = float(df["close"].iloc[-1])
-    curr_ema = float(df["ema_20"].iloc[-1])
-    prev_close = float(df["close"].iloc[-2])
-    prev_ema = float(df["ema_20"].iloc[-2])
-
-    if daily_signal == SignalType.BULLISH_REVERSAL:
-        return bool(curr_close > curr_ema and (prev_close <= prev_ema or curr_close > prev_close))
-
-    if daily_signal == SignalType.BEARISH_BREAKDOWN:
-        return bool(curr_close < curr_ema and (prev_close >= prev_ema or curr_close < prev_close))
-
-    return False
+def compute_ema(series: pd.Series, span: int) -> pd.Series:
+    """Compute standard exponential moving average (EMA)."""
+    if series.empty:
+        return pd.Series(dtype=float)
+    return series.ewm(span=span, adjust=False).mean()
 
 
 def evaluate_technical_signal(
-    daily_df: pd.DataFrame, hourly_df: pd.DataFrame, config: SilverConfig
+    df_5m: pd.DataFrame,
+    config: Optional[SilverConfig] = None,
+    current_time: Optional[time] = None,
 ) -> SignalType:
-    """Evaluate multi-timeframe technical signals across daily and hourly data."""
-    daily_signal = detect_rsi_divergence(daily_df, config)
-    if daily_signal in (SignalType.BULLISH_REVERSAL, SignalType.BEARISH_BREAKDOWN):
-        if verify_hourly_confirmation(hourly_df, daily_signal, config):
-            return daily_signal
+    """Evaluate 5-minute technical momentum signal.
+
+    Conditions:
+    - Minimum bars: len(df_5m) >= config.williams_r_period (default 70).
+    - Session window: config.session_start <= current_time <= config.session_end (if provided).
+    - Bullish Momentum:
+        Williams %R(70) > -20.0 AND 5 EMA > 15 EMA > 50 EMA AND current High > previous High.
+    - Bearish Momentum:
+        Williams %R(70) < -80.0 AND 5 EMA < 15 EMA < 50 EMA AND current Low < previous Low.
+    - Otherwise: NO_SIGNAL.
+    """
+    if config is None:
+        config = SilverConfig()
+
+    if df_5m is None or len(df_5m) < config.williams_r_period:
         return SignalType.NO_SIGNAL
+
+    if current_time is not None:
+        if not (config.session_start <= current_time <= config.session_end):
+            return SignalType.NO_SIGNAL
+
+    if not {"high", "low", "close"}.issubset(df_5m.columns):
+        return SignalType.NO_SIGNAL
+
+    wr_series = compute_williams_r(df_5m, period=config.williams_r_period)
+    ema_fast = compute_ema(df_5m["close"], span=config.ema_fast)
+    ema_mid = compute_ema(df_5m["close"], span=config.ema_mid)
+    ema_slow = compute_ema(df_5m["close"], span=config.ema_slow)
+
+    curr_wr = float(wr_series.iloc[-1])
+    curr_ema5 = float(ema_fast.iloc[-1])
+    curr_ema15 = float(ema_mid.iloc[-1])
+    curr_ema50 = float(ema_slow.iloc[-1])
+
+    curr_high = float(df_5m["high"].iloc[-1])
+    prev_high = float(df_5m["high"].iloc[-2])
+    curr_low = float(df_5m["low"].iloc[-1])
+    prev_low = float(df_5m["low"].iloc[-2])
+
+    # Bullish Momentum Check
+    if curr_wr > -20.0 and (curr_ema5 > curr_ema15 > curr_ema50) and (curr_high > prev_high):
+        return SignalType.BULLISH_MOMENTUM
+
+    # Bearish Momentum Check
+    if curr_wr < -80.0 and (curr_ema5 < curr_ema15 < curr_ema50) and (curr_low < prev_low):
+        return SignalType.BEARISH_MOMENTUM
+
     return SignalType.NO_SIGNAL
+
+
+# Alias for backward/naming compatibility
+evaluate_intraday_signals = evaluate_technical_signal
+
+
+def check_trend_reversal(
+    df_5m: pd.DataFrame,
+    opt_type: str,
+    config: Optional[SilverConfig] = None,
+) -> bool:
+    """Check whether a short option position has experienced an adverse trend reversal.
+
+    Reversal Conditions:
+    - For Short Put (PE): 5 EMA crosses below 50 EMA AND current Low < previous Low.
+    - For Short Call (CE): 5 EMA crosses above 50 EMA AND current High > previous High.
+
+    Requires at least 2 bars.
+    Returns True if trend reversal occurred, False otherwise.
+    """
+    if df_5m is None or len(df_5m) < 2:
+        return False
+
+    if not {"high", "low", "close"}.issubset(df_5m.columns):
+        return False
+
+    if config is None:
+        config = SilverConfig()
+
+    ema5 = compute_ema(df_5m["close"], span=config.ema_fast)
+    ema50 = compute_ema(df_5m["close"], span=config.ema_slow)
+
+    curr_ema5 = float(ema5.iloc[-1])
+    prev_ema5 = float(ema5.iloc[-2])
+    curr_ema50 = float(ema50.iloc[-1])
+    prev_ema50 = float(ema50.iloc[-2])
+
+    curr_low = float(df_5m["low"].iloc[-1])
+    prev_low = float(df_5m["low"].iloc[-2])
+    curr_high = float(df_5m["high"].iloc[-1])
+    prev_high = float(df_5m["high"].iloc[-2])
+
+    opt_str = opt_type.upper().strip()
+
+    # Short Put is threatened when market reverses bearishly (5 EMA crosses below 50 EMA + breakdowns)
+    if opt_str in ("PE", "PUT", "SHORT_PUT"):
+        bearish_cross = (curr_ema5 < curr_ema50) and (prev_ema5 >= prev_ema50)
+        breakdown = curr_low < prev_low
+        return bool(bearish_cross and breakdown)
+
+    # Short Call is threatened when market reverses bullishly (5 EMA crosses above 50 EMA + breakouts)
+    if opt_str in ("CE", "CALL", "SHORT_CALL"):
+        bullish_cross = (curr_ema5 > curr_ema50) and (prev_ema5 <= prev_ema50)
+        breakout = curr_high > prev_high
+        return bool(bullish_cross and breakout)
+
+    return False

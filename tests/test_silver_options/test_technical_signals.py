@@ -1,145 +1,283 @@
-import pandas as pd
+from datetime import time
 import numpy as np
+import pandas as pd
 import pytest
+
 from strategy.silver_options.config import SilverConfig
 from strategy.silver_options.models import SignalType
 from strategy.silver_options.technical_signals import (
+    check_trend_reversal,
+    compute_ema,
     compute_rsi,
-    detect_rsi_divergence,
-    verify_hourly_confirmation,
+    compute_williams_r,
+    evaluate_intraday_signals,
     evaluate_technical_signal,
 )
 
-def test_compute_rsi_accuracy():
-    prices = pd.Series([100, 102, 104, 103, 105, 107, 106, 108, 110, 112, 111, 113, 115, 114, 116, 118])
-    rsi = compute_rsi(prices, period=14)
-    assert not np.isnan(rsi.iloc[-1])
-    assert 0 <= rsi.iloc[-1] <= 100
 
-def test_compute_rsi_zero_loss_boundary():
-    # 25 consecutive increasing prices (zero losses) -> RSI must be 100.0
+def test_compute_williams_r_accuracy_and_boundaries():
+    # 10 bars: high: 95..104, low: 85..94, close: 104
+    # Highest high = 104, lowest low = 85, diff = 19
+    highs = [95 + i for i in range(10)]
+    lows = [85 + i for i in range(10)]
+    closes = [90 + i for i in range(10)]
+    closes[-1] = 104  # Close at the highest high
+
+    df = pd.DataFrame({"high": highs, "low": lows, "close": closes})
+    wr = compute_williams_r(df, period=10)
+
+    # When close == highest_high: (104 - 104) / 19 * -100 = 0.0
+    assert wr.iloc[-1] == 0.0
+    assert wr.iloc[-1] > -20.0  # Overbought territory
+
+    # When close == lowest_low: (104 - 85) / 19 * -100 = -100.0
+    df.loc[9, "close"] = 85
+    wr_oversold = compute_williams_r(df, period=10)
+    assert wr_oversold.iloc[-1] == -100.0
+    assert wr_oversold.iloc[-1] < -80.0  # Oversold territory
+
+
+def test_compute_williams_r_zero_division_and_edge_cases():
+    # Flat line: high == low == close for all bars
+    flat_df = pd.DataFrame({
+        "high": [100.0] * 20,
+        "low": [100.0] * 20,
+        "close": [100.0] * 20,
+    })
+    wr = compute_williams_r(flat_df, period=10)
+    # Should fallback cleanly to -50.0
+    assert (wr == -50.0).all()
+
+    # Empty DataFrame
+    empty_df = pd.DataFrame(columns=["high", "low", "close"])
+    assert compute_williams_r(empty_df).empty
+
+    # Missing required columns
+    bad_df = pd.DataFrame({"price": [100.0, 101.0]})
+    assert compute_williams_r(bad_df).empty
+
+
+def test_compute_ema():
+    series = pd.Series([10.0, 11.0, 12.0, 13.0, 14.0])
+    ema = compute_ema(series, span=3)
+    assert len(ema) == 5
+    assert ema.iloc[-1] > ema.iloc[0]
+
+    empty_series = pd.Series(dtype=float)
+    assert compute_ema(empty_series, span=5).empty
+
+
+def _create_uptrend_df(n_bars: int = 80) -> pd.DataFrame:
+    """Helper to generate a sustained uptrend with 5 EMA > 15 EMA > 50 EMA and wr > -20."""
+    closes = [1000.0 + i * 15.0 for i in range(n_bars)]
+    highs = [c + 5.0 for c in closes]
+    lows = [c - 5.0 for c in closes]
+    return pd.DataFrame({"high": highs, "low": lows, "close": closes})
+
+
+def _create_downtrend_df(n_bars: int = 80) -> pd.DataFrame:
+    """Helper to generate a sustained downtrend with 5 EMA < 15 EMA < 50 EMA and wr < -80."""
+    closes = [2500.0 - i * 15.0 for i in range(n_bars)]
+    highs = [c + 5.0 for c in closes]
+    lows = [c - 5.0 for c in closes]
+    return pd.DataFrame({"high": highs, "low": lows, "close": closes})
+
+
+def test_evaluate_technical_signal_bullish_momentum():
+    cfg = SilverConfig(williams_r_period=70, ema_fast=5, ema_mid=15, ema_slow=50)
+    df = _create_uptrend_df(80)
+
+    # Within session time (e.g. 10:30)
+    sig = evaluate_technical_signal(df, cfg, current_time=time(10, 30))
+    assert sig == SignalType.BULLISH_MOMENTUM
+
+    # Test alias
+    sig_alias = evaluate_intraday_signals(df, cfg, current_time=time(10, 30))
+    assert sig_alias == SignalType.BULLISH_MOMENTUM
+
+
+def test_evaluate_technical_signal_bearish_momentum():
+    cfg = SilverConfig(williams_r_period=70, ema_fast=5, ema_mid=15, ema_slow=50)
+    df = _create_downtrend_df(80)
+
+    # Within session time (e.g. 14:15)
+    sig = evaluate_technical_signal(df, cfg, current_time=time(14, 15))
+    assert sig == SignalType.BEARISH_MOMENTUM
+
+
+def test_candle_breakout_and_breakdown_requirement():
+    cfg = SilverConfig(williams_r_period=70)
+
+    # Bullish setup but current high <= previous high (inside candle / pullback)
+    df_bull = _create_uptrend_df(80)
+    df_bull.loc[79, "high"] = df_bull.loc[78, "high"] - 1.0  # Fails curr_high > prev_high
+    sig_bull = evaluate_technical_signal(df_bull, cfg, current_time=time(11, 0))
+    assert sig_bull == SignalType.NO_SIGNAL
+
+    # Bearish setup but current low >= previous low
+    df_bear = _create_downtrend_df(80)
+    df_bear.loc[79, "low"] = df_bear.loc[78, "low"] + 1.0  # Fails curr_low < prev_low
+    sig_bear = evaluate_technical_signal(df_bear, cfg, current_time=time(11, 0))
+    assert sig_bear == SignalType.NO_SIGNAL
+
+
+def test_triple_ema_alignment_requirement():
+    cfg = SilverConfig(williams_r_period=70)
+    df = _create_uptrend_df(80)
+
+    # Force 5 EMA to be below 15 EMA by dropping recent closes
+    df.loc[70:79, "close"] = df.loc[60, "close"] - 100.0
+    # Keep curr_high > prev_high to isolate the EMA condition
+    df.loc[79, "high"] = df.loc[78, "high"] + 10.0
+
+    sig = evaluate_technical_signal(df, cfg, current_time=time(11, 0))
+    # EMAs are not aligned 5 > 15 > 50
+    assert sig == SignalType.NO_SIGNAL
+
+    # Also test bearish setup with misaligned EMAs (5 EMA > 15 EMA)
+    df_bear = _create_downtrend_df(80)
+    df_bear.loc[70:79, "close"] = df_bear.loc[60, "close"] + 100.0
+    df_bear.loc[79, "low"] = df_bear.loc[78, "low"] - 10.0
+
+    sig_bear = evaluate_technical_signal(df_bear, cfg, current_time=time(11, 0))
+    assert sig_bear == SignalType.NO_SIGNAL
+
+
+def test_session_time_filter():
+    cfg = SilverConfig(
+        williams_r_period=70,
+        session_start=time(9, 15),
+        session_end=time(18, 0),
+    )
+    df = _create_uptrend_df(80)
+
+    # Before session start
+    assert evaluate_technical_signal(df, cfg, current_time=time(9, 14)) == SignalType.NO_SIGNAL
+
+    # At session start boundary
+    assert evaluate_technical_signal(df, cfg, current_time=time(9, 15)) == SignalType.BULLISH_MOMENTUM
+
+    # Mid session
+    assert evaluate_technical_signal(df, cfg, current_time=time(12, 0)) == SignalType.BULLISH_MOMENTUM
+
+    # At session end boundary
+    assert evaluate_technical_signal(df, cfg, current_time=time(18, 0)) == SignalType.BULLISH_MOMENTUM
+
+    # After session end (evening window)
+    assert evaluate_technical_signal(df, cfg, current_time=time(18, 1)) == SignalType.NO_SIGNAL
+    assert evaluate_technical_signal(df, cfg, current_time=time(21, 30)) == SignalType.NO_SIGNAL
+
+    # If current_time is None, session filter is not enforced
+    assert evaluate_technical_signal(df, cfg, current_time=None) == SignalType.BULLISH_MOMENTUM
+
+
+def test_insufficient_data_handling():
+    cfg = SilverConfig(williams_r_period=70)
+
+    # Only 69 bars (< 70)
+    df_short = _create_uptrend_df(69)
+    assert evaluate_technical_signal(df_short, cfg, current_time=time(10, 0)) == SignalType.NO_SIGNAL
+
+    # Empty DataFrame
+    assert evaluate_technical_signal(pd.DataFrame(), cfg) == SignalType.NO_SIGNAL
+
+    # None DataFrame
+    assert evaluate_technical_signal(None, cfg) == SignalType.NO_SIGNAL
+
+
+def test_check_trend_reversal_short_put():
+    cfg = SilverConfig(ema_fast=5, ema_slow=50)
+
+    # To create a fresh bearish cross (5 EMA crossing below 50 EMA):
+    # Bars 0..60 at 1000, bars 61..70 plunge sharply so 5 EMA crosses below 50 EMA at the last bar
+    closes = [1000.0] * 60 + [1000.0 - i * 20.0 for i in range(1, 15)]
+    highs = [c + 5.0 for c in closes]
+    lows = [c - 5.0 for c in closes]
+    df = pd.DataFrame({"high": highs, "low": lows, "close": closes})
+
+    # Let's inspect where 5 EMA crosses 50 EMA
+    ema5 = compute_ema(df["close"], span=5)
+    ema50 = compute_ema(df["close"], span=50)
+
+    # Find the exact cross index
+    cross_idx = None
+    for i in range(1, len(df)):
+        if ema5.iloc[i] < ema50.iloc[i] and ema5.iloc[i - 1] >= ema50.iloc[i - 1]:
+            cross_idx = i
+            break
+
+    assert cross_idx is not None, "A crossover should occur in this synthetic dataset"
+
+    # Slice up to cross_idx + 1 so the last bar is the crossover bar
+    df_cross = df.iloc[: cross_idx + 1].copy().reset_index(drop=True)
+    # Ensure current low < previous low
+    df_cross.loc[len(df_cross) - 1, "low"] = df_cross.loc[len(df_cross) - 2, "low"] - 5.0
+
+    # Short Put should trigger trend reversal
+    assert check_trend_reversal(df_cross, "PE", cfg) is True
+    assert check_trend_reversal(df_cross, "SHORT_PUT", cfg) is True
+
+    # If current low does not breakdown (curr_low >= prev_low), reversal should be False
+    df_no_breakdown = df_cross.copy()
+    df_no_breakdown.loc[len(df_no_breakdown) - 1, "low"] = df_no_breakdown.loc[len(df_no_breakdown) - 2, "low"] + 2.0
+    assert check_trend_reversal(df_no_breakdown, "PE", cfg) is False
+
+
+def test_check_trend_reversal_short_call():
+    cfg = SilverConfig(ema_fast=5, ema_slow=50)
+
+    # To create a fresh bullish cross (5 EMA crossing above 50 EMA):
+    # Bars 0..60 at 1000, bars 61..75 rally sharply so 5 EMA crosses above 50 EMA
+    closes = [1000.0] * 60 + [1000.0 + i * 20.0 for i in range(1, 16)]
+    highs = [c + 5.0 for c in closes]
+    lows = [c - 5.0 for c in closes]
+    df = pd.DataFrame({"high": highs, "low": lows, "close": closes})
+
+    ema5 = compute_ema(df["close"], span=5)
+    ema50 = compute_ema(df["close"], span=50)
+
+    cross_idx = None
+    for i in range(1, len(df)):
+        if ema5.iloc[i] > ema50.iloc[i] and ema5.iloc[i - 1] <= ema50.iloc[i - 1]:
+            cross_idx = i
+            break
+
+    assert cross_idx is not None, "A crossover should occur in this synthetic dataset"
+
+    df_cross = df.iloc[: cross_idx + 1].copy().reset_index(drop=True)
+    # Ensure current high > previous high
+    df_cross.loc[len(df_cross) - 1, "high"] = df_cross.loc[len(df_cross) - 2, "high"] + 5.0
+
+    # Short Call should trigger trend reversal
+    assert check_trend_reversal(df_cross, "CE", cfg) is True
+    assert check_trend_reversal(df_cross, "SHORT_CALL", cfg) is True
+
+    # If current high does not breakout (curr_high <= prev_high), reversal should be False
+    df_no_breakout = df_cross.copy()
+    df_no_breakout.loc[len(df_no_breakout) - 1, "high"] = df_no_breakout.loc[len(df_no_breakout) - 2, "high"] - 2.0
+    assert check_trend_reversal(df_no_breakout, "CE", cfg) is False
+
+
+def test_check_trend_reversal_edge_cases():
+    cfg = SilverConfig()
+
+    # Single candle (< 2 bars)
+    df_single = pd.DataFrame({"high": [100.0], "low": [90.0], "close": [95.0]})
+    assert check_trend_reversal(df_single, "PE", cfg) is False
+
+    # Empty DataFrame
+    assert check_trend_reversal(pd.DataFrame(), "PE", cfg) is False
+
+    # Unknown option type
+    df_two = pd.DataFrame({"high": [100.0, 101.0], "low": [90.0, 91.0], "close": [95.0, 96.0]})
+    assert check_trend_reversal(df_two, "UNKNOWN", cfg) is False
+
+
+def test_compute_rsi_utility():
     prices = pd.Series([100.0 + i * 2.0 for i in range(25)])
     rsi = compute_rsi(prices, period=14)
     assert rsi.iloc[-1] == 100.0
 
-    # Flat prices (zero gains and zero losses) -> RSI defaults to 50.0
     flat_prices = pd.Series([100.0] * 20)
     flat_rsi = compute_rsi(flat_prices, period=14)
     assert flat_rsi.iloc[-1] == 50.0
-
-def test_detect_bullish_divergence():
-    # Price makes lower low (150,000 -> 148,000) while RSI makes higher low (19 -> 25)
-    cfg = SilverConfig(daily_rsi_oversold=25.0)
-    data = {
-        "close": [165000, 162000, 158000, 154000, 150000, 152000, 151000, 148000],
-        "low": [164000, 161000, 157000, 153000, 149000, 151000, 150000, 147500],
-    }
-    df = pd.DataFrame(data)
-    # Inject mocked RSI series directly
-    df["rsi"] = [35.0, 30.0, 24.0, 21.0, 19.0, 23.0, 22.0, 25.0]
-
-    signal = detect_rsi_divergence(df, cfg)
-    assert signal == SignalType.BULLISH_REVERSAL
-
-def test_detect_bullish_divergence_15_bars_lookback():
-    # Divergence low occurred 15 bars prior to the current candle
-    cfg = SilverConfig(daily_rsi_oversold=25.0)
-    
-    # 18 bars total. Bar index 2 is 15 bars before current bar (index 17).
-    # Bar index 2 has low close of 150,000 and oversold RSI of 19.0.
-    closes = [
-        160000, 155000, 150000, 152000, 153000, 154000, 155000, 156000, 155000,
-        154000, 153000, 152000, 151500, 151000, 150500, 150000, 149500, 148000
-    ]
-    rsis = [
-        35.0, 28.0, 19.0, 23.0, 26.0, 28.0, 31.0, 33.0, 30.0,
-        29.0, 27.0, 25.0, 24.0, 23.0, 22.0, 21.0, 22.0, 24.0
-    ]
-    df = pd.DataFrame({"close": closes, "rsi": rsis})
-    assert len(df) == 18
-
-    # Prior min close is at index 2 (150,000, RSI 19.0 <= 25.0).
-    # Current bar at index 17 has close 148,000 (< 150,000) and RSI 24.0 (> 19.0).
-    signal = detect_rsi_divergence(df, cfg)
-    assert signal == SignalType.BULLISH_REVERSAL
-
-def test_detect_bearish_divergence():
-    # Price makes higher high (160,000 -> 165,000) while RSI makes lower high (75 -> 71)
-    cfg = SilverConfig(daily_rsi_overbought=70.0)
-    data = {
-        "close": [150000, 155000, 158000, 160000, 158000, 157000, 159000, 165000],
-        "high": [151000, 156000, 159000, 161000, 159000, 158000, 160000, 166000],
-    }
-    df = pd.DataFrame(data)
-    df["rsi"] = [55.0, 60.0, 68.0, 75.0, 65.0, 62.0, 64.0, 71.0]
-
-    signal = detect_rsi_divergence(df, cfg)
-    assert signal == SignalType.BEARISH_BREAKDOWN
-
-def test_detect_no_divergence():
-    cfg = SilverConfig()
-    # Insufficient bars (< 5)
-    short_df = pd.DataFrame({"close": [100, 101, 102]})
-    assert detect_rsi_divergence(short_df, cfg) == SignalType.NO_SIGNAL
-
-    # Normal trend without divergence
-    normal_df = pd.DataFrame({
-        "close": [100, 101, 102, 103, 104, 105, 106, 107],
-        "rsi": [50.0, 52.0, 54.0, 55.0, 56.0, 57.0, 58.0, 59.0],
-    })
-    assert detect_rsi_divergence(normal_df, cfg) == SignalType.NO_SIGNAL
-
-def test_hourly_confirmation_bullish():
-    cfg = SilverConfig(hourly_ema_period=20)
-    # Hourly close crosses above 20 EMA
-    hourly_df = pd.DataFrame({
-        "close": [148000, 148500, 149200, 150500],
-        "ema_20": [149000, 149000, 149100, 149200],
-    })
-    confirmed = verify_hourly_confirmation(hourly_df, SignalType.BULLISH_REVERSAL, cfg)
-    assert confirmed is True
-
-def test_hourly_confirmation_bearish():
-    cfg = SilverConfig(hourly_ema_period=20)
-    hourly_df = pd.DataFrame({
-        "close": [150000, 149500, 148500, 147000],
-        "ema_20": [149000, 149000, 148800, 148500],
-    })
-    confirmed = verify_hourly_confirmation(hourly_df, SignalType.BEARISH_BREAKDOWN, cfg)
-    assert confirmed is True
-
-def test_hourly_confirmation_short_or_no_signal():
-    cfg = SilverConfig()
-    # Single candle hourly
-    hourly_short = pd.DataFrame({"close": [150000]})
-    assert verify_hourly_confirmation(hourly_short, SignalType.BULLISH_REVERSAL, cfg) is False
-
-    # Valid candle hourly with NO_SIGNAL daily signal
-    hourly_df = pd.DataFrame({
-        "close": [148000, 149500],
-        "ema_20": [148500, 148600],
-    })
-    assert verify_hourly_confirmation(hourly_df, SignalType.NO_SIGNAL, cfg) is False
-
-def test_evaluate_technical_signal_end_to_end():
-    cfg = SilverConfig(daily_rsi_oversold=25.0, hourly_ema_period=20)
-    daily_df = pd.DataFrame({
-        "close": [165000, 162000, 158000, 154000, 150000, 152000, 151000, 148000],
-        "rsi": [35.0, 30.0, 24.0, 21.0, 19.0, 23.0, 22.0, 25.0],
-    })
-    
-    # Confirmed hourly
-    hourly_confirmed = pd.DataFrame({
-        "close": [148000, 148500, 149200, 150500],
-        "ema_20": [149000, 149000, 149100, 149200],
-    })
-    sig = evaluate_technical_signal(daily_df, hourly_confirmed, cfg)
-    assert sig == SignalType.BULLISH_REVERSAL
-
-    # Unconfirmed hourly (still below EMA)
-    hourly_unconfirmed = pd.DataFrame({
-        "close": [148000, 147500, 147200, 147000],
-        "ema_20": [149000, 149000, 149100, 149200],
-    })
-    sig_unconf = evaluate_technical_signal(daily_df, hourly_unconfirmed, cfg)
-    assert sig_unconf == SignalType.NO_SIGNAL
