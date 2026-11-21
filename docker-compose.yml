@@ -40,3 +40,40 @@ services:
     # 4. Paper Trading (Simulation):
     # command: ["--paper", "--lots", "10", "--poll", "5", "--single-leg-exit", "--trail-cost", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
     # -----------------------------------------------------------------------------------
+
+  silver-desk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: silver_options_desk
+    image: ${DOCKER_USER:-sharadprsn}/silver_options_desk:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Kolkata
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-10}
+      - SILVER_LOTS=${SILVER_LOTS:-2}
+      - SILVER_SL_PER_LOT=${SILVER_SL_PER_LOT:-10000}
+      - SILVER_DAILY_MAX_LOSS=${SILVER_DAILY_MAX_LOSS:-15000}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "10"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    # Override default entrypoint to run the MCX Silver Options Desk
+    entrypoint: ["python", "scripts/run_silver_desk.py"]
+    # -----------------------------------------------------------------------------------
+    # Command Options:
+    # 1. Paper Trading Simulation (Default, 2 Lots, Rs 10k/Lot SL, Rs 15k/Lot Daily Max Loss):
+    command: ["--paper", "--lots", "2", "--sl-per-lot", "10000", "--daily-max-loss", "15000"]
+    #
+    # 2. Live Trading (2 Lots, Rs 10k/Lot SL, Rs 15k/Lot Daily Max Loss):
+    # command: ["--live", "--lots", "2", "--sl-per-lot", "10000", "--daily-max-loss", "15000"]
+    # -----------------------------------------------------------------------------------

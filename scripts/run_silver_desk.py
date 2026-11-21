@@ -2,6 +2,7 @@
 import argparse
 from datetime import date, datetime, timedelta
 import logging
+import os
 from pathlib import Path
 import sys
 from typing import Optional, Tuple, List, Dict, Any
@@ -244,19 +245,29 @@ def log_tick_summary(
 
 def display_status(engine: SilverOptionsEngine) -> None:
     """Displays current active position, today's closed positions, and realized PnL."""
+    cfg = engine.config
     logger.info("=== MCX Silver Options Desk Status ===")
+    logger.info(
+        "Contract: %s | Lots: %d (%d kg) | SL/Lot: Rs. %.2f | Daily Max Loss: Rs. %.2f",
+        cfg.symbol,
+        cfg.lots,
+        cfg.total_quantity,
+        cfg.sl_per_lot,
+        cfg.daily_max_loss,
+    )
     if engine.active_position:
         legs_str = ", ".join(l.trading_symbol or f"{l.strike}{l.option_type}" for l in engine.active_position.legs)
         logger.info(
-            "Active Position: %s [%s] | Net Credit: %.2f | SL: %.2f | Status: %s",
+            "Active Position: %s [%s] | Net Credit: %.2f | SL Price: %.2f (Max Trade Loss: Rs. %.2f) | Status: %s",
             engine.active_position.spread_type,
             legs_str,
             engine.active_position.entry_net_credit,
             engine.active_position.sl_price,
+            cfg.max_loss_per_trade,
             engine.active_position.status,
         )
     else:
-        logger.info("Active Position: None")
+        logger.info("Active Position: None (Flat)")
 
     logger.info("Closed Positions Today: %d", len(engine.closed_positions))
     for i, p in enumerate(engine.closed_positions, 1):
@@ -272,7 +283,8 @@ def display_status(engine: SilverOptionsEngine) -> None:
         )
 
     total_realized_pnl = sum(p.realized_pnl for p in engine.closed_positions if p.realized_pnl is not None)
-    logger.info("Realized PnL: Rs. %.2f", total_realized_pnl)
+    logger.info("Today Realized PnL: Rs. %.2f", total_realized_pnl)
+    logger.info("Trading Halted Today: %s", "YES" if engine.trading_halted_for_day else "NO")
     logger.info("=======================================")
 
 
@@ -304,6 +316,24 @@ def build_parser() -> argparse.ArgumentParser:
     mode_group.add_argument("--paper", action="store_true", help="Run in paper trading mode (default)")
     mode_group.add_argument("--live", action="store_true", help="Run in live trading mode")
     parser.add_argument(
+        "--lots",
+        type=int,
+        default=int(os.environ.get("SILVER_LOTS", "2")),
+        help="Number of lots to trade (default: 2)",
+    )
+    parser.add_argument(
+        "--sl-per-lot",
+        type=float,
+        default=float(os.environ.get("SILVER_SL_PER_LOT", "10000.0")),
+        help="Per-lot stop loss cap in Rs (default: 10000.0)",
+    )
+    parser.add_argument(
+        "--daily-max-loss",
+        type=float,
+        default=float(os.environ.get("SILVER_DAILY_MAX_LOSS", "15000.0")),
+        help="Daily max loss cap per lot in Rs (default: 15000.0)",
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="Run single market tick with latest 5m candles from Kite or mock, then exit",
@@ -323,7 +353,11 @@ def main(args=None) -> SilverOptionsEngine:
     is_paper = not parsed_args.live
     logger.info(f"Starting MCX Silver Options Desk (Mode: {'PAPER' if is_paper else 'LIVE'})...")
 
-    cfg = SilverConfig()
+    cfg = SilverConfig(
+        lots=parsed_args.lots,
+        sl_per_lot=parsed_args.sl_per_lot,
+        daily_max_loss_per_lot=parsed_args.daily_max_loss,
+    )
     kite = None
     if is_paper:
         try:
@@ -335,7 +369,11 @@ def main(args=None) -> SilverOptionsEngine:
         kite = get_kite_client()
 
     engine = SilverOptionsEngine(kite_client=kite, config=cfg, is_paper=is_paper)
-    logger.info(f"Initialized Silver Options Engine for {cfg.symbol} (Lot size: {cfg.lot_size} kg). Ready.")
+    logger.info(
+        f"Initialized Silver Options Engine for {cfg.symbol} "
+        f"(Lots: {cfg.lots}, Total Qty: {cfg.total_quantity} kg, SL/Lot: Rs. {cfg.sl_per_lot:,.0f}, "
+        f"Daily Max Loss: Rs. {cfg.daily_max_loss:,.0f}). Ready."
+    )
 
     if parsed_args.once:
         if kite is not None:

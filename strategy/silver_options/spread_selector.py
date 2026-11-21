@@ -190,19 +190,28 @@ def select_spread(
 
     trading_symbol = matched_row.get(f"{opt_type.lower()}_tradingsymbol") or matched_row.get("tradingsymbol")
     lot_size = getattr(cfg, "lot_size", 5)
+    lots = getattr(cfg, "lots", 2)
+    total_qty = getattr(cfg, "total_quantity", lots * lot_size)
 
     leg = OptionLeg(
         strike=strike,
         option_type=opt_type,
         action="SELL",
-        quantity=lot_size,
+        quantity=total_qty,
         premium=premium,
         trading_symbol=trading_symbol,
     )
 
-    net_credit = round(premium * lot_size, 2)
+    net_credit = round(premium * total_qty, 2)
     sl_multiplier = getattr(cfg, "sl_multiplier", 1.5)
-    sl_price = round(premium * sl_multiplier, 2)
+    sl_per_lot = getattr(cfg, "sl_per_lot", 10000.0)
+
+    # Hybrid Stop Loss: min(dynamic 1.5x multiplier, fixed rupee cap per lot)
+    dynamic_allowed_pts = premium * (sl_multiplier - 1.0)
+    fixed_allowed_pts = sl_per_lot / lot_size
+    allowed_loss_pts = min(dynamic_allowed_pts, fixed_allowed_pts)
+    sl_price = round(premium + allowed_loss_pts, 2)
+    max_loss = round(allowed_loss_pts * total_qty, 2)
 
     return SpreadPosition(
         spread_type=spread_type,
@@ -210,7 +219,7 @@ def select_spread(
         entry_net_credit=net_credit,
         entry_net_debit=0.0,
         max_profit=net_credit,
-        max_loss=0.0,
+        max_loss=max_loss,
         target_delta=target_delta,
         sl_price=sl_price,
         status="PENDING",

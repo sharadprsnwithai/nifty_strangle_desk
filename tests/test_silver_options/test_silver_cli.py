@@ -22,6 +22,17 @@ def test_build_parser_defaults():
     assert args.paper is False
     assert args.once is False
     assert args.status is False
+    assert args.lots == 2
+    assert args.sl_per_lot == 10000.0
+    assert args.daily_max_loss == 15000.0
+
+
+def test_build_parser_custom_risk_args():
+    parser = build_parser()
+    args = parser.parse_args(["--lots", "3", "--sl-per-lot", "12000", "--daily-max-loss", "25000"])
+    assert args.lots == 3
+    assert args.sl_per_lot == 12000.0
+    assert args.daily_max_loss == 25000.0
 
 
 def test_build_parser_live():
@@ -260,8 +271,9 @@ def test_execute_single_tick_entry_flow():
     closes = [base + i * 15.0 for i in range(n_bars)]
     highs = [c + 5.0 for c in closes]
     lows = [c - 5.0 for c in closes]
+    dates = pd.date_range("2026-11-20 09:15", periods=n_bars, freq="5min")
     mock_candles = [
-        {"date": f"2026-11-20 10:{i:02d}:00", "open": closes[i], "high": highs[i], "low": lows[i], "close": closes[i], "volume": 100}
+        {"date": str(dates[i]), "open": closes[i], "high": highs[i], "low": lows[i], "close": closes[i], "volume": 100}
         for i in range(n_bars)
     ]
     mock_kite.historical_data.return_value = mock_candles

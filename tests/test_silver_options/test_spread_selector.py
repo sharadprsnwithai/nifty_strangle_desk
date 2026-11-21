@@ -107,7 +107,7 @@ def sample_profile():
 
 
 def test_bullish_signal_selects_target_delta_pe(sample_chain_with_deltas, sample_profile):
-    cfg = SilverConfig(lot_size=5, target_delta=0.35, sl_multiplier=1.5)
+    cfg = SilverConfig(lots=2, lot_size=5, target_delta=0.35, sl_multiplier=1.5, sl_per_lot=10000.0)
 
     # Bullish Momentum -> Sells 0.35 Delta Put (146000 PE)
     spread = select_spread(SignalType.BULLISH_MOMENTUM, sample_profile, sample_chain_with_deltas, cfg)
@@ -120,14 +120,16 @@ def test_bullish_signal_selects_target_delta_pe(sample_chain_with_deltas, sample
     assert short_leg.strike == 146000
     assert short_leg.option_type == "PE"
     assert short_leg.action == "SELL"
-    assert short_leg.quantity == 5
+    assert short_leg.quantity == 10  # 2 lots * 5 kg
     assert short_leg.premium == 950.0
     assert short_leg.trading_symbol == "SILVERM26NOV146000PE"
 
-    assert spread.entry_net_credit == 4750.0  # 950 * 5
+    assert spread.entry_net_credit == 9500.0  # 950 * 10
     assert spread.entry_net_debit == 0.0
-    assert spread.max_profit == 4750.0
-    assert spread.sl_price == 1425.0  # 950 * 1.5
+    assert spread.max_profit == 9500.0
+    # Hybrid SL: dynamic is 950 * 0.5 = 475 pts, fixed is 10000 / 5 = 2000 pts -> allowed is 475 pts
+    assert spread.sl_price == 1425.0  # 950 + 475
+    assert spread.max_loss == 4750.0  # 475 * 10
     assert spread.target_delta == 0.35
     assert spread.status == "PENDING"
 
@@ -139,7 +141,7 @@ def test_bullish_signal_selects_target_delta_pe(sample_chain_with_deltas, sample
 
 
 def test_bearish_signal_selects_target_delta_ce(sample_chain_with_deltas, sample_profile):
-    cfg = SilverConfig(lot_size=5, target_delta=0.35, sl_multiplier=1.5)
+    cfg = SilverConfig(lots=2, lot_size=5, target_delta=0.35, sl_multiplier=1.5, sl_per_lot=10000.0)
 
     # Bearish Momentum -> Sells 0.35 Delta Call (155000 CE)
     spread = select_spread(SignalType.BEARISH_MOMENTUM, sample_profile, sample_chain_with_deltas, cfg)
@@ -152,14 +154,16 @@ def test_bearish_signal_selects_target_delta_ce(sample_chain_with_deltas, sample
     assert short_leg.strike == 155000
     assert short_leg.option_type == "CE"
     assert short_leg.action == "SELL"
-    assert short_leg.quantity == 5
+    assert short_leg.quantity == 10  # 2 lots * 5 kg
     assert short_leg.premium == 900.0
     assert short_leg.trading_symbol == "SILVERM26NOV155000CE"
 
-    assert spread.entry_net_credit == 4500.0  # 900 * 5
+    assert spread.entry_net_credit == 9000.0  # 900 * 10
     assert spread.entry_net_debit == 0.0
-    assert spread.max_profit == 4500.0
-    assert spread.sl_price == 1350.0  # 900 * 1.5
+    assert spread.max_profit == 9000.0
+    # Hybrid SL: dynamic is 900 * 0.5 = 450 pts, fixed is 10000 / 5 = 2000 pts -> allowed is 450 pts
+    assert spread.sl_price == 1350.0  # 900 + 450
+    assert spread.max_loss == 4500.0  # 450 * 10
     assert spread.target_delta == 0.35
     assert spread.status == "PENDING"
 
@@ -168,6 +172,24 @@ def test_bearish_signal_selects_target_delta_ce(sample_chain_with_deltas, sample
     assert spread_breakdown is not None
     assert spread_breakdown.spread_type == SpreadType.SHORT_CALL
     assert spread_breakdown.legs[0].strike == 155000
+
+
+def test_hybrid_sl_caps_at_fixed_amount_when_premium_is_high(sample_profile):
+    # High premium scenario: premium = 6000.0
+    # Dynamic 1.5x gives 3000 pts loss. But sl_per_lot = 10000.0 (with lot_size=5) caps loss at 2000 pts!
+    cfg = SilverConfig(lots=2, lot_size=5, target_delta=0.35, sl_multiplier=1.5, sl_per_lot=10000.0)
+    chain = [{
+        "strike": 146000,
+        "pe_ltp": 6000.0,
+        "pe_delta": -0.35,
+        "pe_tradingsymbol": "SILVERM26NOV146000PE",
+    }]
+    spread = select_spread(SignalType.BULLISH_MOMENTUM, sample_profile, chain, cfg)
+    assert spread is not None
+    # 6000 + min(3000, 2000) = 8000.0
+    assert spread.sl_price == 8000.0
+    # Max loss = 2000 pts * 10 kg = Rs 20,000 (exactly Rs 10,000 per lot across 2 lots!)
+    assert spread.max_loss == 20000.0
 
 
 def test_no_signal_returns_none(sample_chain_with_deltas, sample_profile):

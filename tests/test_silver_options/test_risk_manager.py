@@ -577,3 +577,48 @@ def test_normal_ongoing_position_holds(sample_short_put_position):
     )
     assert should_exit is False
     assert reason is None
+
+
+def test_daily_max_loss_limit_triggers_exit(sample_short_put_position):
+    """Priority: Daily max loss limit triggers immediate exit if cumulative day loss hits threshold."""
+    # Config: 2 lots, daily_max_loss_per_lot = 15000 -> daily_max_loss = 30000
+    cfg = SilverConfig(lots=2, lot_size=5, daily_max_loss_per_lot=15000.0)
+    # Entry premium = 1000.0, current price = 2500.0 -> unrealized loss = (1000 - 2500) * 10 = -15,000
+    # Prior today_realized_pnl = -16,000 -> total day loss = -31,000 <= -30,000
+    should_exit, reason = check_exit_conditions(
+        sample_short_put_position,
+        current_opt_price=2500.0,
+        current_time=time(14, 0),
+        is_expiry_day=False,
+        config=cfg,
+        today_realized_pnl=-16000.0,
+    )
+    assert should_exit is True
+    assert reason == "DAILY_MAX_LOSS_LIMIT"
+
+
+def test_hybrid_sl_triggers_on_fixed_cap_when_premium_is_huge():
+    """Hybrid SL: When premium is huge, fixed cap per lot is used instead of dynamic 1.5x."""
+    # Lot size = 5, sl_per_lot = 10,000 -> max allowed pts = 2,000
+    # Entry premium = 6,000. Dynamic 1.5x would be 9,000 (3,000 pts).
+    # Hybrid cap restricts SL target to 6,000 + 2,000 = 8,000.
+    cfg = SilverConfig(lots=2, lot_size=5, sl_multiplier=1.5, sl_per_lot=10000.0)
+    leg = OptionLeg(strike=150000, option_type="PE", action="SELL", quantity=10, premium=6000.0)
+    pos = SpreadPosition(
+        spread_type=SpreadType.SHORT_PUT,
+        legs=[leg],
+        entry_net_credit=60000.0,
+        sl_price=0.0,  # Unset -> computes hybrid fallback
+        status="ACTIVE",
+    )
+
+    # Price at 8050.0 (below 9,000 dynamic, but above 8,000 hybrid cap)
+    should_exit, reason = check_exit_conditions(
+        pos,
+        current_opt_price=8050.0,
+        current_time=time(14, 0),
+        is_expiry_day=False,
+        config=cfg,
+    )
+    assert should_exit is True
+    assert reason == "STOP_LOSS"

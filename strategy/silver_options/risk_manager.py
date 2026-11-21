@@ -82,7 +82,11 @@ def check_exit_conditions(
     if is_expiry_day and current_time >= config.devolvement_cutoff:
         return True, "MANDATORY_EXPIRY_DEVOLVEMENT_CUTOFF"
 
-    # b) Super Order Stop Loss (1.5x entry premium)
+    # b) Daily Portfolio Max Loss Check
+    daily_max_loss = getattr(config, "daily_max_loss", getattr(config, "daily_max_loss_per_lot", 15000.0) * getattr(config, "lots", 2))
+    today_realized = float(kwargs.get("today_realized_pnl", 0.0))
+
+    # c) Super Order Hybrid Stop Loss (1.5x entry premium capped at sl_per_lot)
     entry_premium = 0.0
     if position.legs:
         short_legs = [l for l in position.legs if getattr(l, "action", None) == "SELL"]
@@ -98,12 +102,23 @@ def check_exit_conditions(
         elif position.entry_net_debit > 0:
             entry_premium = position.entry_net_debit / lot_size
 
+    total_qty = getattr(config, "total_quantity", getattr(config, "lots", 2) * getattr(config, "lot_size", 5))
+    if entry_premium > 0 and current_opt_price > 0:
+        unrealized_pnl = (entry_premium - current_opt_price) * total_qty
+        if (today_realized + unrealized_pnl) <= -daily_max_loss:
+            return True, "DAILY_MAX_LOSS_LIMIT"
+
     sl_multiplier = getattr(config, "sl_multiplier", 1.5) or 1.5
+    sl_per_lot = getattr(config, "sl_per_lot", 10000.0) or 10000.0
+    lot_size = getattr(config, "lot_size", 5) or 5
     pos_sl = getattr(position, "sl_price", 0.0)
     if pos_sl is not None and pos_sl > 0:
         sl_target = pos_sl
     elif entry_premium > 0:
-        sl_target = entry_premium * sl_multiplier
+        dynamic_pts = entry_premium * (sl_multiplier - 1.0)
+        fixed_pts = sl_per_lot / lot_size
+        allowed_pts = min(dynamic_pts, fixed_pts)
+        sl_target = entry_premium + allowed_pts
     else:
         sl_target = float("inf")
 

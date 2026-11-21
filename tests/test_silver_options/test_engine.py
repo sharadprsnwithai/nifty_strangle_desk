@@ -138,7 +138,8 @@ def test_engine_entry_bullish_momentum(sample_chain):
     assert leg.option_type == "PE"
     assert leg.action == "SELL"
     assert leg.premium == 1000.0
-    assert engine.active_position.entry_net_credit == 5000.0
+    assert leg.quantity == 10
+    assert engine.active_position.entry_net_credit == 10000.0
     assert engine.active_position.sl_price == 1500.0
 
 
@@ -166,7 +167,8 @@ def test_engine_entry_bearish_momentum(sample_chain):
     assert leg.option_type == "CE"
     assert leg.action == "SELL"
     assert leg.premium == 1000.0
-    assert engine.active_position.entry_net_credit == 5000.0
+    assert leg.quantity == 10
+    assert engine.active_position.entry_net_credit == 10000.0
     assert engine.active_position.sl_price == 1500.0
 
 
@@ -236,8 +238,8 @@ def test_engine_exit_on_stop_loss(sample_chain):
     closed = engine.closed_positions[0]
     assert closed.status == "CLOSED"
     assert closed.exit_reason == "STOP_LOSS"
-    # Realized PnL: (1000.0 - 1550.0) * 5 = -2750.0
-    assert closed.realized_pnl == -2750.0
+    # Realized PnL: (1000.0 - 1550.0) * 10 = -5500.0 (2 lots of 5kg = 10kg)
+    assert closed.realized_pnl == -5500.0
 
 
 def test_engine_exit_on_trend_reversal():
@@ -323,8 +325,8 @@ def test_engine_exit_on_session_end(sample_chain):
     closed = engine.closed_positions[0]
     assert closed.status == "CLOSED"
     assert closed.exit_reason == "SESSION_CLOSE"
-    # Realized PnL: (1000.0 - 400.0) * 5 = +3000.0
-    assert closed.realized_pnl == 3000.0
+    # Realized PnL: (1000.0 - 400.0) * 10 = +6000.0 (2 lots of 5kg = 10kg)
+    assert closed.realized_pnl == 6000.0
 
 
 def test_engine_exit_on_intraday_eod(sample_chain):
@@ -450,7 +452,7 @@ def test_engine_live_execution_full_cycle(sample_chain):
     assert engine.active_position is None
     assert mock_kite.place_order.call_count == 2
     assert len(engine.closed_positions) == 1
-    assert engine.closed_positions[0].realized_pnl == (1000.0 - 500.0) * 5
+    assert engine.closed_positions[0].realized_pnl == (1000.0 - 500.0) * 10
 
 
 def test_engine_backward_compatibility_legacy_kwargs(sample_chain):
@@ -494,3 +496,44 @@ def test_engine_option_price_fallback_when_not_in_chain():
 
     assert engine.active_position is not None
     assert engine.active_position.current_value == 1000.0
+
+
+def test_engine_daily_max_loss_circuit_breaker(sample_chain):
+    """When cumulative daily loss reaches daily_max_loss (e.g. 30,000 for 2 lots), trading is halted."""
+    cfg = SilverConfig(lots=2, lot_size=5, daily_max_loss_per_lot=15000.0)
+    engine = SilverOptionsEngine(kite_client=MagicMock(), config=cfg, is_paper=True)
+
+    df_up = _create_uptrend_df(80)
+    engine.on_market_tick(
+        spot_price=75000.0,
+        df_5m=df_up,
+        chain_data=sample_chain,
+        current_time=time(10, 0),
+        is_expiry_day=False,
+    )
+    assert engine.active_position is not None
+
+    # Catastrophic surge: PE spikes to 4500.0 -> loss of (1000 - 4500) * 10 = -35000.0
+    surge_chain = [{"strike": 74000, "pe_ltp": 4500.0}]
+    engine.on_market_tick(
+        spot_price=70000.0,
+        df_5m=df_up,
+        chain_data=surge_chain,
+        current_time=time(11, 0),
+        is_expiry_day=False,
+    )
+
+    assert engine.active_position is None
+    assert len(engine.closed_positions) == 1
+    assert engine.closed_positions[0].realized_pnl == -35000.0
+    assert engine.trading_halted_for_day is True
+
+    # Subsequent tick with strong signal should NOT enter because trading is halted
+    engine.on_market_tick(
+        spot_price=75000.0,
+        df_5m=df_up,
+        chain_data=sample_chain,
+        current_time=time(12, 0),
+        is_expiry_day=False,
+    )
+    assert engine.active_position is None

@@ -34,6 +34,14 @@ def test_silver_config_defaults():
     assert cfg.eod_cutoff == time(23, 15)
     assert cfg.slippage_buffer_ticks == 2
 
+    # Lots and Hybrid Risk parameters
+    assert cfg.lots == 2
+    assert cfg.sl_per_lot == 10000.0
+    assert cfg.daily_max_loss_per_lot == 15000.0
+    assert cfg.total_quantity == 10
+    assert cfg.max_loss_per_trade == 20000.0
+    assert cfg.daily_max_loss == 30000.0
+
     # Verify legacy attributes are removed
     legacy_attrs = [
         "daily_rsi_period",
