@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument("--lots", type=int, default=int(os.getenv("STOCK_FUTURES_LOTS", "2")), help="Number of lots per trade (default: 2)")
     parser.add_argument("--order-type", choices=["LIMIT", "MARKET"], default=os.getenv("STOCK_FUTURES_ORDER_TYPE", "LIMIT"), help="Order execution type (LIMIT: marketable limit order, default: LIMIT)")
     parser.add_argument("--limit-buffer-pct", type=float, default=float(os.getenv("STOCK_FUTURES_LIMIT_BUFFER_PCT", "0.05")), help="Marketable limit price buffer percentage (default: 0.05 / 5%%)")
-    parser.add_argument("--target-pct", type=float, default=float(os.getenv("STOCK_FUTURES_TARGET_PCT", "0.015")), help="Profit target percentage (default: 0.015 / 1.5%%)")
+    parser.add_argument("--target-pct", type=float, default=float(os.getenv("STOCK_FUTURES_TARGET_PCT", "0.0225")), help="Profit target percentage (default: 0.0225 / 2.25%%)")
     parser.add_argument("--sl-pct", type=float, default=float(os.getenv("STOCK_FUTURES_SL_PCT", "0.010")), help="Hard stop loss percentage (default: 0.010 / 1.0%%)")
     parser.add_argument("--vol-threshold", type=float, default=float(os.getenv("STOCK_FUTURES_VOL_THRESHOLD", "1.5")), help="Volume breakout ratio vs 20-MA (default: 1.5)")
     parser.add_argument("--entry-cutoff", type=str, default=os.getenv("STOCK_FUTURES_ENTRY_CUTOFF", "13:00"), help="Entry cutoff time IST (default: 13:00)")
@@ -69,7 +69,7 @@ def main():
 
     logger.info("=" * 80)
     logger.info("  NIFTY 200 MOMENTUM 30 STOCK FUTURES DESK [%s MODE]", mode)
-    logger.info("  Lots Per Trade: %d | Target: %.1f%% | SL: %.1f%% | Vol Filter: %.1fx", args.lots, args.target_pct * 100, args.sl_pct * 100, args.vol_threshold)
+    logger.info("  Lots Per Trade: %d | Target: %.2f%% | SL: %.1f%% | Vol Filter: %.1fx", args.lots, args.target_pct * 100, args.sl_pct * 100, args.vol_threshold)
     logger.info("=" * 80)
 
     # Load credentials & clients

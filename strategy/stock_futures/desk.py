@@ -259,7 +259,7 @@ class StockFuturesDesk:
                             f"Qty: <b>{pos.quantity}</b> ({pos.lots} Lots)\n"
                             f"Entry Price: Rs {pos.entry_price:.2f}\n"
                             f"Stop Loss: Rs {pos.sl_price:.2f} (-{self.config.sl_pct*100:.1f}%)\n"
-                            f"Target: Rs {pos.target_price:.2f} (+{self.config.target_pct*100:.1f}%)\n"
+                            f"Target: Rs {pos.target_price:.2f} (+{self.config.target_pct*100:.2f}%)\n"
                             f"Trigger Time: <code>{signal.trigger_time}</code>"
                         )
                         self.notifier.send_message(msg)

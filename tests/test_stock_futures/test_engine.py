@@ -39,7 +39,7 @@ def test_engine_evaluates_long_breakout():
     assert signal.side == SignalType.LONG
     assert signal.entry_price == 105.0  # max(open 101.0, h1 105.0)
     assert signal.sl_price == round(105.0 * 0.99, 2)
-    assert signal.target_price == round(105.0 * 1.015, 2)
+    assert signal.target_price == round(105.0 * 1.0225, 2)
     assert signal.volume_ratio == 2.0
 
 
@@ -54,7 +54,7 @@ def test_engine_evaluates_short_breakout():
     assert signal.side == SignalType.SHORT
     assert signal.entry_price == 95.0  # min(open 99.0, l1 95.0)
     assert signal.sl_price == round(95.0 * 1.01, 2)
-    assert signal.target_price == round(95.0 * 0.985, 2)
+    assert signal.target_price == round(95.0 * (1.0 - 0.0225), 2)
 
 
 def test_engine_rejects_low_volume_breakout():

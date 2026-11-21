@@ -58,7 +58,7 @@ services:
       - STOCK_FUTURES_LOTS=${STOCK_FUTURES_LOTS:-2}
       - STOCK_FUTURES_ORDER_TYPE=${STOCK_FUTURES_ORDER_TYPE:-LIMIT}
       - STOCK_FUTURES_LIMIT_BUFFER_PCT=${STOCK_FUTURES_LIMIT_BUFFER_PCT:-0.05}
-      - STOCK_FUTURES_TARGET_PCT=${STOCK_FUTURES_TARGET_PCT:-0.015}
+      - STOCK_FUTURES_TARGET_PCT=${STOCK_FUTURES_TARGET_PCT:-0.0225}
       - STOCK_FUTURES_SL_PCT=${STOCK_FUTURES_SL_PCT:-0.010}
       - STOCK_FUTURES_VOL_THRESHOLD=${STOCK_FUTURES_VOL_THRESHOLD:-1.5}
       - STOCK_FUTURES_ENTRY_CUTOFF=${STOCK_FUTURES_ENTRY_CUTOFF:-13:00}
@@ -78,9 +78,9 @@ services:
     entrypoint: ["python", "scripts/run_stock_futures_desk.py"]
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Live Production (2 Lots, Marketable Limit Orders with 5% Freak-Trade Protection, 1.5% Target, 1.0% SL, 1.5x Vol Filter, 13:00 Cutoff, 15:00 EOD):
-    command: ["--live", "--lots", "2", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--target-pct", "0.015", "--sl-pct", "0.010", "--vol-threshold", "1.5", "--entry-cutoff", "13:00", "--loop"]
+    # 1. Live Production (2 Lots, Marketable Limit Orders with 5% Freak-Trade Protection, 2.25% Target, 1.0% SL, 1.5x Vol Filter, 13:00 Cutoff, 15:00 EOD):
+    command: ["--live", "--lots", "2", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--target-pct", "0.0225", "--sl-pct", "0.010", "--vol-threshold", "1.5", "--entry-cutoff", "13:00", "--loop"]
     #
     # 2. Paper Trading Simulation:
-    # command: ["--paper", "--lots", "2", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--target-pct", "0.015", "--sl-pct", "0.010", "--vol-threshold", "1.5", "--entry-cutoff", "13:00", "--loop"]
+    # command: ["--paper", "--lots", "2", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--target-pct", "0.0225", "--sl-pct", "0.010", "--vol-threshold", "1.5", "--entry-cutoff", "13:00", "--loop"]
     # -----------------------------------------------------------------------------------
