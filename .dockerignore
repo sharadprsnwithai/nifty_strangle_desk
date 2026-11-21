@@ -5,6 +5,9 @@
 data/*.parquet
 data/*.csv
 data/trades_today.json
+data/stock_futures_trades_today.json
+data/cache_15m_1y/
+data/historical_options/
 logs/*.log
 __pycache__
 *.pyc
