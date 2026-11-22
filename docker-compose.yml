@@ -144,11 +144,11 @@ services:
     entrypoint: ["python", "scripts/run_weekly_etf_desk.py"]
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Paper Trading Simulation (Default: Rs 10 Lakhs, 3 Slots, Friday 15:20 Scan + Monday 09:16 Rebalance):
-    command: ["--paper", "--capital", "1000000", "--slots", "3", "--loop"]
+    # 1. Live Production Execution (Active: Rs 10 Lakhs, 3 Slots, Friday 15:20 Scan + Monday 09:16 Rebalance):
+    command: ["--live", "--capital", "1000000", "--slots", "3", "--loop"]
     #
-    # 2. Live Production Execution:
-    # command: ["--live", "--capital", "1000000", "--slots", "3", "--loop"]
+    # 2. Paper Trading Simulation:
+    # command: ["--paper", "--capital", "1000000", "--slots", "3", "--loop"]
     # -----------------------------------------------------------------------------------
 
 

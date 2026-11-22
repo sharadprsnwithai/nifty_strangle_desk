@@ -1,3 +1,4 @@
+from unittest.mock import MagicMock
 import pytest
 import pandas as pd
 import numpy as np
@@ -46,3 +47,44 @@ def test_order_manager_paper_sizing():
     res_sell = om.execute_sell("NIFTYBEES", quantity=400, current_price=280.0)
     assert res_sell["status"] == "COMPLETE"
     assert res_sell["quantity"] == 400
+
+def test_order_manager_live_buy_fill_verification():
+    mock_kite = MagicMock()
+    mock_kite.place_order.return_value = "ORD_123"
+    mock_kite.order_history.return_value = [{
+        "status": "COMPLETE",
+        "filled_quantity": 350,
+        "average_price": 251.2,
+        "status_message": None
+    }]
+    
+    cfg = ETFSwingConfig(mode="LIVE")
+    om = ETFOrderManager(cfg, kite_client=mock_kite)
+    
+    res = om.execute_buy("NIFTYBEES", allocated_capital=100000.0, current_price=250.0)
+    assert res["status"] == "COMPLETE"
+    assert res["quantity"] == 350
+    assert res["price"] == 251.2
+    assert res["cost"] == 350 * 251.2
+
+def test_order_manager_live_sell_demat_quantity_adjustment():
+    mock_kite = MagicMock()
+    mock_kite.holdings.return_value = [
+        {"tradingsymbol": "NIFTYBEES", "quantity": 150, "t1_quantity": 50}  # total 200 available
+    ]
+    mock_kite.place_order.return_value = "ORD_SELL_123"
+    mock_kite.order_history.return_value = [{
+        "status": "COMPLETE",
+        "filled_quantity": 200,
+        "average_price": 280.0
+    }]
+    
+    cfg = ETFSwingConfig(mode="LIVE")
+    om = ETFOrderManager(cfg, kite_client=mock_kite)
+    
+    # State recorded 400, but Demat only has 200
+    res = om.execute_sell("NIFTYBEES", quantity=400, current_price=280.0)
+    assert res["status"] == "COMPLETE"
+    assert res["quantity"] == 200
+    mock_kite.place_order.assert_called_once()
+    assert mock_kite.place_order.call_args[1]["quantity"] == 200

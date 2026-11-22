@@ -97,9 +97,14 @@ class ETFSwingDesk:
             
             res = self.orders.execute_sell(symbol, qty, current_price)
             if res.get("status") == "COMPLETE":
-                proceeds = qty * current_price
-                pnl = proceeds - pos["cost"]
-                pnl_pct = (current_price / pos["entry_price"] - 1.0) * 100.0
+                sold_qty = res.get("quantity", qty)
+                sold_price = res.get("price", current_price)
+                proceeds = sold_qty * sold_price
+                
+                # Pro-rate cost basis if partially sold
+                cost_basis = pos["cost"] * (sold_qty / pos["quantity"]) if pos["quantity"] > 0 else pos["cost"]
+                pnl = proceeds - cost_basis
+                pnl_pct = (sold_price / pos["entry_price"] - 1.0) * 100.0 if pos["entry_price"] > 0 else 0.0
                 
                 self.state["cash"] += proceeds
                 trade_record = {
@@ -107,14 +112,22 @@ class ETFSwingDesk:
                     "entry_date": pos["entry_date"],
                     "entry_price": pos["entry_price"],
                     "exit_date": datetime.datetime.now().strftime("%Y-%m-%d"),
-                    "exit_price": current_price,
-                    "quantity": qty,
+                    "exit_price": sold_price,
+                    "quantity": sold_qty,
                     "pnl": round(pnl, 2),
                     "return_pct": round(pnl_pct, 2)
                 }
                 self.state["trade_history"].append(trade_record)
                 exited_trades.append(trade_record)
-                del self.state["positions"][symbol]
+                
+                if sold_qty >= pos["quantity"]:
+                    del self.state["positions"][symbol]
+                else:
+                    self.state["positions"][symbol]["quantity"] -= sold_qty
+                    self.state["positions"][symbol]["cost"] -= cost_basis
+                    logger.warning(
+                        f"Partial exit for {symbol}: sold {sold_qty}/{pos['quantity']}. Remaining {self.state['positions'][symbol]['quantity']} units retained in state."
+                    )
                 
         # 2. Process ENTRIES
         current_active = len(self.state["positions"])
@@ -139,11 +152,14 @@ class ETFSwingDesk:
                 if res.get("status") == "COMPLETE":
                     cost = res["cost"]
                     qty = res["quantity"]
+                    fill_price = res.get("price", ltp)
+                    if qty <= 0:
+                        continue
                     self.state["cash"] -= cost
                     self.state["positions"][sym] = {
                         "symbol": sym,
                         "quantity": qty,
-                        "entry_price": ltp,
+                        "entry_price": fill_price,
                         "cost": cost,
                         "entry_date": datetime.datetime.now().strftime("%Y-%m-%d"),
                         "pivot": cand["pivot"],
@@ -152,7 +168,7 @@ class ETFSwingDesk:
                     new_entries.append({
                         "symbol": sym,
                         "quantity": qty,
-                        "price": ltp,
+                        "price": fill_price,
                         "cost": cost
                     })
 
