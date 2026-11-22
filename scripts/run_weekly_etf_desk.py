@@ -41,9 +41,9 @@ def parse_args():
     mode_group.add_argument("--live", action="store_true", help="Execute real LIVE orders via Kite Connect")
     mode_group.add_argument("--paper", action="store_true", default=True, help="Run simulated PAPER trading (default)")
     
-    parser.add_argument("--capital", type=float, default=float(os.getenv("ETF_SWING_CAPITAL", "1000000.0")), 
+    parser.add_argument("--capital", type=float, default=1000000.0, 
                         help="Total capital allocated to ETF desk (default: Rs 10,00,000)")
-    parser.add_argument("--slots", type=int, default=int(os.getenv("ETF_SWING_MAX_SLOTS", "3")), 
+    parser.add_argument("--slots", type=int, default=3, 
                         help="Maximum concurrent ETF positions (default: 3)")
     parser.add_argument("--scan-only", "--scan", action="store_true", 
                         help="Only scan the universe, print pivot levels and signals without placing orders")

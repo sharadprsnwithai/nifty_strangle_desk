@@ -27,12 +27,12 @@ DEFAULT_ETF_UNIVERSE: Dict[str, ETFInfo] = {
 
 @dataclass
 class ETFSwingConfig:
-    # Capital and Allocation (Configured for Rs 10 Lakhs)
-    total_capital: float = float(os.getenv("ETF_SWING_CAPITAL", "1000000.0"))
-    max_slots: int = int(os.getenv("ETF_SWING_MAX_SLOTS", "3"))
+    # Capital and Allocation (Default: Rs 10 Lakhs)
+    total_capital: float = 1000000.0
+    max_slots: int = 3
     
     # Execution Mode: PAPER or LIVE
-    mode: str = os.getenv("ETF_SWING_MODE", "PAPER").upper()
+    mode: str = "PAPER"
     
     # Timing
     scan_time_friday: str = "15:20"      # Time to preview weekend rebalance

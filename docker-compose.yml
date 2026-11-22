@@ -131,9 +131,7 @@ services:
       - TZ=Asia/Kolkata
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - ETF_SWING_CAPITAL=${ETF_SWING_CAPITAL:-1000000.0}
-      - ETF_SWING_MAX_SLOTS=${ETF_SWING_MAX_SLOTS:-3}
-      - ETF_SWING_MODE=${ETF_SWING_MODE:-PAPER}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-5}
     logging:
       driver: "json-file"
       options:
@@ -146,11 +144,11 @@ services:
     entrypoint: ["python", "scripts/run_weekly_etf_desk.py"]
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Daemon loop (Continuous scheduling: Friday 15:20 scan + Monday 09:16 rebalance, Rs 10 Lakhs):
-    command: ["--loop", "--capital", "1000000", "--slots", "3"]
+    # 1. Paper Trading Simulation (Default: Rs 10 Lakhs, 3 Slots, Friday 15:20 Scan + Monday 09:16 Rebalance):
+    command: ["--paper", "--capital", "1000000", "--slots", "3", "--loop"]
     #
-    # 2. Live production execution (run on demand via Kite Connect):
-    # command: ["--live", "--rebalance", "--capital", "1000000", "--slots", "3"]
+    # 2. Live Production Execution:
+    # command: ["--live", "--capital", "1000000", "--slots", "3", "--loop"]
     # -----------------------------------------------------------------------------------
 
 
