@@ -99,3 +99,61 @@ def test_order_manager_paper_trade_lifecycle(tmp_path):
     om_new = StockFuturesOrderManager(mode="PAPER", config=cfg, state_file=state_file)
     assert len(om_new.trades_history) == 1
     assert om_new.trades_history[0]["symbol"] == "MCX"
+
+
+def test_order_manager_hard_concurrency_limit(tmp_path):
+    state_file = tmp_path / "concurrency_test_trades.json"
+    cfg = StockFuturesConfig(
+        lots_per_trade=2,
+        max_concurrent_positions=2,
+        state_file=state_file,
+    )
+    om = StockFuturesOrderManager(mode="PAPER", config=cfg, state_file=state_file)
+
+    def create_signal(sym, price):
+        return TradeSignal(
+            symbol=sym,
+            side=SignalType.LONG,
+            trigger_time="10:30",
+            entry_price=price,
+            sl_price=price * 0.99,
+            target_price=price * 1.0225,
+            volume_ratio=2.0,
+            c1_high=price,
+            c1_low=price * 0.98,
+        )
+
+    # 1st position: Should succeed
+    pos1 = om.enter_position(create_signal("ABB", 5000.0))
+    assert pos1 is not None
+    assert pos1.status == "OPEN"
+    assert len([p for p in om.positions.values() if p.status == "OPEN"]) == 1
+
+    # 2nd position: Should succeed (limit is 2)
+    pos2 = om.enter_position(create_signal("MCX", 2500.0))
+    assert pos2 is not None
+    assert pos2.status == "OPEN"
+    assert len([p for p in om.positions.values() if p.status == "OPEN"]) == 2
+
+    # 3rd position: Must be rejected by hard concurrency guard!
+    pos3 = om.enter_position(create_signal("BSE", 3000.0))
+    assert pos3 is None
+    assert len([p for p in om.positions.values() if p.status == "OPEN"]) == 2
+    assert "BSE" not in om.positions
+
+    # Close one position (ABB)
+    closed = om.exit_position("ABB", exit_price=5112.5, exit_reason="TARGET_HIT", exit_time="11:45")
+    assert closed is not None
+    assert len([p for p in om.positions.values() if p.status == "OPEN"]) == 1
+
+    # 3rd position (BSE) can now enter successfully!
+    pos3_retry = om.enter_position(create_signal("BSE", 3000.0))
+    assert pos3_retry is not None
+    assert pos3_retry.status == "OPEN"
+    assert len([p for p in om.positions.values() if p.status == "OPEN"]) == 2
+
+    # 4th position (IDEA): Must be rejected again as open positions = 2
+    pos4 = om.enter_position(create_signal("IDEA", 10.0))
+    assert pos4 is None
+    assert len([p for p in om.positions.values() if p.status == "OPEN"]) == 2
+

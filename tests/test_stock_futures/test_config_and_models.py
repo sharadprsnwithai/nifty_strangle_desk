@@ -10,6 +10,7 @@ from strategy.stock_futures.models import (
 
 def test_momentum_30_config(tmp_path):
     cfg = StockFuturesConfig(lots_per_trade=2, universe_file=tmp_path / "empty.json")
+    assert cfg.max_concurrent_positions == 2
     assert len(cfg.symbols) == 30
     assert "IDEA" in cfg.symbols
     assert "MCX" in cfg.symbols

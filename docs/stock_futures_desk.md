@@ -45,6 +45,7 @@ The system trades the top 30 highest-momentum constituents of the **Nifty 200 Mo
   - Long Stop: $\text{Entry} \times 0.990$
   - Short Stop: $\text{Entry} \times 1.010$
 - **Mandatory EOD Squareoff**: **15:00 IST** for any remaining intraday positions.
+- **Hard Concurrency Limit**: **Max 2 simultaneous open positions** (`max_concurrent_positions = 2`). Prevents margin exhaustion and caps peak margin requirement at ~₹16L–₹18L.
 - **Why No Trailing SL?**: Rigorous backtests proved that trailing stops to cost at 1.0% gain trigger a "breakeven trap," prematurely shaking out trades during normal retests that later hit the 2.25% target.
 
 ---
@@ -80,14 +81,14 @@ The system trades the top 30 highest-momentum constituents of the **Nifty 200 Mo
 ## 5. Usage Commands
 
 ```bash
-# Paper Trading Daemon (Default: 2 Lots, 2.25% Target, 1.0% SL)
-uv run python scripts/run_stock_futures_desk.py --paper --lots 2
+# Paper Trading Daemon (Default: 2 Lots, Max 2 Concurrent Positions, 2.25% Target, 1.0% SL)
+uv run python scripts/run_stock_futures_desk.py --paper --lots 2 --max-concurrent 2
 
 # Single Monitoring Pass
 uv run python scripts/run_stock_futures_desk.py --once
 
 # Live Production Trading via Kite Connect
-uv run python scripts/run_stock_futures_desk.py --live --lots 2 --order-type LIMIT --limit-buffer-pct 0.05 --target-pct 0.0225 --sl-pct 0.010
+uv run python scripts/run_stock_futures_desk.py --live --lots 2 --max-concurrent 2 --order-type LIMIT --limit-buffer-pct 0.05 --target-pct 0.0225 --sl-pct 0.010
 
 # Dynamic Universe Rehydration from NSE
 uv run python scripts/rehydrate_momentum_universe.py

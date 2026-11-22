@@ -237,7 +237,25 @@ class StockFuturesDesk:
             logger.info("Current time %s is past entry cutoff (%s). No new entries allowed.", now_time, self.config.entry_cutoff_time)
             return new_positions
 
+        # Pre-scan check: Skip scanning if already at max concurrent capacity
+        open_positions = [p for p in self.order_manager.positions.values() if p.status == "OPEN"]
+        if len(open_positions) >= self.config.max_concurrent_positions:
+            logger.info(
+                "Max concurrent positions reached (%d/%d). Skipping breakout scan.",
+                len(open_positions), self.config.max_concurrent_positions
+            )
+            return new_positions
+
         for symbol in self.config.symbols:
+            # Check hard concurrency limit during loop
+            open_positions = [p for p in self.order_manager.positions.values() if p.status == "OPEN"]
+            if len(open_positions) >= self.config.max_concurrent_positions:
+                logger.info(
+                    "Reached max concurrent positions limit (%d/%d). Stopping new entries.",
+                    len(open_positions), self.config.max_concurrent_positions
+                )
+                break
+
             # Skip if already in position
             if symbol in self.order_manager.positions and self.order_manager.positions[symbol].status == "OPEN":
                 continue

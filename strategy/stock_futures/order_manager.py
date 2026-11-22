@@ -94,6 +94,15 @@ class StockFuturesOrderManager:
             logger.info("Max daily trades reached for %s today. Skipping.", symbol)
             return None
 
+        # Hard concurrency limit (max concurrent positions)
+        open_positions = [p for p in self.positions.values() if p.status == "OPEN"]
+        if len(open_positions) >= self.config.max_concurrent_positions:
+            logger.warning(
+                "[CONCURRENCY LIMIT] Max concurrent positions limit reached (%d/%d). Rejecting entry for %s.",
+                len(open_positions), self.config.max_concurrent_positions, symbol
+            )
+            return None
+
         tradingsymbol = self.resolve_futures_symbol(symbol)
         quantity = self.config.get_unit_quantity(symbol)
         lots = self.config.lots_per_trade

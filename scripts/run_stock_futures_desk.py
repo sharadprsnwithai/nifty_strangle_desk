@@ -43,6 +43,7 @@ def parse_args():
     mode_group.add_argument("--live", action="store_true", help="Execute real LIVE orders via Kite Connect")
     mode_group.add_argument("--paper", action="store_true", help="Run simulated PAPER trading (default)")
     parser.add_argument("--lots", type=int, default=int(os.getenv("STOCK_FUTURES_LOTS", "2")), help="Number of lots per trade (default: 2)")
+    parser.add_argument("--max-concurrent", type=int, default=int(os.getenv("STOCK_FUTURES_MAX_CONCURRENT_POSITIONS", "2")), help="Maximum allowed simultaneous open positions (default: 2)")
     parser.add_argument("--order-type", choices=["LIMIT", "MARKET"], default=os.getenv("STOCK_FUTURES_ORDER_TYPE", "LIMIT"), help="Order execution type (LIMIT: marketable limit order, default: LIMIT)")
     parser.add_argument("--limit-buffer-pct", type=float, default=float(os.getenv("STOCK_FUTURES_LIMIT_BUFFER_PCT", "0.05")), help="Marketable limit price buffer percentage (default: 0.05 / 5%%)")
     parser.add_argument("--target-pct", type=float, default=float(os.getenv("STOCK_FUTURES_TARGET_PCT", "0.0225")), help="Profit target percentage (default: 0.0225 / 2.25%%)")
@@ -65,11 +66,17 @@ def parse_args():
 def main():
     args = parse_args()
     setup_logging(log_dir=args.log_dir, log_level=args.log_level, log_filename="stock_futures_desk.log")
-    mode = "LIVE" if args.live else "PAPER"
+    env_mode = os.getenv("STOCK_FUTURES_MODE", "PAPER").upper()
+    if args.live:
+        mode = "LIVE"
+    elif args.paper:
+        mode = "PAPER"
+    else:
+        mode = env_mode if env_mode in ("LIVE", "PAPER") else "PAPER"
 
     logger.info("=" * 80)
     logger.info("  NIFTY 200 MOMENTUM 30 STOCK FUTURES DESK [%s MODE]", mode)
-    logger.info("  Lots Per Trade: %d | Target: %.2f%% | SL: %.1f%% | Vol Filter: %.1fx", args.lots, args.target_pct * 100, args.sl_pct * 100, args.vol_threshold)
+    logger.info("  Lots Per Trade: %d | Max Concurrent: %d | Target: %.2f%% | SL: %.1f%% | Vol Filter: %.1fx", args.lots, args.max_concurrent, args.target_pct * 100, args.sl_pct * 100, args.vol_threshold)
     logger.info("=" * 80)
 
     # Load credentials & clients
@@ -98,6 +105,7 @@ def main():
 
     strategy_config = StockFuturesConfig(
         lots_per_trade=args.lots,
+        max_concurrent_positions=args.max_concurrent,
         order_type=args.order_type,
         limit_buffer_pct=args.limit_buffer_pct,
         target_pct=args.target_pct,

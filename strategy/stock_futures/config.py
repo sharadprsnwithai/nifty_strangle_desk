@@ -76,6 +76,7 @@ STOCK_NAME_MAPPING: Dict[str, str] = {
 class StockFuturesConfig:
     """Configuration for Nifty 200 Momentum 30 Stock Futures Trading Desk."""
     lots_per_trade: int = 2
+    max_concurrent_positions: int = 2  # Hard limit on simultaneous open futures positions
     target_pct: float = 0.0225      # +2.25% profit target (2.25:1 R:R)
     sl_pct: float = 0.010           # -1.0% hard stop loss
     vol_threshold: float = 1.5      # 1.5x of 20-period volume MA

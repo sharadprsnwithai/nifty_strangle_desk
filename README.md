@@ -56,6 +56,7 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
 - **Opening Range Base Formation**: Evaluates C1 (09:15–09:30 IST) range $[L_1, H_1]$ and confirms consolidation through C2–C5 (09:30–10:15 IST).
 - **Volume Breakout Engine**: Initiates Long ($> H_1$) or Short ($< L_1$) entries strictly at or after 10:30 IST when candle volume $> 1.5\times$ 20-MA.
 - **Optimized 2.25:1 R:R**: Rigorously backtested sweet-spot with **Fixed +2.25% Profit Target**, **1.0% Hard Stop Loss**, and mandatory 15:00 IST squareoff (+₹37.59 Lakhs on 2 lots, 1.67 profit factor, 13/13 green months).
+- **Hard Concurrency Limit (Max 2 Positions)**: Enforces `max_concurrent_positions = 2` to prevent margin exhaustion and protect capital allocation (~₹16L–₹18L margin ceiling).
 - **Freak-Trade Protection**: Places marketable `LIMIT` orders with 5% buffer rounded to NSE ₹0.05 ticks to prevent Zerodha RMS rejections.
 - Detailed specs: [docs/stock_futures_desk.md](file:///d:/code/sharads_intraday_option_selling_desk/docs/stock_futures_desk.md).
 
@@ -66,6 +67,17 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
 - **$\ge 20\%$ Panic Unwinding**: Compares live OI against persistent snapshots (`data/oi_snapshots/`) to detect institutional writer capitulation.
 - **Automated Paper Execution**: Auto-executes simulated ATM option buying, tracks 50% hard Stop Loss, 2x (100%) Target, and 2-Day max holding time exit.
 - Detailed specs: [docs/max_oi_option_buying.md](file:///d:/code/sharads_intraday_option_selling_desk/docs/max_oi_option_buying.md).
+
+### 4. Desk 4: Weekly Monthly-Fibonacci ETF Swing Trading Desk
+- **Low-Frequency Positional Momentum**: Tailored for working professionals with ~10–12 trades per year and ~3.5 months average holding period.
+- **Monthly Fibonacci Pivots**: Uses prior month's High, Low, and Close to calculate $P = (H+L+C)/3$ and $S1 = P - 0.382\times(H-L)$.
+- **Strict Weekly Closing Rule**:
+  - **Entry**: Weekly Friday close $> P$. Executed on Monday 09:16 AM open.
+  - **Exit / Stop Loss**: Weekly Friday close $< S1$. Executed on Monday 09:16 AM open. Eliminates mid-week intraday noise shakeouts.
+- **Configured Capital**: ₹10,00,000 divided across 3 concurrent ETF slots (₹3.33 Lakhs per ETF).
+- **Execution & Safeguards**: CNC Delivery equity product (zero leverage, zero margin calls) with marketable limit orders (0.5% cap) to protect against bid-ask slippage.
+- **Docker & Daemon Support**: Runs as a daemon scheduling Friday 15:20 IST preview scans and Monday 09:16 IST rebalances.
+- CLI runner: `python scripts/run_weekly_etf_desk.py --scan` or `--rebalance` or `--loop`.
 
 ### 4. Zero-Hit Off-Market Safety & Auth Core
 - **Zero Kite API Hits Off-Market**: All desks verify `is_market_open()` before hitting any Kite API endpoints. On weekends, holidays, and outside 09:15–15:30 IST, all background polling loops sleep automatically without touching broker infrastructure.
@@ -147,14 +159,14 @@ uv run python scripts/backtest_nifty_3y.py
 
 ### 3. Desk 2: Stock Futures Breakout Desk
 ```bash
-# Run Paper Trading daemon (2 Lots, 2.25% Target, 1.0% SL)
-uv run python scripts/run_stock_futures_desk.py --paper --lots 2
+# Run Paper Trading daemon (2 Lots, Max 2 Concurrent Positions, 2.25% Target, 1.0% SL)
+uv run python scripts/run_stock_futures_desk.py --paper --lots 2 --max-concurrent 2
 
 # Execute single scan pass
 uv run python scripts/run_stock_futures_desk.py --once
 
 # Run Live Production Desk
-uv run python scripts/run_stock_futures_desk.py --live --lots 2 --order-type LIMIT --target-pct 0.0225 --sl-pct 0.010
+uv run python scripts/run_stock_futures_desk.py --live --lots 2 --max-concurrent 2 --order-type LIMIT --target-pct 0.0225 --sl-pct 0.010
 
 # Dynamic Universe Rehydration from NSE India
 uv run python scripts/rehydrate_momentum_universe.py
