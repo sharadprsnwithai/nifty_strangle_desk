@@ -16,15 +16,15 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
                      |                                       |                                       |
     +---------------------------------+     +---------------------------------+     +---------------------------------+
     |             DESK 1              |     |             DESK 2              |     |             DESK 3              |
-    |      NIFTY Adaptive Strangle    |     |   Nifty 200 Momentum 30 Futures |     |   Put-Call Parity Max OI Buy    |
-    |        (Option Selling)         |     |       (Futures Breakout)        |     |        (Option Buying)          |
+    |      NIFTY Adaptive Strangle    |     |   Nifty 200 Momentum 30 Futures |     |   Weekly Fibonacci ETF Swing    |
+    |        (Option Selling)         |     |       (Futures Breakout)        |     |          (Cash Swing)           |
     +---------------------------------+     +---------------------------------+     +---------------------------------+
-    | • Dynamic 1.25x ATR Strikes     |     | • Top 30 Momentum Stock Futures |     | • Screens ~200 F&O Equities     |
-    | • 09:15-10:00 Morning Filter    |     | • 15m Opening Range (C1) [L1,H1]|     | • Post-15th Expiry Timing       |
-    | • Single-Leg Exit + Cost Trail  |     | • C2-C5 Base Vol Contraction    |     | • Within 2.0% of Max Call/Put OI|
-    | • 80% Decay Target / 10k Loss   |     | • 10:30 IST Breakout Scan       |     | • >=20% Panic Unwinding Filter  |
-    | • Mandatory 14:45 EOD Exit      |     | • 2.25% Target (2.25:1 R:R)     |     | • 50% Hard SL / 2x Profit Target|
-    | • Paper & Live Execution Modes  |     | • 1.0% Hard Stop / 15:00 Exit   |     | • 2-Day Max Holding Time Stop   |
+    | • Dynamic 1.25x ATR Strikes     |     | • Top 30 Momentum Stock Futures |     | • Nifty, Junior, Gold, Silver   |
+    | • 09:15-10:00 Morning Filter    |     | • 15m Opening Range (C1) [L1,H1]|     | • Monthly Fibonacci P & S1      |
+    | • Single-Leg Exit + Cost Trail  |     | • C2-C5 Base Vol Contraction    |     | • Friday Weekly Close Trigger   |
+    | • 80% Decay Target / 10k Loss   |     | • 10:30 IST Breakout Scan       |     | • Monday 09:16 AM Rebalance     |
+    | • Mandatory 14:45 EOD Exit      |     | • 2.25% Target (2.25:1 R:R)     |     | • CNC Delivery / Zero Leverage  |
+    | • Paper & Live Execution Modes  |     | • 1.0% Hard Stop / 15:00 Exit   |     | • Rs 10 Lakhs Portfolio Ballast |
     +---------------------------------+     +---------------------------------+     +---------------------------------+
                      |                                       |                                       |
                      +---------------------------------------+---------------------------------------+
@@ -60,16 +60,8 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
 - **Freak-Trade Protection**: Places marketable `LIMIT` orders with 5% buffer rounded to NSE ₹0.05 ticks to prevent Zerodha RMS rejections.
 - Detailed specs: [docs/stock_futures_desk.md](file:///d:/code/sharads_intraday_option_selling_desk/docs/stock_futures_desk.md).
 
-### 3. Desk 3: Saurabh Put-Call Parity Max OI Option Buying Desk
-- **Put-Call Parity Framework ($S + P = C$)**: Exploits institutional writer panic covering at key monthly expiry resistance and support strikes.
-- **Second Half Expiry Filter**: Operates exclusively post-15th of the month when gamma spikes and options face immediate expiry pressure.
-- **2.0% Max Strike Proximity**: Filters ~200 F&O stocks testing their highest Call OI or Put OI strikes.
-- **$\ge 20\%$ Panic Unwinding**: Compares live OI against persistent snapshots (`data/oi_snapshots/`) to detect institutional writer capitulation.
-- **Automated Paper Execution**: Auto-executes simulated ATM option buying, tracks 50% hard Stop Loss, 2x (100%) Target, and 2-Day max holding time exit.
-- Detailed specs: [docs/max_oi_option_buying.md](file:///d:/code/sharads_intraday_option_selling_desk/docs/max_oi_option_buying.md).
-
-### 4. Desk 4: Weekly Monthly-Fibonacci ETF Swing Trading Desk
-- **Low-Frequency Positional Momentum**: Tailored for working professionals with ~10–12 trades per year and ~3.5 months average holding period.
+### 3. Desk 3: Weekly Monthly-Fibonacci ETF Swing Trading Desk
+- **Low-Frequency Positional Momentum**: Tailored for capital preservation with ~10–12 trades per year and ~3.5 months average holding period.
 - **Monthly Fibonacci Pivots**: Uses prior month's High, Low, and Close to calculate $P = (H+L+C)/3$ and $S1 = P - 0.382\times(H-L)$.
 - **Strict Weekly Closing Rule**:
   - **Entry**: Weekly Friday close $> P$. Executed on Monday 09:16 AM open.
@@ -174,19 +166,16 @@ uv run python scripts/rehydrate_momentum_universe.py
 
 ---
 
-### 4. Desk 3: Max OI Option Buying Desk
+### 4. Desk 3: Weekly Monthly-Fibonacci ETF Swing Trading Desk
 ```bash
-# Execute immediate scan pass & print results table
-uv run python scripts/run_max_oi_scanner.py --now
+# Execute weekend preview scan (prints Fibonacci pivots & qualification status)
+uv run python scripts/run_weekly_etf_desk.py --scan
 
-# Run Continuous Market-Hours Daemon (Daily 09:30 IST Scan & Position Tracking)
-uv run python scripts/run_max_oi_scanner.py --loop --poll 60
+# Run Live Production daemon (Mon-Fri continuous scheduler)
+uv run python scripts/run_weekly_etf_desk.py --live --capital 1000000 --slots 3 --loop
 
-# Run in Alert-Only Mode (Without Paper Execution)
-uv run python scripts/run_max_oi_scanner.py --alert-only
-
-# Off-Market / Weekend Test Mode (Passes holiday override)
-uv run python scripts/run_max_oi_scanner.py --now --ignore-holidays --stocks RELIANCE,TATASTEEL
+# Execute immediate rebalance
+uv run python scripts/run_weekly_etf_desk.py --live --rebalance
 ```
 
 ---
@@ -196,9 +185,9 @@ uv run python scripts/run_max_oi_scanner.py --now --ignore-holidays --stocks REL
 The platform is fully containerized using Docker and Docker Compose with `Asia/Kolkata` timezone pre-configured.
 
 ### Multi-Desk `docker-compose.yml` Services:
-- `strangle-desk`: NIFTY Adaptive Short Strangle Desk.
-- `stock-futures-desk`: Nifty 200 Momentum 30 Stock Futures Desk.
-- `max-oi-scanner`: Max OI Option Buying Scanner & Paper Desk.
+- `strangle-desk`: NIFTY Adaptive Short Strangle Desk (Live 10 Lots).
+- `stock-futures-desk`: Nifty 200 Momentum 30 Stock Futures Desk (Live 2 Lots).
+- `etf-swing-desk`: Weekly Monthly-Fibonacci ETF Swing Desk (Live Rs 10 Lakhs).
 
 ```bash
 # Start all desks in the background
@@ -210,7 +199,7 @@ docker compose build
 # Stream logs for a specific desk
 docker compose logs -f stock-futures-desk
 docker compose logs -f strangle-desk
-docker compose logs -f max-oi-scanner
+docker compose logs -f etf-swing-desk
 
 # Stop all desks
 docker compose down
@@ -220,7 +209,7 @@ docker compose down
 
 ## Testing & Quality Assurance
 
-The codebase features comprehensive unit test coverage with **183 automated tests**:
+The codebase features comprehensive unit test coverage with **179 automated tests**:
 
 ```bash
 uv run pytest
@@ -230,7 +219,7 @@ uv run pytest
 - **Authentication**: Headless TOTP generation, token validation, inter-process lock acquisition.
 - **Market Hours**: NSE exchange calendar, weekends, pre-market, and holiday bypass guards.
 - **Stock Futures**: C1–C5 consolidation base rules, volume ratio breakouts, order manager execution, and target/SL calculations.
-- **Max OI Strategy**: Monthly expiry resolution, snapshot persistence, strike proximity, panic unwinding triggers, paper buy lifecycle, and 2-day holding time exit.
+- **ETF Swing Desk**: Monthly Fibonacci pivot calculations, weekly Friday close evaluation, Monday order rebalancing.
 - **Adaptive Strangle**: Daily ATR strike calculation, single-leg stop outs, cost trailing, and 14:45 cutoff rules.
 
 ---
@@ -256,22 +245,21 @@ uv run pytest
 │   │   ├── models.py
 │   │   ├── order_manager.py
 │   │   └── rehydrator.py
-│   └── max_oi/                    # Desk 3: Max OI Option Buying Engine
+│   └── etf_swing/                 # Desk 3: Weekly ETF Swing Engine & Scanner
 │       ├── config.py
 │       ├── desk.py
-│       ├── models.py
+│       ├── order_manager.py
 │       └── scanner.py
 ├── scripts/                       # Runners, backtesters, and utilities
 │   ├── run_stock_futures_desk.py
-│   ├── run_max_oi_scanner.py
+│   ├── run_weekly_etf_desk.py
 │   ├── rehydrate_momentum_universe.py
 │   └── backtest_nifty_3y.py
 ├── docs/                          # Detailed strategy documentation
-│   ├── stock_futures_desk.md
-│   └── max_oi_option_buying.md
-├── tests/                         # Pytest test suite (183 tests)
+│   └── stock_futures_desk.md
+├── tests/                         # Pytest test suite (179 tests)
 │   ├── test_stock_futures/
-│   ├── test_max_oi/
+│   ├── test_etf_swing.py
 │   └── ...
-└── data/                          # State JSON files, caches, and snapshots
+└── data/                          # State JSON files, caches, and universes
 ```
