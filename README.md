@@ -12,33 +12,33 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
                                       +---------------------------------------------+
                                                              ^
                                                              | (Zero-Hit Off-Market Guard)
-                     +---------------------------------------+---------------------------------------+
-                     |                                       |                                       |
-    +---------------------------------+     +---------------------------------+     +---------------------------------+
-    |             DESK 1              |     |             DESK 2              |     |             DESK 3              |
-    |      NIFTY Adaptive Strangle    |     |   Nifty 200 Momentum 30 Futures |     |   Weekly Fibonacci ETF Swing    |
-    |        (Option Selling)         |     |       (Futures Breakout)        |     |          (Cash Swing)           |
-    +---------------------------------+     +---------------------------------+     +---------------------------------+
-    | • Dynamic 1.25x ATR Strikes     |     | • Top 30 Momentum Stock Futures |     | • Nifty, Junior, Gold, Silver   |
-    | • 09:15-10:00 Morning Filter    |     | • 15m Opening Range (C1) [L1,H1]|     | • Monthly Fibonacci P & S1      |
-    | • Single-Leg Exit + Cost Trail  |     | • C2-C5 Base Vol Contraction    |     | • Friday Weekly Close Trigger   |
-    | • 80% Decay Target / 10k Loss   |     | • 10:30 IST Breakout Scan       |     | • Monday 09:16 AM Rebalance     |
-    | • Mandatory 14:45 EOD Exit      |     | • 2.25% Target (2.25:1 R:R)     |     | • CNC Delivery / Zero Leverage  |
-    | • Paper & Live Execution Modes  |     | • 1.0% Hard Stop / 15:00 Exit   |     | • Rs 10 Lakhs Portfolio Ballast |
-    +---------------------------------+     +---------------------------------+     +---------------------------------+
-                     |                                       |                                       |
-                     +---------------------------------------+---------------------------------------+
-                                                             |
-                                      +---------------------------------------------+
-                                      |         Shared Core Infrastructure          |
-                                      +---------------------------------------------+
-                                      | • Headless RFC 6238 TOTP 2FA Authentication |
-                                      | • Atomic Inter-Process Lock (Token Safety)  |
-                                      | • NSE Trading Holiday & Market Hours Guards |
-                                      | • Real-Time Rich HTML Telegram Notifier     |
-                                      | • State Persistence (Crash-Resilient JSON)  |
-                                      | • Full Pytest Test Suite (183/183 Passing)  |
-                                      +---------------------------------------------+
+     +--------------------------------------------+--------------------------------------------+
+     |                                            |                                            |
++---------------------------------+      +---------------------------------+      +---------------------------------+      +---------------------------------+
+|             DESK 1              |      |             DESK 2              |      |             DESK 3              |      |             DESK 4              |
+|      NIFTY Adaptive Strangle    |      |   Nifty 200 Momentum 30 Futures |      |   Weekly Fibonacci ETF Swing    |      |   MCX SILVERM Evening Strangle  |
+|        (Option Selling)         |      |       (Futures Breakout)        |      |          (Cash Swing)           |      |        (Commodity Strangle)     |
++---------------------------------+      +---------------------------------+      +---------------------------------+      +---------------------------------+
+| • Dynamic 1.25x ATR Strikes     |      | • Top 30 Momentum Stock Futures |      | • Nifty, Junior, Gold, Silver   |      | • MCX SILVERM (5kg Mini Lots)   |
+| • 09:15-10:00 Morning Filter    |      | • 15m Opening Range (C1) [L1,H1]|      | • Monthly Fibonacci P & S1      |      | • 1.5% OTM Post-US Open Strike  |
+| • Single-Leg Exit + Cost Trail  |      | • C2-C5 Base Vol Contraction    |      | • Friday Weekly Close Trigger   |      | • 20:00 Entry / 23:15 EOD Exit  |
+| • 80% Decay Target / 10k Loss   |      | • 10:30 IST Breakout Scan       |      | • Monday 09:16 AM Rebalance     |      | • Single-Leg 40% SL + Cost Trail|
+| • Mandatory 14:45 EOD Exit      |      | • 2.25% Target (2.25:1 R:R)     |      | • CNC Delivery / Zero Leverage  |      | • SL Dynamic from Number of Lots|
+| • Paper & Live Execution Modes  |      | • 1.0% Hard Stop / 15:00 Exit   |      | • Rs 10 Lakhs Portfolio Ballast |      | • 0 Overnight / Devolvement Risk|
++---------------------------------+      +---------------------------------+      +---------------------------------+      +---------------------------------+
+     |                                            |                                            |                                            |
+     +--------------------------------------------+--------------------------------------------+--------------------------------------------+
+                                                  |
+                           +---------------------------------------------+
+                           |         Shared Core Infrastructure          |
+                           +---------------------------------------------+
+                           | • Headless RFC 6238 TOTP 2FA Authentication |
+                           | • Atomic Inter-Process Lock (Token Safety)  |
+                           | • NSE & MCX Trading Holiday / Hours Guards  |
+                           | • Real-Time Rich HTML Telegram Notifier     |
+                           | • State Persistence (Crash-Resilient JSON)  |
+                           | • Full Pytest Test Suite (194/194 Passing)  |
+                           +---------------------------------------------+
 ```
 
 ---
@@ -71,7 +71,16 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
 - **Docker & Daemon Support**: Runs as a daemon scheduling Friday 15:20 IST preview scans and Monday 09:16 IST rebalances.
 - CLI runner: `python scripts/run_weekly_etf_desk.py --scan` or `--rebalance` or `--loop`.
 
-### 4. Zero-Hit Off-Market Safety & Auth Core
+### 4. Desk 4: MCX SILVERM US Post-Open IV Crush Evening Strangle Desk
+- **Instrument**: MCX SILVERM (Silver Mini, 5 kg lot size) options.
+- **US Session Timing**: Enters at **20:00 IST** after the initial US opening macro volatility subsides, capturing the steep evening Implied Volatility (IV) crush and Theta decay until **23:15 IST**.
+- **1.5% OTM Strike Selection**: Dynamically resolves active monthly futures spot and sells 1.5% OTM Call and Put strikes (rounded to nearest 500/1000 step).
+- **Single-Leg 40% SL & Cost Trailing**: Single-leg 40% stop loss. When one leg stops out or decays by $\ge 30\%$, the surviving leg's SL is automatically trailed to its entry price (cost).
+- **Dynamic Risk Cap**: Total portfolio maximum loss is calculated directly from the number of lots (`sl_per_lot * lots`, e.g., ₹3,000/lot × 2 lots = ₹6,000 risk cap).
+- **Zero Overnight & Devolvement Risk**: Mandatorily closes all positions at 23:15 IST every evening, completely avoiding overnight COMEX price gaps and the MCX physical delivery tender period.
+- **CLI Runner**: `python scripts/run_silver_desk.py --live --lots 2 --loop`
+
+### 5. Zero-Hit Off-Market Safety & Auth Core
 - **Zero Kite API Hits Off-Market**: All desks verify `is_market_open()` before hitting any Kite API endpoints. On weekends, holidays, and outside 09:15–15:30 IST, all background polling loops sleep automatically without touching broker infrastructure.
 - **Automated Headless TOTP**: Daily login via `pyotp` RFC 6238 without manual browser interaction. Proactive 08:00 AM IST token renewal.
 - **Atomic Inter-Process Lock**: Safe file-locking ensures concurrent desks do not conflict over TOTP logins or token files.
@@ -200,6 +209,7 @@ docker compose build
 docker compose logs -f stock-futures-desk
 docker compose logs -f strangle-desk
 docker compose logs -f etf-swing-desk
+docker compose logs -f silver-desk
 
 # Stop all desks
 docker compose down
@@ -209,7 +219,7 @@ docker compose down
 
 ## Testing & Quality Assurance
 
-The codebase features comprehensive unit test coverage with **179 automated tests**:
+The codebase features comprehensive unit test coverage with **194 automated tests**:
 
 ```bash
 uv run pytest
