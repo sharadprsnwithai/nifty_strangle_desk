@@ -36,14 +36,23 @@ class SilverStrangleDesk:
         self.position: Optional[SilverStranglePosition] = None
         self.load_state()
 
-    def load_state(self) -> Optional[SilverStranglePosition]:
+    def load_state(self, today_str: Optional[str] = None) -> Optional[SilverStranglePosition]:
         if not self.state_file.exists():
             self.position = None
             return None
         try:
             with open(self.state_file, "r") as f:
                 data = json.load(f)
-            self.position = SilverStranglePosition.from_dict(data)
+            pos = SilverStranglePosition.from_dict(data)
+            today = today_str or datetime.now().strftime("%Y-%m-%d")
+            if pos.trade_date != today:
+                logger.info(
+                    "State file contains prior date (%s != %s). Initializing fresh state for today.",
+                    pos.trade_date, today
+                )
+                self.position = None
+                return None
+            self.position = pos
             logger.info("Loaded existing Silver Strangle position for date: %s (Status: %s)", self.position.trade_date, self.position.status)
             return self.position
         except Exception as e:
@@ -367,21 +376,30 @@ class SilverStrangleDesk:
             except Exception as e:
                 logger.error("Failed to send Telegram session completion alert: %s", e)
 
-    def run_session(self, poll_interval: Optional[int] = None, execute_once: bool = False):
+    def run_session(self, poll_interval: Optional[int] = None, execute_once: bool = False, now: Optional[datetime] = None):
         """Runs the active evening trading session until completion."""
         poll_secs = poll_interval or self.config.poll_seconds
         logger.info("Starting Silver Strangle session execution loop (Poll: %ds)...", poll_secs)
 
-        now = datetime.now()
+        now = now or datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
         curr_time = now.strftime("%H:%M")
 
+        if self.position and self.position.trade_date != today_str:
+            logger.info("Clearing prior day position (%s != %s) before session start.", self.position.trade_date, today_str)
+            self.position = None
+
         # Enter if not yet entered
-        if curr_time >= self.config.entry_time and (not self.position or self.position.status != "CLOSED"):
+        if curr_time >= self.config.entry_time and (
+            not self.position or (self.position.trade_date == today_str and self.position.status != "CLOSED")
+        ):
             self.enter_strangle(now)
 
+        loop_now = now
         while True:
-            now = datetime.now()
-            is_active = self.monitor_cycle(now)
+            if not execute_once:
+                loop_now = datetime.now()
+            is_active = self.monitor_cycle(loop_now)
             if not is_active or execute_once:
                 break
             time.sleep(poll_secs)
@@ -404,6 +422,12 @@ class SilverStrangleDesk:
         while True:
             now = datetime.now()
             today = now.date()
+            today_str = now.strftime("%Y-%m-%d")
+
+            # 0. Daily Date Boundary Check: Clear prior day's state
+            if self.position and self.position.trade_date != today_str:
+                logger.info("Archiving state from prior date (%s != %s). Starting fresh session for today.", self.position.trade_date, today_str)
+                self.position = None
 
             # 1. Holiday & Weekend Check for MCX Evening Session
             is_holiday, reason = is_mcx_trading_holiday(today, session="EVENING")
@@ -416,20 +440,25 @@ class SilverStrangleDesk:
 
             # 2. Before 20:00 IST: Idle and wait
             if curr_time < self.config.entry_time:
-                # Sleep in 60s intervals until 20:00 IST
+                # Sleep in 30s intervals until 20:00 IST
                 time.sleep(30)
                 continue
 
             # 3. Active Window: 20:00 to 23:15 IST
             if self.config.entry_time <= curr_time <= self.config.exit_time:
-                if not self.position or self.position.status != "CLOSED":
+                if not self.position or (self.position.trade_date == today_str and self.position.status != "CLOSED"):
                     self.enter_strangle(now)
                     while True:
                         active = self.monitor_cycle()
                         if not active:
                             break
                         time.sleep(self.config.poll_seconds)
+                else:
+                    # Position already completed today, wait until post-market cutoff
+                    time.sleep(60)
+                    continue
 
-            # 4. Post 23:15 IST: Session closed, sleep until 08:00 AM next day
-            logger.info("MCX evening trading concluded for today (%s). Sleeping until tomorrow...", today)
-            time.sleep(3600)
+            # 4. Post 23:15 IST: Session closed, sleep until tomorrow
+            elif curr_time > self.config.exit_time:
+                logger.info("MCX evening trading concluded for today (%s). Sleeping until tomorrow...", today)
+                time.sleep(1800)

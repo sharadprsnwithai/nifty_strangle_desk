@@ -193,3 +193,57 @@ def test_desk_eod_square_off(temp_state_file):
     # Points captured: (400 - 250) + (400 - 220) = 150 + 180 = 330 pts -> Rs 3,300
     assert desk.position.total_points == 330.0
     assert desk.position.total_pnl == 3300.0
+
+
+def test_desk_clears_stale_position_from_previous_day(temp_state_file, mock_chain_data):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = mock_chain_data
+    mock_kite.quote.return_value = {
+        "MCX:SILVERM26NOVFUT": {"last_price": 155000.0},
+        "MCX:SILVERM26NOV157000CE": {"last_price": 400.0},
+        "MCX:SILVERM26NOV153000PE": {"last_price": 400.0},
+    }
+
+    config = SilverOptionsConfig(lots=2)
+    om = SilverOrderManager(mode="PAPER", config=config)
+
+    # Pre-populate state file with a CLOSED position from yesterday (2026-11-23)
+    yesterday_pos = {
+        "trade_date": "2026-11-23",
+        "underlying_spot": 155000.0,
+        "lots": 2,
+        "multiplier": 10.0,
+        "max_loss_cap": 6000.0,
+        "status": "CLOSED",
+        "created_at": "2026-11-23T20:00:00",
+        "closed_at": "2026-11-23T23:15:00",
+        "ce_leg": {
+            "symbol": "SILVERM26NOV157000CE", "strike": 157000.0, "option_type": "CE",
+            "entry_price": 400.0, "entry_time": "20:00:00", "stop_loss_price": 560.0,
+            "current_price": 200.0, "exit_price": 200.0, "status": "CLOSED"
+        },
+        "pe_leg": {
+            "symbol": "SILVERM26NOV153000PE", "strike": 153000.0, "option_type": "PE",
+            "entry_price": 400.0, "entry_time": "20:00:00", "stop_loss_price": 560.0,
+            "current_price": 200.0, "exit_price": 200.0, "status": "CLOSED"
+        }
+    }
+    import json
+    with open(temp_state_file, "w") as f:
+        json.dump(yesterday_pos, f)
+
+    # Initialize desk on a new day (2026-11-24)
+    desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
+    # Stale position from yesterday should NOT be active for today
+    assert desk.load_state(today_str="2026-11-24") is None
+    assert desk.position is None
+
+    # Now run session entry on new day (2026-11-24 20:00:00)
+    now = datetime(2026, 11, 24, 20, 0, 0)
+    desk.run_session(poll_interval=1, execute_once=True, now=now)
+
+    # Position should successfully be entered for 2026-11-24!
+    assert desk.position is not None
+    assert desk.position.trade_date == "2026-11-24"
+    assert desk.position.status == "OPEN"
+
