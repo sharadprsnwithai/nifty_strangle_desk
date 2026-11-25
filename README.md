@@ -14,20 +14,20 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
                                                              | (Zero-Hit Off-Market Guard)
      +--------------------------------------------+--------------------------------------------+
      |                                            |                                            |
-+---------------------------------+      +---------------------------------+      +---------------------------------+      +---------------------------------+
-|             DESK 1              |      |             DESK 2              |      |             DESK 3              |      |             DESK 4              |
-|      NIFTY Adaptive Strangle    |      |   Nifty 200 Momentum 30 Futures |      |   Weekly Fibonacci ETF Swing    |      |   MCX SILVERM Evening Strangle  |
-|        (Option Selling)         |      |       (Futures Breakout)        |      |          (Cash Swing)           |      |        (Commodity Strangle)     |
-+---------------------------------+      +---------------------------------+      +---------------------------------+      +---------------------------------+
-| • Dynamic 1.25x ATR Strikes     |      | • Top 30 Momentum Stock Futures |      | • Nifty, Junior, Gold, Silver   |      | • MCX SILVERM (5kg Mini Lots)   |
-| • 09:15-10:00 Morning Filter    |      | • 15m Opening Range (C1) [L1,H1]|      | • Monthly Fibonacci P & S1      |      | • 1.5% OTM Post-US Open Strike  |
-| • Single-Leg Exit + Cost Trail  |      | • C2-C5 Base Vol Contraction    |      | • Friday Weekly Close Trigger   |      | • 20:00 Entry / 23:15 EOD Exit  |
-| • 80% Decay Target / 10k Loss   |      | • 10:30 IST Breakout Scan       |      | • Monday 09:16 AM Rebalance     |      | • Single-Leg 40% SL + Cost Trail|
-| • Mandatory 14:45 EOD Exit      |      | • 2.25% Target (2.25:1 R:R)     |      | • CNC Delivery / Zero Leverage  |      | • SL Dynamic from Number of Lots|
-| • Paper & Live Execution Modes  |      | • 1.0% Hard Stop / 15:00 Exit   |      | • Rs 10 Lakhs Portfolio Ballast |      | • 0 Overnight / Devolvement Risk|
-+---------------------------------+      +---------------------------------+      +---------------------------------+      +---------------------------------+
-     |                                            |                                            |                                            |
-     +--------------------------------------------+--------------------------------------------+--------------------------------------------+
++---------------------------------+      +---------------------------------+      +---------------------------------+
+|             DESK 1              |      |             DESK 2              |      |             DESK 3              |
+|      NIFTY Adaptive Strangle    |      |   Weekly Fibonacci ETF Swing    |      |   MCX SILVERM Evening Strangle  |
+|        (Option Selling)         |      |          (Cash Swing)           |      |        (Commodity Strangle)     |
++---------------------------------+      +---------------------------------+      +---------------------------------+
+| • Dynamic 1.25x ATR Strikes     |      | • Nifty, Junior, Gold, Silver   |      | • MCX SILVERM (5kg Mini Lots)   |
+| • 09:15-10:00 Morning Filter    |      | • Monthly Fibonacci P & S1      |      | • 1.5% OTM Post-US Open Strike  |
+| • Single-Leg Exit + Cost Trail  |      | • Friday Weekly Close Trigger   |      | • 20:00 Entry / 23:15 EOD Exit  |
+| • 80% Decay Target / 10k Loss   |      | • Monday 09:16 AM Rebalance     |      | • Single-Leg 40% SL + Cost Trail|
+| • Mandatory 14:45 EOD Exit      |      | • CNC Delivery / Zero Leverage  |      | • SL Dynamic from Number of Lots|
+| • Paper & Live Execution Modes  |      | • Rs 10 Lakhs Portfolio Ballast |      | • 0 Overnight / Devolvement Risk|
++---------------------------------+      +---------------------------------+      +---------------------------------+
+     |                                            |                                            |
+     +--------------------------------------------+--------------------------------------------+
                                                   |
                            +---------------------------------------------+
                            |         Shared Core Infrastructure          |
@@ -51,16 +51,7 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
 - **Single-Leg Exit with Cost Trailing**: When a losing leg hits +50% SL or ₹10,000 loss, only the losing leg is squared off. The winning leg remains open and its stop-loss is immediately moved to breakeven (`cost`), allowing theta decay to cushion drawdowns.
 - **Circuit Breakers**: Combined portfolio ₹10,000 risk cap, 80% premium decay lock-in, and mandatory 14:45 IST cutoff exit.
 
-### 2. Desk 2: Nifty 200 Momentum 30 Stock Futures Desk
-- **Dynamic Universe Rehydration**: Automatically queries and syncs the top 30 constituents of the NSE Nifty 200 Momentum 30 Index directly from NSE India daily between 08:00 and 09:10 IST.
-- **Opening Range Base Formation**: Evaluates C1 (09:15–09:30 IST) range $[L_1, H_1]$ and confirms consolidation through C2–C5 (09:30–10:15 IST).
-- **Volume Breakout Engine**: Initiates Long ($> H_1$) or Short ($< L_1$) entries strictly at or after 10:30 IST when candle volume $> 1.5\times$ 20-MA.
-- **Optimized 2.25:1 R:R**: Rigorously backtested sweet-spot with **Fixed +2.25% Profit Target**, **1.0% Hard Stop Loss**, and mandatory 15:00 IST squareoff (+₹37.59 Lakhs on 2 lots, 1.67 profit factor, 13/13 green months).
-- **Hard Concurrency Limit (Max 2 Positions)**: Enforces `max_concurrent_positions = 2` to prevent margin exhaustion and protect capital allocation (~₹16L–₹18L margin ceiling).
-- **Freak-Trade Protection**: Places marketable `LIMIT` orders with 5% buffer rounded to NSE ₹0.05 ticks to prevent Zerodha RMS rejections.
-- Detailed specs: [docs/stock_futures_desk.md](file:///d:/code/sharads_intraday_option_selling_desk/docs/stock_futures_desk.md).
-
-### 3. Desk 3: Weekly Monthly-Fibonacci ETF Swing Trading Desk
+### 2. Desk 2: Weekly Monthly-Fibonacci ETF Swing Trading Desk
 - **Low-Frequency Positional Momentum**: Tailored for capital preservation with ~10–12 trades per year and ~3.5 months average holding period.
 - **Monthly Fibonacci Pivots**: Uses prior month's High, Low, and Close to calculate $P = (H+L+C)/3$ and $S1 = P - 0.382\times(H-L)$.
 - **Strict Weekly Closing Rule**:
@@ -71,7 +62,7 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
 - **Docker & Daemon Support**: Runs as a daemon scheduling Friday 15:20 IST preview scans and Monday 09:16 IST rebalances.
 - CLI runner: `python scripts/run_weekly_etf_desk.py --scan` or `--rebalance` or `--loop`.
 
-### 4. Desk 4: MCX SILVERM US Post-Open IV Crush Evening Strangle Desk
+### 3. Desk 3: MCX SILVERM US Post-Open IV Crush Evening Strangle Desk
 - **Instrument**: MCX SILVERM (Silver Mini, 5 kg lot size) options.
 - **US Session Timing**: Enters at **20:00 IST** after the initial US opening macro volatility subsides, capturing the steep evening Implied Volatility (IV) crush and Theta decay until **23:15 IST**.
 - **1.5% OTM Strike Selection**: Dynamically resolves active monthly futures spot and sells 1.5% OTM Call and Put strikes (rounded to nearest 500/1000 step).
@@ -158,24 +149,7 @@ uv run python scripts/backtest_nifty_3y.py
 
 ---
 
-### 3. Desk 2: Stock Futures Breakout Desk
-```bash
-# Run Paper Trading daemon (2 Lots, Max 2 Concurrent Positions, 2.25% Target, 1.0% SL)
-uv run python scripts/run_stock_futures_desk.py --paper --lots 2 --max-concurrent 2
-
-# Execute single scan pass
-uv run python scripts/run_stock_futures_desk.py --once
-
-# Run Live Production Desk
-uv run python scripts/run_stock_futures_desk.py --live --lots 2 --max-concurrent 2 --order-type LIMIT --target-pct 0.0225 --sl-pct 0.010
-
-# Dynamic Universe Rehydration from NSE India
-uv run python scripts/rehydrate_momentum_universe.py
-```
-
----
-
-### 4. Desk 3: Weekly Monthly-Fibonacci ETF Swing Trading Desk
+### 3. Desk 2: Weekly Monthly-Fibonacci ETF Swing Trading Desk
 ```bash
 # Execute weekend preview scan (prints Fibonacci pivots & qualification status)
 uv run python scripts/run_weekly_etf_desk.py --scan
@@ -195,8 +169,8 @@ The platform is fully containerized using Docker and Docker Compose with `Asia/K
 
 ### Multi-Desk `docker-compose.yml` Services:
 - `strangle-desk`: NIFTY Adaptive Short Strangle Desk (Live 10 Lots).
-- `stock-futures-desk`: Nifty 200 Momentum 30 Stock Futures Desk (Live 2 Lots).
 - `etf-swing-desk`: Weekly Monthly-Fibonacci ETF Swing Desk (Live Rs 10 Lakhs).
+- `silver-desk`: MCX SILVERM Evening Strangle Desk (Live 2 Lots).
 
 ```bash
 # Start all desks in the background
@@ -206,7 +180,6 @@ docker compose up -d
 docker compose build
 
 # Stream logs for a specific desk
-docker compose logs -f stock-futures-desk
 docker compose logs -f strangle-desk
 docker compose logs -f etf-swing-desk
 docker compose logs -f silver-desk
@@ -228,7 +201,6 @@ uv run pytest
 ### Coverage Highlights:
 - **Authentication**: Headless TOTP generation, token validation, inter-process lock acquisition.
 - **Market Hours**: NSE exchange calendar, weekends, pre-market, and holiday bypass guards.
-- **Stock Futures**: C1–C5 consolidation base rules, volume ratio breakouts, order manager execution, and target/SL calculations.
 - **ETF Swing Desk**: Monthly Fibonacci pivot calculations, weekly Friday close evaluation, Monday order rebalancing.
 - **Adaptive Strangle**: Daily ATR strike calculation, single-leg stop outs, cost trailing, and 14:45 cutoff rules.
 
@@ -248,27 +220,18 @@ uv run pytest
 ├── strategy/                      # Trading strategies & shared modules
 │   ├── holidays.py                # NSE calendar & zero-hit market hours guard
 │   ├── logger.py                  # Rotating file loggers
-│   ├── stock_futures/             # Desk 2: Stock Futures Engine & Models
+│   ├── etf_swing/                 # Weekly ETF Swing Engine & Scanner
 │   │   ├── config.py
 │   │   ├── desk.py
-│   │   ├── engine.py
-│   │   ├── models.py
 │   │   ├── order_manager.py
-│   │   └── rehydrator.py
-│   └── etf_swing/                 # Desk 3: Weekly ETF Swing Engine & Scanner
-│       ├── config.py
-│       ├── desk.py
-│       ├── order_manager.py
-│       └── scanner.py
+│   │   └── scanner.py
+│   └── silver_options/            # MCX SILVERM Evening Strangle Desk
 ├── scripts/                       # Runners, backtesters, and utilities
-│   ├── run_stock_futures_desk.py
+│   ├── run_silver_desk.py
 │   ├── run_weekly_etf_desk.py
-│   ├── rehydrate_momentum_universe.py
 │   └── backtest_nifty_3y.py
-├── docs/                          # Detailed strategy documentation
-│   └── stock_futures_desk.md
-├── tests/                         # Pytest test suite (179 tests)
-│   ├── test_stock_futures/
+├── tests/                         # Pytest test suite
+│   ├── test_silver_options/
 │   ├── test_etf_swing.py
 │   └── ...
 └── data/                          # State JSON files, caches, and universes
