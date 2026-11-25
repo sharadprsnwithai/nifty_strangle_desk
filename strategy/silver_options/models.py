@@ -46,16 +46,19 @@ class SilverStranglePosition:
     lots: int
     multiplier: float
     max_loss_cap: float
-    ce_leg: SilverStrangleLeg
-    pe_leg: SilverStrangleLeg
-    status: str = "OPEN"       # OPEN, PARTIAL, CLOSED
+    ce_leg: Optional[SilverStrangleLeg] = None
+    pe_leg: Optional[SilverStrangleLeg] = None
+    status: str = "OPEN"       # OPEN, PARTIAL, CLOSED, ABORTED
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     closed_at: Optional[str] = None
+    abort_reason: Optional[str] = None
 
     @property
     def total_points(self) -> float:
         """Combined points captured across both legs."""
-        return round(self.ce_leg.points_captured + self.pe_leg.points_captured, 2)
+        ce_pts = self.ce_leg.points_captured if self.ce_leg else 0.0
+        pe_pts = self.pe_leg.points_captured if self.pe_leg else 0.0
+        return round(ce_pts + pe_pts, 2)
 
     @property
     def total_pnl(self) -> float:
@@ -63,7 +66,9 @@ class SilverStranglePosition:
         return round(self.total_points * self.multiplier, 2)
 
     def is_fully_closed(self) -> bool:
-        return self.ce_leg.status != "OPEN" and self.pe_leg.status != "OPEN"
+        ce_closed = self.ce_leg is None or self.ce_leg.status != "OPEN"
+        pe_closed = self.pe_leg is None or self.pe_leg.status != "OPEN"
+        return ce_closed and pe_closed
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -75,27 +80,29 @@ class SilverStranglePosition:
             "status": self.status,
             "created_at": self.created_at,
             "closed_at": self.closed_at,
-            "ce_leg": self.ce_leg.to_dict(),
-            "pe_leg": self.pe_leg.to_dict(),
+            "abort_reason": self.abort_reason,
+            "ce_leg": self.ce_leg.to_dict() if self.ce_leg else None,
+            "pe_leg": self.pe_leg.to_dict() if self.pe_leg else None,
             "total_points": self.total_points,
             "total_pnl": self.total_pnl,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SilverStranglePosition":
-        ce_data = data["ce_leg"]
-        pe_data = data["pe_leg"]
+        ce_data = data.get("ce_leg")
+        pe_data = data.get("pe_leg")
         return cls(
             trade_date=data["trade_date"],
             underlying_spot=data["underlying_spot"],
             lots=data["lots"],
             multiplier=data["multiplier"],
             max_loss_cap=data.get("max_loss_cap", 6000.0),
-            ce_leg=SilverStrangleLeg.from_dict(ce_data),
-            pe_leg=SilverStrangleLeg.from_dict(pe_data),
+            ce_leg=SilverStrangleLeg.from_dict(ce_data) if ce_data else None,
+            pe_leg=SilverStrangleLeg.from_dict(pe_data) if pe_data else None,
             status=data.get("status", "OPEN"),
             created_at=data.get("created_at", datetime.now().isoformat()),
             closed_at=data.get("closed_at"),
+            abort_reason=data.get("abort_reason"),
         )
 
 

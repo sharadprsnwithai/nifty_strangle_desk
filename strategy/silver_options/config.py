@@ -25,6 +25,9 @@ class SilverOptionsConfig:
     strike_otm_pct: float = float(os.getenv("SILVER_STRIKE_OTM_PCT", "0.015"))
     strike_mode: str = os.getenv("SILVER_STRIKE_MODE", "PERCENT")  # PERCENT or ATR
     atr_multiplier: float = float(os.getenv("SILVER_ATR_MULTIPLIER", "1.5"))
+    min_option_oi: int = int(os.getenv("SILVER_MIN_OI", "100"))
+    max_bid_ask_spread_pct: float = float(os.getenv("SILVER_MAX_SPREAD_PCT", "0.03"))
+    strike_scan_steps: int = int(os.getenv("SILVER_STRIKE_SCAN_STEPS", "5"))
 
     # Execution Timing (IST)
     entry_time: str = os.getenv("SILVER_ENTRY_TIME", "20:00")
@@ -40,6 +43,7 @@ class SilverOptionsConfig:
     # Order execution settings
     order_type: str = os.getenv("SILVER_ORDER_TYPE", "LIMIT")
     limit_buffer_pct: float = float(os.getenv("SILVER_LIMIT_BUFFER_PCT", "0.05"))
+    max_limit_slippage_pct: float = float(os.getenv("SILVER_MAX_LIMIT_SLIPPAGE_PCT", "0.01"))
     product: str = os.getenv("SILVER_PRODUCT", "MIS")  # MIS for intraday margin
     order_timeout_seconds: int = int(os.getenv("SILVER_ORDER_TIMEOUT", "180"))
 

@@ -29,7 +29,10 @@ def parse_args():
     parser.add_argument("--sl-pct", type=float, default=float(os.getenv("SILVER_SL_PCT", "0.40")), help="Single-leg stop loss percentage (default: 0.40 / 40%%)")
     parser.add_argument("--strike-otm-pct", type=float, default=float(os.getenv("SILVER_STRIKE_OTM_PCT", "0.015")), help="OTM strike distance percentage from spot (default: 0.015 / 1.5%%)")
     parser.add_argument("--order-type", choices=["LIMIT", "MARKET"], default=os.getenv("SILVER_ORDER_TYPE", "LIMIT"), help="Order execution type (default: LIMIT)")
-    parser.add_argument("--limit-buffer-pct", type=float, default=float(os.getenv("SILVER_LIMIT_BUFFER_PCT", "0.05")), help="Marketable limit price buffer percentage (default: 0.05)")
+    parser.add_argument("--limit-buffer-pct", type=float, default=float(os.getenv("SILVER_LIMIT_BUFFER_PCT", "0.05")), help="Fallback limit price buffer percentage when depth unavailable (default: 0.05)")
+    parser.add_argument("--max-limit-slippage-pct", type=float, default=float(os.getenv("SILVER_MAX_LIMIT_SLIPPAGE_PCT", "0.01")), help="Tight bid/ask-anchored limit slippage percentage (default: 0.01 / 1%%)")
+    parser.add_argument("--min-oi", type=int, default=int(os.getenv("SILVER_MIN_OI", "100")), help="Minimum option OI required to select a strike (default: 100)")
+    parser.add_argument("--max-spread-pct", type=float, default=float(os.getenv("SILVER_MAX_SPREAD_PCT", "0.03")), help="Maximum allowed bid-ask spread pct (default: 0.03 / 3%%)")
     parser.add_argument("--entry-time", type=str, default=os.getenv("SILVER_ENTRY_TIME", "20:00"), help="Entry time in IST (default: 20:00)")
     parser.add_argument("--exit-time", type=str, default=os.getenv("SILVER_EXIT_TIME", "23:15"), help="Mandatory EOD exit time in IST (default: 23:15)")
     parser.add_argument("--poll", type=int, default=int(os.getenv("SILVER_POLL_SECONDS", "5")), help="Monitoring poll interval in seconds (default: 5)")
@@ -67,6 +70,9 @@ def main():
         strike_otm_pct=args.strike_otm_pct,
         order_type=args.order_type,
         limit_buffer_pct=args.limit_buffer_pct,
+        max_limit_slippage_pct=args.max_limit_slippage_pct,
+        min_option_oi=args.min_oi,
+        max_bid_ask_spread_pct=args.max_spread_pct,
         entry_time=args.entry_time,
         exit_time=args.exit_time,
         poll_seconds=args.poll,

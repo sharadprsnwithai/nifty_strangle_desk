@@ -40,14 +40,19 @@ class SilverOrderManager:
         order_type: str = "LIMIT",
         buffer_pct: float = 0.05,
         min_buffer_rs: float = 1.0,
+        best_bid: Optional[float] = None,
+        max_slippage_pct: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Sells an option leg on MCX (Strangle entry).
-        For LIMIT orders, places a marketable limit order below LTP to prevent freak fills.
+        For LIMIT orders, anchors to live best_bid (when available) with tight max_slippage_pct
+        to prevent thin-book slippage, falling back to price - buffer_pct otherwise.
         """
         order_type_norm = order_type.upper()
-        buffer = max(price * buffer_pct, min_buffer_rs)
-        limit_price = max(0.5, _round_to_mcx_tick(price - buffer, self.config.tick_size)) if order_type_norm == "LIMIT" else None
+        anchor_price = best_bid if (best_bid is not None and best_bid > 0) else price
+        effective_pct = max_slippage_pct if (best_bid is not None and best_bid > 0 and max_slippage_pct is not None) else buffer_pct
+        buffer = max(anchor_price * effective_pct, min_buffer_rs)
+        limit_price = max(0.5, _round_to_mcx_tick(anchor_price - buffer, self.config.tick_size)) if order_type_norm == "LIMIT" else None
 
         logger.info(
             "[%s] Executing MCX SELL (%s): %s x %d @ Rs %.2f%s",
@@ -134,8 +139,9 @@ class SilverOrderManager:
                         "status": "SUBMITTED",
                     }
                 except Exception as retry_err:
-                    logger.error("[LIVE] MCX SELL order retry failed: %s", retry_err)
+                    logger.error("[LIVE] MCX SELL order retry failed for %s: %s", symbol, retry_err)
                     raise retry_err
+            logger.error("[LIVE] MCX SELL order failed for %s: %s", symbol, e)
             raise e
 
     def buy(
@@ -146,14 +152,19 @@ class SilverOrderManager:
         order_type: str = "LIMIT",
         buffer_pct: float = 0.05,
         min_buffer_rs: float = 1.0,
+        best_ask: Optional[float] = None,
+        max_slippage_pct: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Buys back an option leg on MCX (Square-off on SL, Target, or EOD).
-        For LIMIT orders, places a marketable limit order above LTP to guarantee execution.
+        For LIMIT orders, anchors to live best_ask (when available) with tight max_slippage_pct
+        to guarantee execution without sweeping an empty book.
         """
         order_type_norm = order_type.upper()
-        buffer = max(price * buffer_pct, min_buffer_rs)
-        limit_price = max(0.5, _round_to_mcx_tick(price + buffer, self.config.tick_size)) if order_type_norm == "LIMIT" else None
+        anchor_price = best_ask if (best_ask is not None and best_ask > 0) else price
+        effective_pct = max_slippage_pct if (best_ask is not None and best_ask > 0 and max_slippage_pct is not None) else buffer_pct
+        buffer = max(anchor_price * effective_pct, min_buffer_rs)
+        limit_price = max(0.5, _round_to_mcx_tick(anchor_price + buffer, self.config.tick_size)) if order_type_norm == "LIMIT" else None
 
         logger.info(
             "[%s] Executing MCX BUY square-off (%s): %s x %d @ Rs %.2f%s",
@@ -240,6 +251,77 @@ class SilverOrderManager:
                         "status": "SUBMITTED",
                     }
                 except Exception as retry_err:
-                    logger.error("[LIVE] MCX BUY order retry failed: %s", retry_err)
+                    logger.error("[LIVE] MCX BUY order retry failed for %s: %s", symbol, retry_err)
                     raise retry_err
+            logger.error("[LIVE] MCX BUY order failed for %s: %s", symbol, e)
             raise e
+
+    def get_order_status(self, order_id: str) -> Dict[str, Any]:
+        """Retrieves real-time status of an MCX order."""
+        if self.mode == "PAPER":
+            order_info = self._paper_orders.get(order_id)
+            if order_info:
+                return {
+                    "order_id": order_id,
+                    "status": order_info.get("status", "COMPLETE"),
+                    "filled_quantity": int(order_info.get("filled_quantity", order_info.get("quantity", 0))),
+                    "pending_quantity": int(order_info.get("pending_quantity", 0)),
+                    "average_price": float(order_info.get("fill_price", 0.0)),
+                    "status_message": order_info.get("status_message"),
+                }
+            return {
+                "order_id": order_id,
+                "status": "COMPLETE",
+                "filled_quantity": 0,
+                "pending_quantity": 0,
+                "average_price": 0.0,
+                "status_message": None,
+            }
+
+        try:
+            history = self.kite.order_history(order_id)
+            if not history:
+                return {
+                    "order_id": order_id,
+                    "status": "UNKNOWN",
+                    "filled_quantity": 0,
+                    "pending_quantity": 0,
+                    "average_price": 0.0,
+                    "status_message": None,
+                }
+            latest = history[-1]
+            return {
+                "order_id": order_id,
+                "status": latest.get("status", "UNKNOWN"),
+                "filled_quantity": int(latest.get("filled_quantity") or 0),
+                "pending_quantity": int(latest.get("pending_quantity") or 0),
+                "average_price": float(latest.get("average_price") or 0.0),
+                "status_message": latest.get("status_message"),
+            }
+        except Exception as e:
+            logger.error("[LIVE] Error fetching MCX order status for %s: %s", order_id, e)
+            return {
+                "order_id": order_id,
+                "status": "ERROR",
+                "filled_quantity": 0,
+                "pending_quantity": 0,
+                "average_price": 0.0,
+                "status_message": str(e),
+            }
+
+    def cancel_order(self, order_id: str, variety: str = "regular") -> bool:
+        """Cancels an open or pending MCX order."""
+        logger.info("[%s] Cancelling MCX order: %s", self.mode, order_id)
+        if self.mode == "PAPER":
+            if order_id in self._paper_orders:
+                self._paper_orders[order_id]["status"] = "CANCELLED"
+                self._paper_orders[order_id]["pending_quantity"] = 0
+            return True
+
+        try:
+            self.kite.cancel_order(variety=variety, order_id=order_id)
+            logger.info("[LIVE] Cancel request sent for MCX order: %s", order_id)
+            return True
+        except Exception as e:
+            logger.error("[LIVE] Failed to cancel MCX order %s: %s", order_id, e)
+            return False

@@ -72,3 +72,32 @@ def test_order_manager_live_mcx_execution():
     assert call_kwargs["exchange"] == "MCX"
     assert call_kwargs["tradingsymbol"] == "SILVERM26NOV160000CE"
     assert call_kwargs["quantity"] == 2
+
+
+def test_order_manager_bid_ask_anchored_tight_limits():
+    config = SilverOptionsConfig(lots=2, limit_buffer_pct=0.05, max_limit_slippage_pct=0.01)
+    om = SilverOrderManager(mode="PAPER", config=config)
+
+    sell_ord = om.sell(
+        symbol="SILVERM26DEC140000CE",
+        quantity=2,
+        price=12000.0,
+        order_type="LIMIT",
+        buffer_pct=0.05,
+        best_bid=11900.0,
+        max_slippage_pct=0.01,
+    )
+    # Anchored to best_bid (11900 - 1% = 11781.0) instead of LTP - 5% (11400.0)
+    assert sell_ord["limit_price"] == 11781.0
+
+    buy_ord = om.buy(
+        symbol="SILVERM26DEC140000CE",
+        quantity=2,
+        price=12000.0,
+        order_type="LIMIT",
+        buffer_pct=0.05,
+        best_ask=12100.0,
+        max_slippage_pct=0.01,
+    )
+    # Anchored to best_ask (12100 + 1% = 12221.0) instead of LTP + 5% (12600.0)
+    assert buy_ord["limit_price"] == 12221.0
