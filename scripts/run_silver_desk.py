@@ -34,9 +34,14 @@ def parse_args():
     parser.add_argument("--min-oi", type=int, default=int(os.getenv("SILVER_MIN_OI", "100")), help="Minimum option OI required to select a strike (default: 100)")
     parser.add_argument("--max-spread-pct", type=float, default=float(os.getenv("SILVER_MAX_SPREAD_PCT", "0.03")), help="Maximum allowed bid-ask spread pct (default: 0.03 / 3%%)")
     parser.add_argument("--entry-time", type=str, default=os.getenv("SILVER_ENTRY_TIME", "20:00"), help="Entry time in IST (default: 20:00)")
-    parser.add_argument("--exit-time", type=str, default=os.getenv("SILVER_EXIT_TIME", "23:15"), help="Mandatory EOD exit time in IST (default: 23:15)")
+    parser.add_argument("--exit-time", type=str, default=os.getenv("SILVER_EXIT_TIME", "23:10"), help="Mandatory EOD exit time in IST (default: 23:10)")
     parser.add_argument("--poll", type=int, default=int(os.getenv("SILVER_POLL_SECONDS", "5")), help="Monitoring poll interval in seconds (default: 5)")
     parser.add_argument("--product", choices=["MIS", "NRML"], default=os.getenv("SILVER_PRODUCT", "MIS"), help="Product type (default: MIS)")
+    parser.add_argument("--target-decay-pct", type=float, default=float(os.getenv("SILVER_TARGET_DECAY_PCT", "0.70")), help="Target combined/surviving decay percentage (default: 0.70)")
+    parser.add_argument("--trail-activation-pct", type=float, default=float(os.getenv("SILVER_TRAIL_ACTIVATION_PCT", "0.30")), help="Decay pct on one leg to arm cost trailing on the other (default: 0.30)")
+    parser.add_argument("--no-trail-cost", dest="trail_to_cost", action="store_false", default=os.getenv("SILVER_TRAIL_COST", "true").lower() in ("true", "1", "yes"), help="Disable trailing surviving leg SL to cost")
+    parser.add_argument("--no-single-leg-exit", dest="single_leg_exit", action="store_false", default=os.getenv("SILVER_SINGLE_LEG_EXIT", "true").lower() in ("true", "1", "yes"), help="Disable single-leg SL (co-exits both legs together)")
+    parser.add_argument("--no-skip-0dte", dest="skip_0dte", action="store_false", default=os.getenv("SILVER_SKIP_0DTE", "true").lower() in ("true", "1", "yes"), help="Disable skipping 0-DTE option expiry day")
 
     parser.add_argument("--state-file", type=str, default=os.getenv("SILVER_STATE_FILE"), help="Custom path to state JSON file")
     parser.add_argument("--log-dir", type=str, default=os.getenv("LOG_DIR", "logs"), help="Directory for log files")
@@ -77,9 +82,16 @@ def main():
         exit_time=args.exit_time,
         poll_seconds=args.poll,
         product=args.product,
+        target_decay_pct=args.target_decay_pct,
+        trail_activation_decay_pct=args.trail_activation_pct,
+        trail_to_cost=args.trail_to_cost,
+        single_leg_exit=args.single_leg_exit,
+        skip_0dte=args.skip_0dte,
     )
     if args.state_file:
         config.state_file = args.state_file
+    elif mode == "PAPER" and not os.getenv("SILVER_STATE_FILE"):
+        config.state_file = "data/silver_paper_trades_today.json"
 
     logger.info("=" * 80)
     logger.info("  MCX SILVERM EVENING INTRADAY STRANGLE DESK [%s MODE]", mode)
@@ -97,11 +109,11 @@ def main():
     try:
         notifier = TelegramNotifier(bot_token=app_config.telegram_bot_token, chat_id=app_config.telegram_chat_id)
         if mode == "LIVE":
-            kite = get_kite_client(config=app_config, check_market_hours=False, ignore_holidays=args.ignore_holidays)
+            kite = get_kite_client(config=None, check_market_hours=False, ignore_holidays=args.ignore_holidays)
             logger.info("Connected to Zerodha Kite API for MCX Live Execution.")
         else:
             try:
-                kite = get_kite_client(config=app_config, check_market_hours=False, ignore_holidays=True)
+                kite = get_kite_client(config=None, check_market_hours=False, ignore_holidays=True)
             except Exception:
                 logger.info("Paper mode running without live Kite credentials.")
     except Exception as e:
@@ -125,6 +137,10 @@ def main():
             underlying=config.underlying,
             strike_otm_pct=config.strike_otm_pct,
             exchange=config.exchange,
+            min_oi=config.min_option_oi,
+            max_spread_pct=config.max_bid_ask_spread_pct,
+            scan_steps=config.strike_scan_steps,
+            skip_0dte=config.skip_0dte,
         )
         print("\n--- DRY RUN STRIKE SELECTION PREVIEW ---")
         for k, v in strikes.items():

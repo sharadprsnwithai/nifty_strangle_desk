@@ -198,3 +198,65 @@ def test_run_backtest_simulation_single_leg_exit():
     # PE remained active or exited at TIME_EXIT / DECAY_TARGET (not STRATEGY_MAX_LOSS_10K)
     assert trade["pe_reason"] in ("TIME_EXIT", "DECAY_TARGET")
 
+
+def test_calculate_daily_atr_has_no_same_day_lookahead():
+    from strategy.backtest import calculate_daily_atr
+    rows = [
+        {"timestamps": datetime(2026, 11, 2, 10, 0), "open": 24000.0, "high": 24100.0, "low": 23950.0, "close": 24050.0},
+        {"timestamps": datetime(2026, 11, 3, 10, 0), "open": 24050.0, "high": 24650.0, "low": 24050.0, "close": 24600.0},
+    ]
+    atr = calculate_daily_atr(pd.DataFrame(rows), period=14)
+    assert pd.isna(atr.iloc[0])
+    # Day 2 10:00 AM ATR must reflect Day 1 range (150.0), not Day 2 afternoon range (600.0)
+    assert pytest.approx(float(atr.iloc[1]), abs=1e-6) == 150.0
+
+
+def test_backtest_pending_cost_trail_uses_correct_favorable_extremum():
+    rows = []
+    t0 = datetime(2026, 11, 2, 9, 15)
+    for i in range(75):
+        t = t0 + timedelta(minutes=i * 5)
+        if i == 10:  # 10:05: PE hits 1.5x STOP_LOSS on bar_low=23900 (CE > 0.2x target) while close=24030 leaves CE underwater -> cost_trail_pending=True
+            rows.append({"timestamps": t, "open": 24000.0, "high": 24035.0, "low": 23900.0, "close": 24030.0})
+        elif i == 11:  # 10:10: bar_low=23980 dips CE < ce_entry (locks trail) while bar_high=24020 stays < 1.5x SL
+            rows.append({"timestamps": t, "open": 24015.0, "high": 24020.0, "low": 23980.0, "close": 23990.0})
+        elif i == 12:  # 10:15: spot rallies to 24035 -> triggers trailed CE SL at ce_entry (< 1.5x SL)
+            rows.append({"timestamps": t, "open": 24000.0, "high": 24035.0, "low": 23995.0, "close": 24030.0})
+        else:
+            rows.append({"timestamps": t, "open": 24000.0, "high": 24002.0, "low": 23998.0, "close": 24000.0})
+    res = run_backtest_simulation(
+        pd.DataFrame(rows),
+        lots=1,
+        lot_size=65,
+        strategy_max_loss=50000.0,
+        use_leg_sl=True,
+        trail_opposite_to_cost=True,
+    )
+    assert res["summary"]["total_days_traded"] == 1
+    trade = res["trades"][0]
+    assert trade["pe_reason"] == "STOP_LOSS"
+    assert trade["ce_reason"] == "STOP_LOSS"
+    assert trade["ce_exit"] == trade["ce_entry"]
+
+
+def test_silver_strangle_backtest_parity_and_0dte_roll():
+    from scripts.backtest_silver_strangle import get_monthly_expiry, run_strangle_backtest
+
+    # 2026-11-26 is monthly 0-DTE expiry in the helper -> skip_0dte=True must roll to Dec
+    assert get_monthly_expiry(date(2026, 11, 26), skip_0dte=True) == date(2026, 12, 26)
+    assert get_monthly_expiry(date(2026, 11, 26), skip_0dte=False) == date(2026, 11, 26)
+
+    # Simulate an evening session (20:00 -> 23:10) with sharp rally breaching Rs 6,000 portfolio max-loss cap
+    rows = []
+    base = datetime(2026, 11, 23, 20, 0)
+    for i in range(15):  # 20:00 .. 21:10
+        spot = 155000.0 if i == 0 else 155000.0 + (i * 400.0)
+        rows.append({"date": base + timedelta(minutes=i * 5), "open": spot, "high": spot + 50.0, "low": spot - 50.0, "close": spot, "volume": 500})
+    df = pd.DataFrame(rows)
+    res = run_strangle_backtest(df, lots=2, lot_size_kg=5, sl_per_lot=3000.0, exit_time_str="23:10")
+    assert len(res) == 1
+    row = res.iloc[0]
+    assert row["ce_reason"] in ("SL", "MAX_PORTFOLIO_LOSS")
+    assert row["costs_inr"] > 0
+    assert row["net_pnl_inr"] == round(row["gross_pnl_inr"] - row["costs_inr"], 2)
+

@@ -146,3 +146,76 @@ def test_find_silver_strangle_strikes_raises_when_no_liquid_strike_in_live():
             allow_fallback=False,
             min_oi=100,
         )
+
+
+def test_find_silver_strangle_strikes_aligns_future_and_skips_0dte():
+    from datetime import datetime, timedelta
+    today = datetime.now().date()
+    exp_0dte = today
+    exp_next = today + timedelta(days=28)
+    fut_expiring_soon = today + timedelta(days=3)
+    fut_aligned = today + timedelta(days=45)
+
+    mock_instruments = [
+        {"name": "SILVERM", "instrument_type": "FUT", "tradingsymbol": "SILVERM_SOONFUT", "expiry": fut_expiring_soon, "instrument_token": 1001},
+        {"name": "SILVERM", "instrument_type": "FUT", "tradingsymbol": "SILVERM_ALIGNEDFUT", "expiry": fut_aligned, "instrument_token": 1002},
+        {"name": "SILVERM", "instrument_type": "CE", "tradingsymbol": "SILVERM_0DTE_CE", "strike": 157000.0, "expiry": exp_0dte, "instrument_token": 2000},
+        {"name": "SILVERM", "instrument_type": "PE", "tradingsymbol": "SILVERM_0DTE_PE", "strike": 153000.0, "expiry": exp_0dte, "instrument_token": 3000},
+        {"name": "SILVERM", "instrument_type": "CE", "tradingsymbol": "SILVERM_NEXT_CE", "strike": 162000.0, "expiry": exp_next, "instrument_token": 2001},
+        {"name": "SILVERM", "instrument_type": "PE", "tradingsymbol": "SILVERM_NEXT_PE", "strike": 158000.0, "expiry": exp_next, "instrument_token": 3001},
+    ]
+
+    mock_kite = MagicMock()
+    mock_kite.quote.side_effect = [
+        {"MCX:SILVERM_ALIGNEDFUT": {"last_price": 160000.0}},
+        {
+            "MCX:SILVERM_NEXT_CE": {"last_price": 500.0, "oi": 200},
+            "MCX:SILVERM_NEXT_PE": {"last_price": 520.0, "oi": 220},
+        },
+    ]
+
+    res = find_silver_strangle_strikes(
+        kite=mock_kite,
+        underlying="SILVERM",
+        instruments=mock_instruments,
+        allow_fallback=False,
+        min_oi=100,
+    )
+    assert res["expiry"] == str(exp_next)
+    assert res["underlying_futures"] == "SILVERM_ALIGNEDFUT"
+    assert res["spot_price"] == 160000.0
+    assert res["ce_symbol"] == "SILVERM_NEXT_CE"
+    assert res["pe_symbol"] == "SILVERM_NEXT_PE"
+
+
+def test_find_silver_strangle_strikes_rejects_empty_depth_and_prefers_outer_otm():
+    expiry = date(2026, 11, 27)
+    mock_instruments = [
+        {"name": "SILVERM", "instrument_type": "FUT", "tradingsymbol": "SILVERM26NOVFUT", "expiry": expiry.isoformat(), "instrument_token": 1001},
+        {"name": "SILVERM", "instrument_type": "CE", "tradingsymbol": "SILVERM_INWARD_CE", "strike": 156000.0, "expiry": expiry.isoformat(), "instrument_token": 2000},
+        {"name": "SILVERM", "instrument_type": "CE", "tradingsymbol": "SILVERM_TARGET_CE", "strike": 157000.0, "expiry": expiry.isoformat(), "instrument_token": 2001},
+        {"name": "SILVERM", "instrument_type": "CE", "tradingsymbol": "SILVERM_OUTER_CE", "strike": 158000.0, "expiry": expiry.isoformat(), "instrument_token": 2002},
+        {"name": "SILVERM", "instrument_type": "PE", "tradingsymbol": "SILVERM_TARGET_PE", "strike": 153000.0, "expiry": expiry.isoformat(), "instrument_token": 3001},
+    ]
+    mock_kite = MagicMock()
+    mock_kite.quote.side_effect = [
+        {"MCX:SILVERM26NOVFUT": {"last_price": 155000.0}},
+        {
+            "MCX:SILVERM_INWARD_CE": {"last_price": 600.0, "oi": 500, "depth": {"buy": [{"price": 599.0}], "sell": [{"price": 601.0}]}},
+            # Target CE has empty depth (no bids!) -> must be rejected!
+            "MCX:SILVERM_TARGET_CE": {"last_price": 450.0, "oi": 200, "depth": {"buy": [], "sell": [{"price": 460.0}]}},
+            # Outer CE is healthy -> must be preferred over stepping inward!
+            "MCX:SILVERM_OUTER_CE": {"last_price": 380.0, "oi": 250, "depth": {"buy": [{"price": 379.0}], "sell": [{"price": 381.0}]}},
+            "MCX:SILVERM_TARGET_PE": {"last_price": 470.0, "oi": 250, "depth": {"buy": [{"price": 469.0}], "sell": [{"price": 471.0}]}},
+        },
+    ]
+    res = find_silver_strangle_strikes(
+        kite=mock_kite,
+        underlying="SILVERM",
+        strike_otm_pct=0.015,
+        instruments=mock_instruments,
+        allow_fallback=False,
+        min_oi=100,
+    )
+    assert res["ce_symbol"] == "SILVERM_OUTER_CE"
+    assert res["pe_symbol"] == "SILVERM_TARGET_PE"

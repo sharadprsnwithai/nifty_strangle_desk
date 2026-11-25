@@ -229,3 +229,48 @@ def test_order_manager_invalid_product():
     with pytest.raises(ValueError, match="Invalid product type"):
         OrderManager(mode="PAPER", product="INVALID")
 
+
+def test_order_manager_splits_nifty_freeze_limit_orders():
+    mock_kite = MagicMock()
+    mock_kite.place_order.side_effect = ["ORD_SLICE_1", "ORD_SLICE_2"]
+    mock_kite.order_history.side_effect = [
+        [{"order_id": "ORD_SLICE_1", "status": "COMPLETE", "filled_quantity": 1755, "pending_quantity": 0, "average_price": 30.0}],
+        [{"order_id": "ORD_SLICE_2", "status": "COMPLETE", "filled_quantity": 195, "pending_quantity": 0, "average_price": 32.0}],
+    ]
+
+    om = OrderManager(mode="LIVE", kite=mock_kite)
+    res = om.sell("NIFTY26NOV24200CE", 1950, 30.5, order_type="MARKET")
+    assert mock_kite.place_order.call_count == 2
+    assert mock_kite.place_order.call_args_list[0].kwargs["quantity"] == 1755
+    assert mock_kite.place_order.call_args_list[1].kwargs["quantity"] == 195
+    assert res["order_id"] == "ORD_SLICE_1"
+    assert res["order_ids"] == ["ORD_SLICE_1", "ORD_SLICE_2"]
+
+    agg = om.get_order_status("ORD_SLICE_1")
+    assert agg["status"] == "COMPLETE"
+    assert agg["filled_quantity"] == 1950
+    assert agg["pending_quantity"] == 0
+    assert agg["average_price"] == 30.2
+
+    assert om.cancel_order("ORD_SLICE_1") is True
+    assert mock_kite.cancel_order.call_count == 2
+
+
+def test_order_manager_freeze_slice_failure_rolls_back_first_slice():
+    mock_kite = MagicMock()
+    mock_kite.place_order.side_effect = ["ORD_SLICE_1", RuntimeError("RMS margin exceeded"), "ORD_ROLLBACK"]
+    mock_kite.order_history.return_value = [
+        {"order_id": "ORD_SLICE_1", "status": "COMPLETE", "filled_quantity": 1755, "pending_quantity": 0, "average_price": 30.0}
+    ]
+
+    om = OrderManager(mode="LIVE", kite=mock_kite)
+    with pytest.raises(RuntimeError, match="RMS margin exceeded"):
+        om.sell("NIFTY26NOV24200CE", 1950, 30.5, order_type="MARKET")
+
+    mock_kite.cancel_order.assert_called_once_with(variety="regular", order_id="ORD_SLICE_1")
+    # Verify rollback MARKET buy_to_cover executed for the filled 1755 qty
+    assert mock_kite.place_order.call_count == 3
+    rollback_kwargs = mock_kite.place_order.call_args_list[2].kwargs
+    assert rollback_kwargs["transaction_type"] == mock_kite.TRANSACTION_TYPE_BUY
+    assert rollback_kwargs["quantity"] == 1755
+

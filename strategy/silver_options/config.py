@@ -8,10 +8,14 @@ class SilverOptionsConfig:
     """Configuration for MCX SILVERM Evening Intraday Strangle Desk."""
 
     # Underlying and Contract Specifications
-    underlying: str = "SILVERM"
+    underlying: str = os.getenv("SILVER_UNDERLYING", "SILVERM")
     exchange: str = "MCX"
-    lot_size_kg: int = 5         # 1 lot of SILVERM = 5 kg
+    lot_size_kg: int = int(os.getenv("SILVER_LOT_SIZE_KG", "5"))  # 1 lot of SILVERM = 5 kg (SILVER = 30 kg)
     tick_size: float = 0.5       # MCX Silver option tick size is 0.50
+
+    def __post_init__(self):
+        if self.underlying.upper() == "SILVER" and self.lot_size_kg == 5 and "SILVER_LOT_SIZE_KG" not in os.environ:
+            self.lot_size_kg = 30
 
     # Trade Sizing & Risk Management
     # Lot size is fully configurable via CLI / environment
@@ -31,8 +35,9 @@ class SilverOptionsConfig:
 
     # Execution Timing (IST)
     entry_time: str = os.getenv("SILVER_ENTRY_TIME", "20:00")
-    exit_time: str = os.getenv("SILVER_EXIT_TIME", "23:15")
+    exit_time: str = os.getenv("SILVER_EXIT_TIME", "23:10")
     poll_seconds: int = int(os.getenv("SILVER_POLL_SECONDS", "5"))
+    skip_0dte: bool = os.getenv("SILVER_SKIP_0DTE", "true").lower() in ("true", "1", "yes")
 
     # Protective features
     single_leg_exit: bool = os.getenv("SILVER_SINGLE_LEG_EXIT", "true").lower() in ("true", "1", "yes")

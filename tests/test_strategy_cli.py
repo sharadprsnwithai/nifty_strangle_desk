@@ -662,10 +662,12 @@ def test_strangle_desk_run_session_order_timeout_zero_fill_aborts(tmp_path):
         {"order_id": "ORD_CE_1", "status": "SUBMITTED"},
         {"order_id": "ORD_PE_1", "status": "SUBMITTED"}
     ]
-    # Simulate both orders still OPEN with 0 filled after timeout
+    # Simulate both orders still OPEN with 0 filled after timeout, then CANCELLED post-cancel
     om.get_order_status.side_effect = [
         {"order_id": "ORD_CE_1", "status": "OPEN", "filled_quantity": 0, "pending_quantity": 65, "average_price": 0.0},
-        {"order_id": "ORD_PE_1", "status": "OPEN", "filled_quantity": 0, "pending_quantity": 65, "average_price": 0.0}
+        {"order_id": "ORD_PE_1", "status": "OPEN", "filled_quantity": 0, "pending_quantity": 65, "average_price": 0.0},
+        {"order_id": "ORD_CE_1", "status": "CANCELLED", "filled_quantity": 0, "pending_quantity": 0, "average_price": 0.0},
+        {"order_id": "ORD_PE_1", "status": "CANCELLED", "filled_quantity": 0, "pending_quantity": 0, "average_price": 0.0},
     ]
 
     desk = StrangleDesk(order_manager=om, state_file=state_file)
@@ -700,10 +702,11 @@ def test_strangle_desk_run_session_partial_fill_aborts_and_squares_off(tmp_path)
         {"order_id": "ORD_CE_2", "status": "SUBMITTED"},
         {"order_id": "ORD_PE_2", "status": "SUBMITTED"}
     ]
-    # CE was completely filled (650 shares), PE only partially filled (130 shares)
+    # CE was completely filled (650 shares), PE only partially filled (130 shares), then CANCELLED post-cancel
     om.get_order_status.side_effect = [
         {"order_id": "ORD_CE_2", "status": "COMPLETE", "filled_quantity": 650, "pending_quantity": 0, "average_price": 32.0},
-        {"order_id": "ORD_PE_2", "status": "OPEN", "filled_quantity": 130, "pending_quantity": 520, "average_price": 31.0}
+        {"order_id": "ORD_PE_2", "status": "OPEN", "filled_quantity": 130, "pending_quantity": 520, "average_price": 31.0},
+        {"order_id": "ORD_PE_2", "status": "CANCELLED", "filled_quantity": 130, "pending_quantity": 0, "average_price": 31.0},
     ]
 
     desk = StrangleDesk(order_manager=om, state_file=state_file)
@@ -1381,6 +1384,252 @@ def test_strangle_desk_concurrent_entry_order_placement(tmp_path):
     assert len(threads_seen) == 2
     # Verify that the two calls started within 20ms of each other (parallel dispatch)
     assert abs(call_times[0] - call_times[1]) < 0.04
+
+
+def test_safe_exit_leg_tracks_partial_fills_and_escalates(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    mock_om = MagicMock()
+    mock_om.mode = "LIVE"
+    desk = StrangleDesk(order_manager=mock_om, state_file=state_file)
+    state = {
+        "date": "2026-11-26",
+        "status": "OPEN",
+        "ce": {"symbol": "NIFTY26NOV24300CE", "status": "OPEN", "entry_price": 30.0},
+        "pe": {"symbol": "NIFTY26NOV23800PE", "status": "OPEN", "entry_price": 30.0},
+    }
+
+    # Poll 1: 325/650 filled on LIMIT timeout -> stays OPEN with exit_filled_qty=325
+    mock_om.buy_to_cover.return_value = {"order_id": "ORD_PART_1", "status": "SUBMITTED"}
+    with patch.object(desk, "wait_for_order_completion") as mock_wait:
+        mock_wait.side_effect = [
+            {"status": "OPEN", "filled_quantity": 325, "pending_quantity": 325},
+            {"status": "CANCELLED", "filled_quantity": 325, "average_price": 46.0},
+        ]
+        ok = desk._safe_exit_leg("ce", "NIFTY26NOV24300CE", 650, 46.0, "STOP_LOSS", "LIMIT", 0.05, state)
+        assert ok is False
+        assert state["ce"]["status"] == "OPEN"
+        assert state["ce"]["exit_filled_qty"] == 325
+
+    # Poll 2: retries ONLY remaining 325 (never 650!) and escalates to MARKET if LIMIT times out
+    mock_om.buy_to_cover.reset_mock()
+    mock_om.buy_to_cover.side_effect = [
+        {"order_id": "ORD_PART_2", "status": "SUBMITTED"},
+        {"order_id": "ORD_MKT_3", "status": "SUBMITTED"},
+    ]
+    with patch.object(desk, "wait_for_order_completion") as mock_wait:
+        mock_wait.side_effect = [
+            {"status": "OPEN", "filled_quantity": 0, "pending_quantity": 325},
+            {"status": "CANCELLED", "filled_quantity": 0},
+            {"status": "COMPLETE", "filled_quantity": 325, "average_price": 48.0},
+        ]
+        ok = desk._safe_exit_leg("ce", "NIFTY26NOV24300CE", 650, 47.0, "STOP_LOSS", "LIMIT", 0.05, state, escalate_to_market=True)
+        assert ok is True
+        assert state["ce"]["status"] == "CLOSED"
+        assert state["ce"]["exit_filled_qty"] == 650
+        assert state["ce"]["exit_price"] == 47.0  # weighted (46 + 48) / 2
+        assert mock_om.buy_to_cover.call_args_list[0].args[1] == 325
+        assert mock_om.buy_to_cover.call_args_list[1].args[1] == 325
+        assert mock_om.buy_to_cover.call_args_list[1].kwargs["order_type"] == "MARKET"
+
+
+def test_morning_login_with_existing_kite_preserves_peer_session():
+    om = MagicMock()
+    desk = StrangleDesk(order_manager=om)
+    existing_kite = MagicMock()
+    existing_kite.profile.return_value = {"user_name": "Trader", "user_id": "TC4648"}
+
+    with patch("kite.client.get_kite_client") as mock_force, \
+         patch.object(desk, "_ensure_kite_session", return_value=existing_kite):
+        res = desk.perform_daily_morning_login(kite=existing_kite)
+        assert res is existing_kite
+        mock_force.assert_not_called()
+
+
+def test_10k_exit_underwater_surviving_leg_no_same_tick_cascade(tmp_path):
+    state_file = tmp_path / "trades_today.json"
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    state = {
+        "date": today_str,
+        "status": "OPEN",
+        "quantity": 650,
+        "ce": {"symbol": "NIFTY26N24300CE", "entry_price": 30.0, "sl_price": 45.0, "target_price": 6.0, "status": "OPEN"},
+        "pe": {"symbol": "NIFTY26N23800PE", "entry_price": 30.0, "sl_price": 45.0, "target_price": 6.0, "status": "OPEN"},
+    }
+    om = MagicMock()
+    om.mode = "PAPER"
+    om.buy_to_cover.return_value = {"order_id": "P_1", "status": "COMPLETE"}
+    desk = StrangleDesk(order_manager=om, state_file=state_file)
+    desk.save_state(state)
+
+    # Combined loss: CE -6,500 (ltp 40), PE -4,225 (ltp 36.5 > 30 entry) = -10,725 >= 10k!
+    mock_kite = MagicMock()
+    mock_kite.positions.return_value = {"net": []}
+    mock_kite.ltp.return_value = {
+        "NFO:NIFTY26N24300CE": {"last_price": 40.0},
+        "NFO:NIFTY26N23800PE": {"last_price": 36.5},
+    }
+    with patch.object(desk, "_ensure_kite_session", return_value=mock_kite):
+        res = desk.run_session(lots=10, kite=mock_kite, strategy_max_loss=10000.0, use_leg_sl=True, trail_to_cost=True, execute_once=True, ignore_holidays=True)
+
+    assert res["ce"]["status"] == "CLOSED"
+    assert res["ce"]["exit_reason"] == "SINGLE_LEG_10K_EXIT"
+    # Surviving PE leg MUST remain OPEN (NOT cascaded out in the same tick!) with cost trail pending
+    assert res["pe"]["status"] == "OPEN"
+    assert res["pe"]["cost_trail_pending"] is True
+    assert res["pe"]["sl_price"] == 45.0
+
+
+def test_run_scheduler_entry_window_handles_hour_rollover(tmp_path):
+    om = MagicMock()
+    om.mode = "PAPER"
+    desk = StrangleDesk(order_manager=om, state_file=tmp_path / "t.json")
+    mock_kite = MagicMock()
+    fake_now = datetime(2026, 11, 2, 10, 58, 0)
+    with patch("strategy.strangle_desk.datetime") as mock_dt, \
+         patch.object(desk, "perform_daily_morning_login", return_value=mock_kite), \
+         patch.object(desk, "run_session", return_value={"status": "COMPLETED"}) as mock_sess, \
+         patch("strategy.strangle_desk.time.sleep"):
+        mock_dt.now.return_value = fake_now
+        desk.run_scheduler(lots=1, kite=mock_kite, entry_time_str="10:56", exit_time_str="14:15", idle_sleep_seconds=1, max_iterations=1)
+        mock_sess.assert_called_once()
+        assert mock_sess.call_args.kwargs["exit_time_str"] == "14:15"
+
+
+def test_run_strategy_cli_exit_time_flag():
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client") as mock_kite_fn, \
+         patch("run_strategy.StrangleDesk") as mock_desk_cls:
+        mock_kite_fn.return_value = MagicMock()
+        mock_desk = MagicMock()
+        mock_desk_cls.return_value = mock_desk
+        exit_code = run_strategy_cli(["--paper", "--exit-time", "15:00", "--once"])
+        assert exit_code == 0
+        assert mock_desk.run_session.call_args.kwargs["exit_time_str"] == "15:00"
+
+
+def test_safe_exit_leg_partial_fill_on_cancelled_avoids_double_buy(tmp_path):
+    om = MagicMock()
+    om.mode = "LIVE"
+    om.product = "MIS"
+    om.buy_to_cover.side_effect = [
+        {"order_id": "ORD_LIM_1", "status": "SUBMITTED"},
+        {"order_id": "ORD_MKT_2", "status": "SUBMITTED"},
+    ]
+    desk = StrangleDesk(order_manager=om, state_file=tmp_path / "state.json")
+    state = {
+        "date": "2026-11-26",
+        "status": "OPEN",
+        "ce": {"symbol": "NIFTY26N2624300CE", "status": "OPEN", "entry_price": 30.0},
+        "pe": {"symbol": "NIFTY26N2623800PE", "status": "OPEN", "entry_price": 30.0},
+    }
+    with patch.object(desk, "wait_for_order_completion", side_effect=[
+        {"status": "CANCELLED", "filled_quantity": 260, "average_price": 46.0},
+        {"status": "COMPLETE", "filled_quantity": 390, "average_price": 48.0},
+    ]):
+        ok = desk._safe_exit_leg(
+            "ce", "NIFTY26N2624300CE", 650, 46.0, "TIME_EXIT", "LIMIT", 0.05, state, escalate_to_market=True
+        )
+    assert ok is True
+    assert state["ce"]["status"] == "CLOSED"
+    assert state["ce"]["exit_filled_qty"] == 650
+    # Second buy_to_cover (MARKET) must request only remaining 390, not full 650!
+    assert om.buy_to_cover.call_args_list[1].args[1] == 390
+    assert state["ce"]["exit_price"] == 47.2
+
+
+def test_paper_and_live_default_state_files_are_isolated():
+    from strategy.strangle_desk import get_default_strangle_state_file
+    with patch.dict("os.environ", {}, clear=True):
+        live_p = get_default_strangle_state_file("LIVE")
+        paper_p = get_default_strangle_state_file("PAPER")
+        assert live_p.name == "trades_today.json"
+        assert paper_p.name == "paper_trades_today.json"
+
+
+def test_reconcile_skips_mismatched_non_strangle_positions(tmp_path):
+    om = MagicMock()
+    om.mode = "LIVE"
+    desk = StrangleDesk(order_manager=om, state_file=tmp_path / "trades.json")
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"tradingsymbol": "NIFTY26N2624400CE", "name": "NIFTY", "instrument_type": "CE", "expiry": date(2026, 12, 3), "strike": 24400.0, "lot_size": 65},
+        {"tradingsymbol": "NIFTY26N2623400PE", "name": "NIFTY", "instrument_type": "PE", "expiry": date(2026, 12, 3), "strike": 23400.0, "lot_size": 65},
+    ]
+    mock_kite.positions.return_value = {
+        "net": [
+            {"tradingsymbol": "NIFTY26N2624400CE", "exchange": "NFO", "product": "NRML", "quantity": -650, "average_price": 40.0},
+            {"tradingsymbol": "NIFTY26N2623400PE", "exchange": "NFO", "product": "NRML", "quantity": -325, "average_price": 38.0},
+        ]
+    }
+    res = desk.reconcile_with_broker(mock_kite, target_expiry=date(2026, 12, 3))
+    assert res is None
+
+
+def test_run_session_skips_new_entry_after_cutoff(tmp_path):
+    om = MagicMock()
+    om.mode = "PAPER"
+    desk = StrangleDesk(order_manager=om, state_file=tmp_path / "trades.json")
+    fake_after_cutoff = datetime(2026, 11, 2, 14, 50, 0)
+    with patch("strategy.strangle_desk.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_after_cutoff
+        res = desk.run_session(lots=1, kite=MagicMock(), check_market_hours=True, ignore_holidays=True, exit_time_str="14:45")
+    assert res["status"] == "AFTER_CUTOFF"
+    om.sell.assert_not_called()
+
+
+def test_nse_fixed_holidays_work_in_2027():
+    from strategy.holidays import is_trading_holiday
+    is_hol, reason = is_trading_holiday(date(2027, 1, 26))
+    assert is_hol is True
+    assert "Republic Day" in reason
+
+
+def test_failed_10k_exit_does_not_double_submit_sl_or_send_exit_alert(tmp_path):
+    om = MagicMock()
+    om.mode = "LIVE"
+    om.product = "MIS"
+    notifier = MagicMock()
+    desk = StrangleDesk(order_manager=om, state_file=tmp_path / "trades.json", notifier=notifier)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    desk.save_state({
+        "date": today_str,
+        "status": "OPEN",
+        "mode": "LIVE",
+        "quantity": 650,
+        "ce": {"symbol": "NIFTY26N2624300CE", "entry_price": 30.0, "sl_price": 45.0, "target_price": 6.0, "status": "OPEN"},
+        "pe": {"symbol": "NIFTY26N2623800PE", "entry_price": 30.0, "sl_price": 45.0, "target_price": 6.0, "status": "OPEN"},
+    })
+    mock_kite = MagicMock()
+    mock_kite.positions.return_value = {
+        "net": [
+            {"tradingsymbol": "NIFTY26N2624300CE", "exchange": "NFO", "quantity": -650},
+            {"tradingsymbol": "NIFTY26N2623800PE", "exchange": "NFO", "quantity": -650},
+        ]
+    }
+    mock_kite.ltp.return_value = {
+        "NFO:NIFTY26N2624300CE": {"last_price": 50.0},  # Both >= 10k loss AND >= sl_price 45
+        "NFO:NIFTY26N2623800PE": {"last_price": 28.0},
+    }
+    with patch.object(desk, "_ensure_kite_session", return_value=mock_kite), \
+         patch.object(desk, "_safe_exit_leg", return_value=False) as mock_exit:
+        desk.run_session(lots=10, kite=mock_kite, strategy_max_loss=10000.0, use_leg_sl=True, execute_once=True, ignore_holidays=True)
+    # _safe_exit_leg must only be tried ONCE this tick (never re-tried as STOP_LOSS in Block #3)
+    assert mock_exit.call_count == 1
+    assert mock_exit.call_args.args[4] == "SINGLE_LEG_10K_EXIT"
+    notifier.send_message.assert_not_called()
+
+
+def test_run_strategy_cli_live_once_enforces_check_market_hours():
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client") as mock_kite_fn, \
+         patch("run_strategy.OrderManager"), \
+         patch("run_strategy.StrangleDesk") as mock_desk_cls:
+        mock_kite_fn.return_value = MagicMock()
+        mock_desk = MagicMock()
+        mock_desk_cls.return_value = mock_desk
+        exit_code = run_strategy_cli(["--live", "--once"])
+        assert exit_code == 0
+        assert mock_desk.run_session.call_args.kwargs["check_market_hours"] is True
 
 
 

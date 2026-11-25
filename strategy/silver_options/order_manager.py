@@ -1,4 +1,5 @@
 import logging
+import threading
 from typing import Dict, Any, Optional
 from kiteconnect import KiteConnect
 
@@ -31,6 +32,7 @@ class SilverOrderManager:
         self.config = config or SilverOptionsConfig()
         self.product = self.config.product.upper()
         self._paper_orders: Dict[str, Dict[str, Any]] = {}
+        self._kite_lock = threading.RLock()
 
     def sell(
         self,
@@ -104,7 +106,10 @@ class SilverOrderManager:
 
         try:
             logger.info("[LIVE] Submitting MCX SELL order: %s x %d (OrderType: %s, LimitPrice: %s)", symbol, quantity, order_type_norm, limit_price)
-            order_id = self.kite.place_order(**params)
+            order_id = self._call_kite_with_token_retry(
+                f"MCX SELL ({symbol})",
+                lambda: self.kite.place_order(**params),
+            )
             logger.info("[LIVE] MCX SELL order placed successfully: %s x %d (Order ID: %s)", symbol, quantity, order_id)
             return {
                 "order_id": order_id,
@@ -119,28 +124,6 @@ class SilverOrderManager:
                 "status": "SUBMITTED",
             }
         except Exception as e:
-            from kite.client import is_token_error, ensure_kite_session
-            if is_token_error(e):
-                logger.warning("[LIVE] Token error on MCX SELL order (%s). Refreshing session and retrying...", e)
-                try:
-                    self.kite = ensure_kite_session(self.kite, force_login=False)
-                    order_id = self.kite.place_order(**params)
-                    logger.info("[LIVE] MCX SELL order succeeded after token refresh: %s x %d (Order ID: %s)", symbol, quantity, order_id)
-                    return {
-                        "order_id": order_id,
-                        "mode": "LIVE",
-                        "exchange": "MCX",
-                        "symbol": symbol,
-                        "transaction_type": "SELL",
-                        "quantity": quantity,
-                        "order_type": order_type_norm,
-                        "limit_price": limit_price,
-                        "fill_price": price,
-                        "status": "SUBMITTED",
-                    }
-                except Exception as retry_err:
-                    logger.error("[LIVE] MCX SELL order retry failed for %s: %s", symbol, retry_err)
-                    raise retry_err
             logger.error("[LIVE] MCX SELL order failed for %s: %s", symbol, e)
             raise e
 
@@ -216,7 +199,10 @@ class SilverOrderManager:
 
         try:
             logger.info("[LIVE] Submitting MCX BUY order: %s x %d (OrderType: %s, LimitPrice: %s)", symbol, quantity, order_type_norm, limit_price)
-            order_id = self.kite.place_order(**params)
+            order_id = self._call_kite_with_token_retry(
+                f"MCX BUY ({symbol})",
+                lambda: self.kite.place_order(**params),
+            )
             logger.info("[LIVE] MCX BUY order placed successfully: %s x %d (Order ID: %s)", symbol, quantity, order_id)
             return {
                 "order_id": order_id,
@@ -231,30 +217,21 @@ class SilverOrderManager:
                 "status": "SUBMITTED",
             }
         except Exception as e:
-            from kite.client import is_token_error, ensure_kite_session
-            if is_token_error(e):
-                logger.warning("[LIVE] Token error on MCX BUY order (%s). Refreshing session and retrying...", e)
-                try:
-                    self.kite = ensure_kite_session(self.kite, force_login=False)
-                    order_id = self.kite.place_order(**params)
-                    logger.info("[LIVE] MCX BUY order succeeded after token refresh: %s x %d (Order ID: %s)", symbol, quantity, order_id)
-                    return {
-                        "order_id": order_id,
-                        "mode": "LIVE",
-                        "exchange": "MCX",
-                        "symbol": symbol,
-                        "transaction_type": "BUY",
-                        "quantity": quantity,
-                        "order_type": order_type_norm,
-                        "limit_price": limit_price,
-                        "fill_price": price,
-                        "status": "SUBMITTED",
-                    }
-                except Exception as retry_err:
-                    logger.error("[LIVE] MCX BUY order retry failed for %s: %s", symbol, retry_err)
-                    raise retry_err
             logger.error("[LIVE] MCX BUY order failed for %s: %s", symbol, e)
             raise e
+
+    def _call_kite_with_token_retry(self, op_desc: str, fn):
+        """Executes a Kite API call and thread-safely refreshes token once on TokenException."""
+        try:
+            return fn()
+        except Exception as e:
+            from kite.client import is_token_error, ensure_kite_session
+            if not is_token_error(e):
+                raise
+            with self._kite_lock:
+                logger.warning("[LIVE] Token error on %s (%s). Refreshing session and retrying...", op_desc, e)
+                self.kite = ensure_kite_session(self.kite, force_login=False)
+                return fn()
 
     def get_order_status(self, order_id: str) -> Dict[str, Any]:
         """Retrieves real-time status of an MCX order."""
@@ -279,7 +256,10 @@ class SilverOrderManager:
             }
 
         try:
-            history = self.kite.order_history(order_id)
+            history = self._call_kite_with_token_retry(
+                f"MCX order_history({order_id})",
+                lambda: self.kite.order_history(order_id),
+            )
             if not history:
                 return {
                     "order_id": order_id,
@@ -319,7 +299,10 @@ class SilverOrderManager:
             return True
 
         try:
-            self.kite.cancel_order(variety=variety, order_id=order_id)
+            self._call_kite_with_token_retry(
+                f"MCX cancel_order({order_id})",
+                lambda: self.kite.cancel_order(variety=variety, order_id=order_id),
+            )
             logger.info("[LIVE] Cancel request sent for MCX order: %s", order_id)
             return True
         except Exception as e:

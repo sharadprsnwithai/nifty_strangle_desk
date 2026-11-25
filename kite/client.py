@@ -227,10 +227,10 @@ def ensure_kite_session(
 
     # In multi-strategy execution, check if .env has already been updated with a valid token
     current_token = getattr(kite, "access_token", None) if kite else None
-    if current_token and isinstance(current_token, str):
+    if kite is None or current_token is None or isinstance(current_token, str):
         cfg = load_config()
         env_token = cfg.access_token
-        if env_token and env_token != current_token:
+        if env_token and isinstance(env_token, str) and env_token != current_token:
             logger.info("Found updated access token in .env from a peer strategy. Testing validity before logging in...")
             test_client = _validate_token(cfg.api_key, env_token)
             if test_client:

@@ -163,3 +163,26 @@ def test_ensure_kite_session_market_closed_skips_profile():
         mock_kite.profile.assert_not_called()
 
 
+def test_ensure_kite_session_adopts_env_token_even_when_current_token_empty():
+    from kite.client import ensure_kite_session
+    mock_kite = MagicMock()
+    mock_kite.access_token = None
+    mock_kite.profile.side_effect = Exception("Incorrect `api_key` or `access_token`.")
+    cfg_with_new_token = KiteConfig(
+        api_key="mock_api_key",
+        api_secret="mock_secret",
+        user_id="mock_user",
+        password="mock_password",
+        totp_key="JBSWY3DPEHPK3PXP",
+        access_token="peer_fresh_token"
+    )
+    valid_peer_client = MagicMock()
+    with patch("kite.client.load_config", return_value=cfg_with_new_token), \
+         patch("kite.client._validate_token", return_value=valid_peer_client), \
+         patch("kite.client.get_kite_client") as mock_get_client:
+        res = ensure_kite_session(kite=mock_kite, force_login=False)
+        assert res is mock_kite
+        mock_kite.set_access_token.assert_called_once_with("peer_fresh_token")
+        mock_get_client.assert_not_called()
+
+

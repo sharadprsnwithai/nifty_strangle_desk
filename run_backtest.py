@@ -98,6 +98,7 @@ def run_backtest_cli(args=None) -> int:
     parser.add_argument("--iv", type=float, default=0.13, help="Option IV (default: 0.13)")
     parser.add_argument("--strike-mode", choices=["ATR", "PRICE"], default="ATR", help="Strike selection mode (ATR: 1.25x ATR distance, PRICE: Rs 30 premium, default: ATR)")
     parser.add_argument("--atr-multiplier", type=float, default=1.25, help="ATR multiplier for strike distance (default: 1.25)")
+    parser.add_argument("--target-price", type=float, default=30.0, help="Target premium in Rs for PRICE strike mode (default: 30.0)")
     parser.add_argument("--morning-filter", dest="morning_filter", action="store_true", default=True, help="Enable 09:15-10:00 AM range trend filter (default: True)")
     parser.add_argument("--no-morning-filter", dest="morning_filter", action="store_false", help="Disable morning trend filter")
     parser.add_argument("--morning-filter-pct", type=float, default=0.60, help="Morning range percentage threshold to skip session (default: 0.60)")
@@ -126,7 +127,8 @@ def run_backtest_cli(args=None) -> int:
             morning_filter=parsed.morning_filter,
             morning_filter_threshold_pct=parsed.morning_filter_pct,
             use_atr_strikes=(parsed.strike_mode.upper() == "ATR"),
-            atr_multiplier=parsed.atr_multiplier
+            atr_multiplier=parsed.atr_multiplier,
+            target_price=parsed.target_price,
         )
 
         summary = results["summary"]

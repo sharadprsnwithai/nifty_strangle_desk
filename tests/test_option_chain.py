@@ -167,3 +167,45 @@ def test_find_strangle_strikes_atr_mode_success():
     assert result["ce"]["ltp"] == 28.5
     assert result["pe"]["ltp"] == 31.0
 
+
+def test_find_strangle_strikes_price_mode_prefers_otm_over_itm():
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "strike": 23800.0, "expiry": date(2026, 11, 3), "tradingsymbol": "NIFTY26NOV23800CE", "lot_size": 65},  # Stale ITM
+        {"name": "NIFTY", "instrument_type": "CE", "strike": 24200.0, "expiry": date(2026, 11, 3), "tradingsymbol": "NIFTY26NOV24200CE", "lot_size": 65},  # True OTM
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 24300.0, "expiry": date(2026, 11, 3), "tradingsymbol": "NIFTY26NOV24300PE", "lot_size": 65},  # Stale ITM
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23800.0, "expiry": date(2026, 11, 3), "tradingsymbol": "NIFTY26NOV23800PE", "lot_size": 65},  # True OTM
+    ]
+    mock_kite.ltp.return_value = {
+        "NSE:NIFTY 50": {"last_price": 24000.0},
+        "NFO:NIFTY26NOV23800CE": {"last_price": 30.5},
+        "NFO:NIFTY26NOV24200CE": {"last_price": 32.0},
+        "NFO:NIFTY26NOV24300PE": {"last_price": 30.5},
+        "NFO:NIFTY26NOV23800PE": {"last_price": 33.0},
+    }
+    res = find_strangle_strikes(mock_kite, strike_mode="PRICE", target_price=30.0, target_date=date(2026, 11, 2))
+    assert res["ce"]["symbol"] == "NIFTY26NOV24200CE"
+    assert res["pe"]["symbol"] == "NIFTY26NOV23800PE"
+
+
+def test_find_strangle_strikes_atr_skips_zero_ltp_strike():
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = [
+        {"name": "NIFTY", "instrument_type": "CE", "strike": 24200.0, "expiry": date(2026, 11, 3), "tradingsymbol": "NIFTY26NOV24200CE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "strike": 24250.0, "expiry": date(2026, 11, 3), "tradingsymbol": "NIFTY26NOV24250CE", "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "strike": 23800.0, "expiry": date(2026, 11, 3), "tradingsymbol": "NIFTY26NOV23800PE", "lot_size": 65},
+    ]
+    mock_kite.historical_data.return_value = [
+        {"date": datetime(2026, 11, 1), "open": 24000.0, "high": 24160.0, "low": 24000.0, "close": 24100.0},
+        {"date": datetime(2026, 11, 2), "open": 24100.0, "high": 24260.0, "low": 24100.0, "close": 24200.0},
+    ]
+    mock_kite.ltp.return_value = {
+        "NSE:NIFTY 50": {"last_price": 24000.0},
+        "NFO:NIFTY26NOV24200CE": {"last_price": 0.0},
+        "NFO:NIFTY26NOV24250CE": {"last_price": 25.0},
+        "NFO:NIFTY26NOV23800PE": {"last_price": 31.0},
+    }
+    res = find_strangle_strikes(mock_kite, strike_mode="ATR", atr_multiplier=1.25, target_date=date(2026, 11, 2))
+    assert res["strike_mode"] == "ATR"
+    assert res["ce"]["symbol"] == "NIFTY26NOV24250CE"
+

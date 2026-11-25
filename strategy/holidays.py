@@ -35,6 +35,26 @@ MCX_FULL_HOLIDAYS_2026: Dict[date, str] = {
     date(2026, 12, 25): "Christmas",
 }
 
+# Fixed-date MCX full-day national closures valid across years
+MCX_FIXED_FULL_HOLIDAYS: Dict[Tuple[int, int], str] = {
+    (1, 26): "Republic Day",
+    (8, 15): "Independence Day",
+    (10, 2): "Mahatma Gandhi Jayanti",
+    (12, 25): "Christmas",
+}
+
+# Fixed-date NSE national closures valid across years
+NSE_FIXED_HOLIDAYS: Dict[Tuple[int, int], str] = {
+    (1, 26): "Republic Day",
+    (5, 1): "Maharashtra Day",
+    (8, 15): "Independence Day",
+    (10, 2): "Mahatma Gandhi Jayanti",
+    (12, 25): "Christmas",
+}
+
+_WARNED_YEARS: set = set()
+_NSE_WARNED_YEARS: set = set()
+
 
 def is_trading_holiday(check_date: Optional[date] = None) -> Tuple[bool, Optional[str]]:
     """
@@ -58,6 +78,15 @@ def is_trading_holiday(check_date: Optional[date] = None) -> Tuple[bool, Optiona
     # Official NSE holiday check
     if check_date in NSE_HOLIDAYS_2026:
         return True, f"NSE Holiday: {NSE_HOLIDAYS_2026[check_date]}"
+    fixed_nse = NSE_FIXED_HOLIDAYS.get((check_date.month, check_date.day))
+    if fixed_nse:
+        return True, f"NSE Holiday: {fixed_nse}"
+    if check_date.year > 2026 and check_date.year not in _NSE_WARNED_YEARS:
+        _NSE_WARNED_YEARS.add(check_date.year)
+        logger.warning(
+            "NSE variable holiday calendar is not populated for %d; update strategy/holidays.py.",
+            check_date.year,
+        )
 
     return False, None
 
@@ -95,6 +124,15 @@ def is_mcx_trading_holiday(check_date: Optional[date] = None, session: str = "EV
     if session.upper() == "EVENING":
         if check_date in MCX_FULL_HOLIDAYS_2026:
             return True, f"MCX Full Holiday: {MCX_FULL_HOLIDAYS_2026[check_date]}"
+        fixed_name = MCX_FIXED_FULL_HOLIDAYS.get((check_date.month, check_date.day))
+        if fixed_name:
+            return True, f"MCX Full Holiday: {fixed_name}"
+        if check_date.year > 2026 and check_date.year not in _WARNED_YEARS:
+            _WARNED_YEARS.add(check_date.year)
+            logger.warning(
+                "MCX variable holiday calendar (e.g. Good Friday) is not populated for %d; update strategy/holidays.py.",
+                check_date.year,
+            )
         return False, None
 
     # Morning session check (closed on all standard holidays)

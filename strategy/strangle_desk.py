@@ -3,7 +3,7 @@ import json
 import logging
 import time
 import tempfile
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from kiteconnect import KiteConnect
@@ -16,14 +16,15 @@ from notifications.telegram import TelegramNotifier
 logger = logging.getLogger("strategy.desk")
 
 
-def get_default_strangle_state_file() -> Path:
+def get_default_strangle_state_file(mode: str = "LIVE") -> Path:
     env_file = os.getenv("STRANGLE_STATE_FILE")
     if env_file:
         return Path(env_file).resolve()
+    filename = "paper_trades_today.json" if str(mode).upper() == "PAPER" else "trades_today.json"
     data_dir = os.getenv("DATA_DIR")
     if data_dir:
-        return Path(data_dir).resolve() / "trades_today.json"
-    return Path(__file__).resolve().parent.parent / "data" / "trades_today.json"
+        return Path(data_dir).resolve() / filename
+    return Path(__file__).resolve().parent.parent / "data" / filename
 
 
 DEFAULT_STATE_FILE = get_default_strangle_state_file()
@@ -39,7 +40,8 @@ class StrangleDesk:
         notifier: Optional[TelegramNotifier] = None
     ):
         self.order_manager = order_manager
-        self.state_file = Path(state_file).resolve() if state_file else get_default_strangle_state_file()
+        om_mode = getattr(order_manager, "mode", "LIVE") if order_manager is not None else "LIVE"
+        self.state_file = Path(state_file).resolve() if state_file else get_default_strangle_state_file(mode=om_mode)
         self.notifier = notifier
         self.state: Optional[Dict[str, Any]] = None
 
@@ -99,7 +101,7 @@ class StrangleDesk:
         self.state = None
 
     @staticmethod
-    def _print_plan(strikes: Dict[str, Any], mode: str = "PAPER") -> None:
+    def _print_plan(strikes: Dict[str, Any], mode: str = "PAPER", exit_time_str: str = "14:45") -> None:
         ce_info = strikes["ce"]
         pe_info = strikes["pe"]
         print("\n" + "=" * 65)
@@ -109,7 +111,7 @@ class StrangleDesk:
         print(f"Order Sizing  : {strikes['total_lots']} lots ({strikes['total_quantity']} qty)")
         print(f"CALL Leg      : {ce_info['symbol']} @ Rs {ce_info['ltp']:.2f} | Target: Rs {ce_info['target_price']:.2f} (80% decay)")
         print(f"PUT Leg       : {pe_info['symbol']} @ Rs {pe_info['ltp']:.2f} | Target: Rs {pe_info['target_price']:.2f} (80% decay)")
-        print(f"Exit Rules    : Single-Leg 50% SL (winner stays open & trails to cost) | Target: 80% decay | Cutoff: 14:45 IST")
+        print(f"Exit Rules    : Single-Leg 50% SL (winner stays open & trails to cost) | Target: 80% decay | Cutoff: {exit_time_str} IST")
         print("=" * 65 + "\n")
 
     @staticmethod
@@ -131,16 +133,28 @@ class StrangleDesk:
         order_type: str,
         limit_buffer_pct: float,
         state: Dict[str, Any],
-        min_buffer_rs: float = 1.5
+        min_buffer_rs: float = 1.5,
+        escalate_to_market: bool = False,
     ) -> bool:
         """
         Safely executes buy_to_cover for a single strangle leg.
-        Verifies order completion on Kite before updating state to CLOSED.
-        Catches broker exceptions, logs errors, alerts Telegram, and prevents loop crashes.
+        Tracks partial exit fills (`exit_filled_qty`) so retries never over-buy,
+        verifies order completion on Kite before marking CLOSED, and optionally
+        escalates unfilled exits to MARKET.
         """
         try:
+            leg_state = state.setdefault(leg_name, {})
+            prev_filled = int(leg_state.get("exit_filled_qty") or 0)
+            prev_exit_px = float(leg_state["exit_price"]) if leg_state.get("exit_price") is not None else 0.0
+            remaining_qty = max(0, qty - prev_filled)
+            if remaining_qty == 0:
+                leg_state["status"] = "CLOSED"
+                leg_state["exit_reason"] = reason
+                self.save_state(state)
+                return True
+
             leg_product = (
-                state.get(leg_name, {}).get("product")
+                leg_state.get("product")
                 or state.get("product")
                 or getattr(self.order_manager, "product", "MIS")
             )
@@ -148,13 +162,13 @@ class StrangleDesk:
                 "reason": reason,
                 "order_type": order_type,
                 "buffer_pct": limit_buffer_pct,
-                "product": leg_product
+                "product": leg_product,
             }
             if min_buffer_rs > 0.0:
                 btc_kwargs["min_buffer_rs"] = min_buffer_rs
 
             order_res = self.order_manager.buy_to_cover(
-                symbol, qty, exit_price, **btc_kwargs
+                symbol, remaining_qty, exit_price, **btc_kwargs
             )
             mode = getattr(self.order_manager, "mode", "PAPER")
             order_id = order_res.get("order_id") if isinstance(order_res, dict) else None
@@ -164,27 +178,97 @@ class StrangleDesk:
                 status_res = self.wait_for_order_completion(order_id, timeout_seconds=10, poll_seconds=1)
                 order_status = status_res.get("status")
                 if order_status == "COMPLETE":
-                    actual_exit_price = float(status_res.get("average_price") or exit_price)
+                    fill_px = float(status_res["average_price"]) if status_res.get("average_price") is not None and float(status_res.get("average_price")) > 0 else exit_price
+                    total_done = prev_filled + remaining_qty
+                    actual_exit_price = round(((prev_filled * prev_exit_px) + (remaining_qty * fill_px)) / total_done, 2) if total_done > 0 else fill_px
+                    leg_state["exit_filled_qty"] = total_done
                 elif order_status in ("REJECTED", "CANCELLED"):
                     err_msg = status_res.get("status_message") or f"Order ended in {order_status}"
-                    logger.error("Exit order %s for %s (%s) was %s: %s", order_id, leg_name.upper(), symbol, order_status, err_msg)
-                    if self.notifier:
-                        self.notifier.send_message(
-                            f"🚨 <b>Exit Order {order_status}</b>: Failed to exit {leg_name.upper()} <code>{symbol}</code> ({reason}): {err_msg}"
+                    part_filled = int(status_res.get("filled_quantity") or 0)
+                    total_done = prev_filled + part_filled
+                    if part_filled > 0:
+                        part_px = float(status_res["average_price"]) if status_res.get("average_price") is not None and float(status_res.get("average_price")) > 0 else exit_price
+                        actual_exit_price = round(((prev_filled * prev_exit_px) + (part_filled * part_px)) / total_done, 2) if total_done > 0 else part_px
+                        leg_state["exit_price"] = actual_exit_price
+                        leg_state["exit_filled_qty"] = total_done
+                        self.save_state(state)
+                    still_left = max(0, qty - total_done)
+                    if still_left == 0:
+                        actual_exit_price = float(leg_state["exit_price"]) if leg_state.get("exit_price") is not None else exit_price
+                    elif escalate_to_market and order_type.upper() != "MARKET":
+                        logger.warning("Exit order %s (%s) %s (%d/%d filled). Escalating %d qty to MARKET...", order_id, symbol, order_status, total_done, qty, still_left)
+                        mkt_res = self.order_manager.buy_to_cover(
+                            symbol, still_left, exit_price, reason=reason, order_type="MARKET", product=leg_product
                         )
-                    return False
+                        mkt_id = mkt_res.get("order_id") if isinstance(mkt_res, dict) else None
+                        if mkt_id:
+                            mkt_st = self.wait_for_order_completion(mkt_id, timeout_seconds=10, poll_seconds=1)
+                            mkt_filled = int(mkt_st.get("filled_quantity") or 0)
+                            if mkt_st.get("status") == "COMPLETE" or mkt_filled >= still_left:
+                                fill_px = float(mkt_st["average_price"]) if mkt_st.get("average_price") is not None and float(mkt_st.get("average_price")) > 0 else exit_price
+                                new_total = total_done + (still_left if mkt_st.get("status") == "COMPLETE" else mkt_filled)
+                                prev_sum_px = float(leg_state["exit_price"]) if leg_state.get("exit_price") is not None else prev_exit_px
+                                actual_exit_price = round(((total_done * prev_sum_px) + ((new_total - total_done) * fill_px)) / new_total, 2) if new_total > 0 else fill_px
+                                leg_state["exit_filled_qty"] = new_total
+                                order_id = mkt_id
+                            else:
+                                logger.error("MARKET escalation failed for %s (%s): %s", symbol, reason, mkt_st)
+                                return False
+                        else:
+                            return False
+                    else:
+                        logger.error("Exit order %s for %s (%s) was %s: %s", order_id, leg_name.upper(), symbol, order_status, err_msg)
+                        if self.notifier:
+                            self.notifier.send_message(
+                                f"🚨 <b>Exit Order {order_status}</b>: Failed to exit {leg_name.upper()} <code>{symbol}</code> ({reason}): {err_msg}"
+                            )
+                        return False
                 else:
                     logger.warning("Exit order %s for %s still pending (%s) after 10s. Cancelling resting order...", order_id, symbol, order_status)
                     self.order_manager.cancel_order(order_id)
                     cancel_res = self.wait_for_order_completion(order_id, timeout_seconds=5, poll_seconds=1, execute_once=True)
                     filled_qty = int(cancel_res.get("filled_quantity") or 0)
-                    if filled_qty >= qty:
-                        actual_exit_price = float(cancel_res.get("average_price") or exit_price)
+                    total_done = prev_filled + filled_qty
+                    if filled_qty > 0:
+                        part_px = float(cancel_res["average_price"]) if cancel_res.get("average_price") is not None and float(cancel_res.get("average_price")) > 0 else exit_price
+                        actual_exit_price = round(((prev_filled * prev_exit_px) + (filled_qty * part_px)) / total_done, 2) if total_done > 0 else part_px
+                        leg_state["exit_price"] = actual_exit_price
+                        leg_state["exit_filled_qty"] = total_done
+                        self.save_state(state)
+                    if total_done >= qty:
+                        actual_exit_price = float(leg_state["exit_price"]) if leg_state.get("exit_price") is not None else exit_price
+                    elif escalate_to_market and order_type.upper() != "MARKET":
+                        still_left = max(0, qty - total_done)
+                        logger.warning("Escalating remaining %d/%d of %s (%s) via MARKET...", still_left, qty, symbol, reason)
+                        mkt_res = self.order_manager.buy_to_cover(
+                            symbol, still_left, exit_price, reason=reason, order_type="MARKET", product=leg_product
+                        )
+                        mkt_id = mkt_res.get("order_id") if isinstance(mkt_res, dict) else None
+                        if mkt_id:
+                            mkt_st = self.wait_for_order_completion(mkt_id, timeout_seconds=10, poll_seconds=1)
+                            mkt_filled = int(mkt_st.get("filled_quantity") or 0)
+                            if mkt_filled > 0:
+                                mkt_px = float(mkt_st["average_price"]) if mkt_st.get("average_price") is not None and float(mkt_st.get("average_price")) > 0 else exit_price
+                                new_total = total_done + mkt_filled
+                                prev_sum_px = float(leg_state["exit_price"]) if leg_state.get("exit_price") is not None else 0.0
+                                actual_exit_price = round(((total_done * prev_sum_px) + (mkt_filled * mkt_px)) / new_total, 2) if new_total > 0 else mkt_px
+                                leg_state["exit_price"] = actual_exit_price
+                                leg_state["exit_filled_qty"] = new_total
+                                order_id = mkt_id
+                                self.save_state(state)
+                            if int(leg_state.get("exit_filled_qty") or 0) < qty:
+                                if self.notifier:
+                                    self.notifier.send_message(
+                                        f"🚨 <b>Incomplete Escalated Exit</b>: {leg_name.upper()} <code>{symbol}</code> filled {leg_state.get('exit_filled_qty', 0)}/{qty}. Retrying next tick!"
+                                    )
+                                return False
+                        else:
+                            return False
                     elif filled_qty > 0:
                         logger.warning("Exit order %s partially filled (%d/%d).", order_id, filled_qty, qty)
                         if self.notifier:
                             self.notifier.send_message(
-                                f"⚠️ <b>Partial Exit Fill</b>: {leg_name.upper()} <code>{symbol}</code> filled {filled_qty}/{qty}. Manual check advised!"
+                                f"⚠️ <b>Partial Exit Fill</b>: {leg_name.upper()} <code>{symbol}</code> filled {total_done}/{qty}. Remaining {qty - total_done} will retry next tick."
                             )
                         return False
                     else:
@@ -193,12 +277,14 @@ class StrangleDesk:
                                 f"⚠️ <b>Exit Order Timeout</b>: Limit order for {leg_name.upper()} <code>{symbol}</code> did not fill within 10s. Order cancelled. Retrying next tick."
                             )
                         return False
+            else:
+                leg_state["exit_filled_qty"] = qty
 
-            state[leg_name]["status"] = "CLOSED"
-            state[leg_name]["exit_price"] = actual_exit_price
-            state[leg_name]["exit_reason"] = reason
+            leg_state["status"] = "CLOSED"
+            leg_state["exit_price"] = actual_exit_price
+            leg_state["exit_reason"] = reason
             if order_id:
-                state[leg_name]["exit_order_id"] = order_id
+                leg_state["exit_order_id"] = order_id
             self.save_state(state)
             return True
         except Exception as e:
@@ -309,16 +395,35 @@ class StrangleDesk:
 
     def perform_daily_morning_login(self, kite: Optional[Any] = None) -> Any:
         """
-        Executes an automated headless TOTP login to obtain a fresh daily Zerodha Kite access token.
-        Saves the token to .env, updates the OrderManager client, and notifies via Telegram.
+        Ensures a fresh daily Zerodha Kite access token at/after 08:00 AM IST.
+        When an existing Kite client is supplied (e.g. scheduler restart mid-day),
+        validates / adopts any already-valid .env token first via ensure_kite_session()
+        so peer strategy containers are not logged out. When called with kite=None,
+        performs an explicit fresh TOTP login.
         """
         logger.info("Executing daily morning TOTP login (08:00 AM IST schedule)...")
+        if kite is not None:
+            active_kite = self._ensure_kite_session(kite, force_login=False)
+            if active_kite is not None:
+                try:
+                    profile = active_kite.profile()
+                    logger.info(
+                        "Daily session check OK for %s (%s).",
+                        profile.get("user_name", "Trader"),
+                        profile.get("user_id"),
+                    )
+                    return active_kite
+                except Exception as prof_err:
+                    err_s = str(prof_err).lower()
+                    if not is_token_error(prof_err) and ("429" in err_s or "too many" in err_s or "timeout" in err_s or "connection" in err_s):
+                        logger.warning("Transient error during morning profile check (%s); preserving active client.", prof_err)
+                        return active_kite
+
         from kite.client import get_kite_client
         new_kite = get_kite_client(force_login=True)
         if hasattr(self.order_manager, "kite"):
             self.order_manager.kite = new_kite
 
-        user_desc = "Zerodha Account"
         try:
             profile = new_kite.profile()
             user_desc = f"{profile.get('user_name', 'Trader')} ({profile.get('user_id')})"
@@ -326,7 +431,6 @@ class StrangleDesk:
         except Exception as e:
             logger.warning("Could not fetch profile after morning login: %s", e)
 
-        # Morning login notification removed per policy (alerts only on entry, exit, sl)
         return new_kite
 
     def reconcile_with_broker(
@@ -376,19 +480,44 @@ class StrangleDesk:
 
                 changed = False
                 if ce_closed and state.get("ce", {}).get("status") == "OPEN":
+                    ce_pos = net_map.get(ce_sym, {})
+                    broker_buy_px = float(ce_pos.get("buy_price") or 0.0)
+                    reconciled_ce_px = (
+                        broker_buy_px
+                        or float(ce_pos.get("last_price") or 0.0)
+                        or float(state["ce"].get("last_ltp") or 0.0)
+                        or float(state["ce"].get("entry_price") or 0.0)
+                    )
                     state["ce"]["status"] = "CLOSED"
                     state["ce"]["exit_reason"] = "BROKER_RECONCILED"
+                    has_partial_exit = int(state["ce"].get("exit_filled_qty") or 0) > 0
+                    if (state["ce"].get("exit_price") is None or (has_partial_exit and broker_buy_px > 0)) and reconciled_ce_px > 0:
+                        state["ce"]["exit_price"] = reconciled_ce_px
                     changed = True
-                    logger.info("Reconciliation: CE leg %s is flat on Kite. Marked CLOSED.", ce_sym)
+                    logger.info("Reconciliation: CE leg %s is flat on Kite. Marked CLOSED (@ %.2f).", ce_sym, state["ce"].get("exit_price") or 0.0)
 
                 if pe_closed and state.get("pe", {}).get("status") == "OPEN":
+                    pe_pos = net_map.get(pe_sym, {})
+                    broker_buy_px = float(pe_pos.get("buy_price") or 0.0)
+                    reconciled_pe_px = (
+                        broker_buy_px
+                        or float(pe_pos.get("last_price") or 0.0)
+                        or float(state["pe"].get("last_ltp") or 0.0)
+                        or float(state["pe"].get("entry_price") or 0.0)
+                    )
                     state["pe"]["status"] = "CLOSED"
                     state["pe"]["exit_reason"] = "BROKER_RECONCILED"
+                    has_partial_exit = int(state["pe"].get("exit_filled_qty") or 0) > 0
+                    if (state["pe"].get("exit_price") is None or (has_partial_exit and broker_buy_px > 0)) and reconciled_pe_px > 0:
+                        state["pe"]["exit_price"] = reconciled_pe_px
                     changed = True
-                    logger.info("Reconciliation: PE leg %s is flat on Kite. Marked CLOSED.", pe_sym)
+                    logger.info("Reconciliation: PE leg %s is flat on Kite. Marked CLOSED (@ %.2f).", pe_sym, state["pe"].get("exit_price") or 0.0)
 
                 if ce_closed and pe_closed:
                     state["status"] = "COMPLETED"
+                    qty = int(state.get("quantity") or 0)
+                    if qty > 0:
+                        state["realized_pnl"] = self._get_current_day_pnl(state, qty)
                     changed = True
                     logger.warning("Reconciliation: Both strangle legs are closed on Kite. Synchronizing local state to COMPLETED.")
 
@@ -397,7 +526,7 @@ class StrangleDesk:
                 return state
 
             # 2. No active trade locally: check if broker has open short strangle positions
-            if state is None or state.get("status") not in ("OPEN", "COMPLETED", "ABORTED"):
+            if state is None or state.get("date") != today_str or state.get("status") not in ("OPEN", "COMPLETED", "ABORTED", "SKIPPED_TREND_DAY"):
                 # Short-circuit: If broker has no short NFO positions at all, avoid fetching instruments
                 has_candidate_positions = any(
                     p.get("exchange") == "NFO" and int(p.get("quantity", 0)) < 0
@@ -406,100 +535,117 @@ class StrangleDesk:
                 if not has_candidate_positions:
                     return state
 
-                # Fetch instruments to identify target expiry
+                # Fetch instruments to identify target expiry (check 0-DTE too if an open expiry position exists today)
                 instruments = kite.instruments("NFO")
-                if target_expiry is None:
-                    target_expiry = resolve_target_expiry(instruments, underlying=underlying)
+                if target_expiry is not None:
+                    candidate_expiries = [target_expiry]
+                else:
+                    default_exp = resolve_target_expiry(instruments, underlying=underlying)
+                    today_exp = datetime.now().date()
+                    candidate_expiries = [today_exp, default_exp] if today_exp != default_exp else [default_exp]
 
-                # Filter contracts matching underlying and target weekly expiry
-                inst_map = {
-                    i["tradingsymbol"]: i
-                    for i in instruments
-                    if i.get("name") == underlying
-                    and _normalize_date(i.get("expiry")) == target_expiry
-                }
-
-                open_ce = []
-                open_pe = []
-
-                for p in net_positions:
-                    sym = p.get("tradingsymbol", "")
-                    qty = p.get("quantity", 0)
-                    if p.get("exchange") == "NFO" and sym in inst_map and qty < 0:
-                        inst = inst_map[sym]
-                        itype = inst.get("instrument_type")
-                        leg_info = {
-                            "symbol": sym,
-                            "strike": float(inst.get("strike", 0.0)),
-                            "quantity": abs(qty),
-                            "product": p.get("product", "MIS"),
-                            "entry_price": float(p.get("average_price") or p.get("sell_price") or 0.0),
-                            "lot_size": int(inst.get("lot_size", 65))
-                        }
-                        if itype == "CE":
-                            open_ce.append(leg_info)
-                        elif itype == "PE":
-                            open_pe.append(leg_info)
-
-                if open_ce and open_pe:
-                    ce_leg = open_ce[0]
-                    pe_leg = open_pe[0]
-                    qty = min(ce_leg["quantity"], pe_leg["quantity"])
-                    lot_size = ce_leg["lot_size"]
-                    total_lots = qty // lot_size
-
-                    ce_entry = ce_leg["entry_price"]
-                    pe_entry = pe_leg["entry_price"]
-
-                    ce_sl = round(ce_entry * 1.50, 2)
-                    ce_tgt = round(ce_entry * 0.20, 2)
-                    pe_sl = round(pe_entry * 1.50, 2)
-                    pe_tgt = round(pe_entry * 0.20, 2)
-
-                    logger.info(
-                        "Reconciliation: Found open broker strangle positions on Kite: "
-                        "CE %s x %d @ Rs %.2f [%s] (SL: %.2f, Tgt: %.2f), "
-                        "PE %s x %d @ Rs %.2f [%s] (SL: %.2f, Tgt: %.2f). Adopting into active state.",
-                        ce_leg["symbol"], qty, ce_entry, ce_leg["product"], ce_sl, ce_tgt,
-                        pe_leg["symbol"], qty, pe_entry, pe_leg["product"], pe_sl, pe_tgt
-                    )
-
-                    state = {
-                        "status": "OPEN",
-                        "date": today_str,
-                        "underlying": underlying,
-                        "expiry": str(target_expiry),
-                        "lots": total_lots,
-                        "quantity": qty,
-                        "product": ce_leg["product"],
-                        "ce": {
-                            "symbol": ce_leg["symbol"],
-                            "strike": ce_leg["strike"],
-                            "entry_price": ce_entry,
-                            "sl_price": ce_sl,
-                            "target_price": ce_tgt,
-                            "status": "OPEN",
-                            "product": ce_leg["product"],
-                            "order_id": None,
-                            "exit_price": None,
-                            "exit_reason": None
-                        },
-                        "pe": {
-                            "symbol": pe_leg["symbol"],
-                            "strike": pe_leg["strike"],
-                            "entry_price": pe_entry,
-                            "sl_price": pe_sl,
-                            "target_price": pe_tgt,
-                            "status": "OPEN",
-                            "product": pe_leg["product"],
-                            "order_id": None,
-                            "exit_price": None,
-                            "exit_reason": None
-                        }
+                adopted = False
+                for scan_expiry in candidate_expiries:
+                    inst_map = {
+                        i["tradingsymbol"]: i
+                        for i in instruments
+                        if i.get("name") == underlying
+                        and _normalize_date(i.get("expiry")) == scan_expiry
                     }
-                    self.save_state(state)
 
-                    pass  # Reconciliation alert removed per policy (alerts only on entry, exit, sl)
+                    open_ce = []
+                    open_pe = []
+
+                    for p in net_positions:
+                        sym = p.get("tradingsymbol", "")
+                        qty = p.get("quantity", 0)
+                        if p.get("exchange") == "NFO" and sym in inst_map and qty < 0:
+                            inst = inst_map[sym]
+                            itype = inst.get("instrument_type")
+                            leg_info = {
+                                "symbol": sym,
+                                "strike": float(inst.get("strike", 0.0)),
+                                "quantity": abs(qty),
+                                "product": p.get("product", "MIS"),
+                                "entry_price": float(p.get("average_price") or p.get("sell_price") or 0.0),
+                                "lot_size": int(inst.get("lot_size", 65))
+                            }
+                            if itype == "CE":
+                                open_ce.append(leg_info)
+                            elif itype == "PE":
+                                open_pe.append(leg_info)
+
+                    if open_ce and open_pe:
+                        if len(open_ce) > 1 or len(open_pe) > 1 or open_ce[0]["quantity"] != open_pe[0]["quantity"]:
+                            logger.warning(
+                                "Reconciliation: Skipping non-strangle/mismatched short positions for expiry %s "
+                                "(CE legs=%d qty=%s, PE legs=%d qty=%s).",
+                                scan_expiry, len(open_ce), [x["quantity"] for x in open_ce],
+                                len(open_pe), [x["quantity"] for x in open_pe]
+                            )
+                            continue
+
+                        ce_leg = open_ce[0]
+                        pe_leg = open_pe[0]
+                        qty = ce_leg["quantity"]
+                        lot_size = ce_leg["lot_size"]
+                        total_lots = qty // lot_size
+
+                        ce_entry = ce_leg["entry_price"]
+                        pe_entry = pe_leg["entry_price"]
+
+                        ce_sl = round(ce_entry * 1.50, 2)
+                        ce_tgt = round(ce_entry * 0.20, 2)
+                        pe_sl = round(pe_entry * 1.50, 2)
+                        pe_tgt = round(pe_entry * 0.20, 2)
+
+                        logger.info(
+                            "Reconciliation: Found open broker strangle positions on Kite (%s): "
+                            "CE %s x %d @ Rs %.2f [%s] (SL: %.2f, Tgt: %.2f), "
+                            "PE %s x %d @ Rs %.2f [%s] (SL: %.2f, Tgt: %.2f). Adopting into active state.",
+                            scan_expiry,
+                            ce_leg["symbol"], qty, ce_entry, ce_leg["product"], ce_sl, ce_tgt,
+                            pe_leg["symbol"], qty, pe_entry, pe_leg["product"], pe_sl, pe_tgt
+                        )
+
+                        state = {
+                            "status": "OPEN",
+                            "mode": getattr(self.order_manager, "mode", "LIVE"),
+                            "date": today_str,
+                            "underlying": underlying,
+                            "expiry": str(scan_expiry),
+                            "lots": total_lots,
+                            "lot_size": lot_size,
+                            "quantity": qty,
+                            "product": ce_leg["product"],
+                            "ce": {
+                                "symbol": ce_leg["symbol"],
+                                "strike": ce_leg["strike"],
+                                "entry_price": ce_entry,
+                                "sl_price": ce_sl,
+                                "target_price": ce_tgt,
+                                "status": "OPEN",
+                                "product": ce_leg["product"],
+                                "order_id": None,
+                                "exit_price": None,
+                                "exit_reason": None
+                            },
+                            "pe": {
+                                "symbol": pe_leg["symbol"],
+                                "strike": pe_leg["strike"],
+                                "entry_price": pe_entry,
+                                "sl_price": pe_sl,
+                                "target_price": pe_tgt,
+                                "status": "OPEN",
+                                "product": pe_leg["product"],
+                                "order_id": None,
+                                "exit_price": None,
+                                "exit_reason": None
+                            }
+                        }
+                        self.save_state(state)
+                        adopted = True
+                        break
 
             return state
         except Exception as e:
@@ -542,18 +688,19 @@ class StrangleDesk:
         self,
         kite: Any,
         underlying: str = "NIFTY",
-        threshold_pct: float = 0.60
+        threshold_pct: float = 0.60,
+        enforce_quote_window: bool = False,
     ) -> Tuple[bool, Dict[str, Any]]:
         """
         Inspects 09:15 to 10:00 morning price action for underlying.
         Returns (is_trend_day, details_dict).
         If (high - low) / open >= threshold_pct, triggers trend day filter to skip session.
         """
-        token = 256265 if underlying == "NIFTY" else None
+        token = 256265 if underlying == "NIFTY" else (260105 if underlying == "BANKNIFTY" else None)
         now_dt = datetime.now()
         today = now_dt.date()
         from_dt = datetime.combine(today, dt_time(9, 15))
-        to_dt = datetime.combine(today, dt_time(10, 5))
+        to_dt = datetime.combine(today, dt_time(10, 0))
 
         try:
             if token and hasattr(kite, "historical_data"):
@@ -564,16 +711,18 @@ class StrangleDesk:
                     interval="5minute"
                 )
                 if candles:
-                    valid_candles = []
+                    parsed_candles = []
                     for c in candles:
                         c_dt = c.get("date")
                         if isinstance(c_dt, str):
                             try:
                                 c_dt = datetime.fromisoformat(c_dt)
                             except Exception:
-                                pass
-                        if isinstance(c_dt, datetime) and c_dt.time() <= dt_time(10, 5):
-                            valid_candles.append(c)
+                                c_dt = None
+                        parsed_candles.append((c_dt, c))
+                    valid_candles = [c for c_dt, c in parsed_candles if isinstance(c_dt, datetime) and c_dt.time() < dt_time(10, 0)]
+                    if not valid_candles:
+                        valid_candles = [c for c_dt, c in parsed_candles if isinstance(c_dt, datetime) and c_dt.time() <= dt_time(10, 5)]
                     if not valid_candles:
                         valid_candles = candles
 
@@ -599,12 +748,14 @@ class StrangleDesk:
                     )
                     return is_triggered, details
         except Exception as e:
+            if is_token_error(e):
+                raise
             logger.warning("Failed to fetch 5m candles for morning filter (%s); checking quote OHLC...", e)
 
-        # Fallback to quote/OHLC
+        # Fallback to quote/OHLC only near the morning entry window when enforce_quote_window=True
         try:
-            sym = "NSE:NIFTY 50" if underlying == "NIFTY" else f"NSE:{underlying}"
-            if hasattr(kite, "quote"):
+            sym = "NSE:NIFTY 50" if underlying == "NIFTY" else ("NSE:NIFTY BANK" if underlying == "BANKNIFTY" else f"NSE:{underlying}")
+            if hasattr(kite, "quote") and (not enforce_quote_window or now_dt.time() <= dt_time(10, 15)):
                 q_data = kite.quote([sym]).get(sym, {})
                 ohlc = q_data.get("ohlc", {})
                 open_price = float(ohlc.get("open") or 0.0)
@@ -630,6 +781,8 @@ class StrangleDesk:
                     )
                     return is_triggered, details
         except Exception as e:
+            if is_token_error(e):
+                raise
             logger.warning("Quote OHLC lookup failed for morning filter: %s", e)
 
         return False, {"triggered": False, "reason": "No morning OHLC available"}
@@ -654,7 +807,8 @@ class StrangleDesk:
         morning_filter_pct: float = 0.60,
         strike_mode: str = "ATR",
         atr_multiplier: float = 1.25,
-        target_price: float = 30.0
+        target_price: float = 30.0,
+        exit_time_str: str = "14:45",
     ) -> Optional[Dict[str, Any]]:
         """
         Executes and monitors the 10:00 AM Short Strangle intraday session.
@@ -669,9 +823,11 @@ class StrangleDesk:
                 # Exchange closed notification removed per policy
                 return {"status": "HOLIDAY", "reason": reason}
 
-        # Market Hours Validation (prevent placing regular orders outside NSE trading hours)
+        # Market Hours & Cutoff Validation (prevent placing regular orders outside NSE trading hours / after cutoff)
         mode = getattr(self.order_manager, "mode", "PAPER")
         now_time = datetime.now().time()
+        exit_h, exit_m = map(int, exit_time_str.split(":"))
+        cutoff_time = dt_time(exit_h, exit_m)
         if mode == "LIVE" and not dry_run and not ignore_holidays and check_market_hours:
             if now_time < dt_time(9, 15) or now_time > dt_time(15, 30):
                 err_msg = (
@@ -686,7 +842,13 @@ class StrangleDesk:
         today_str = datetime.now().strftime("%Y-%m-%d")
 
         if state is not None:
-            if state.get("date") != today_str:
+            if state.get("mode") and state.get("mode") != mode:
+                logger.warning(
+                    "Loaded state belongs to %s mode (%s != %s). Ignoring mismatched state file.",
+                    state.get("mode"), state.get("mode"), mode
+                )
+                state = None
+            elif state.get("date") != today_str:
                 logger.info("Existing state from prior date (%s != %s). Initializing fresh session.", state.get("date"), today_str)
                 self.clear_state()
                 state = None
@@ -694,10 +856,18 @@ class StrangleDesk:
                 logger.info("Session for today (%s) is already %s.", today_str, state.get("status"))
                 return state
 
+        if state is None and check_market_hours and not dry_run and now_time >= cutoff_time:
+            err_msg = (
+                f"Cannot enter new strangle session at {now_time.strftime('%H:%M:%S')} IST "
+                f"(at or after configured cutoff {exit_time_str} IST)."
+            )
+            logger.warning(err_msg)
+            return {"status": "AFTER_CUTOFF", "reason": err_msg}
+
         if kite is None:
             kite = getattr(self.order_manager, "kite", None)
 
-        if not dry_run and kite is not None:
+        if mode == "LIVE" and not dry_run and kite is not None:
             kite = self._ensure_kite_session(kite)
             state = self.reconcile_with_broker(kite, state, underlying=underlying)
 
@@ -709,8 +879,11 @@ class StrangleDesk:
 
             # Evaluate Morning Range Trend Filter (skips violent morning moves >= 0.60%)
             if morning_filter and not dry_run:
+                filter_kwargs: Dict[str, Any] = {"underlying": underlying, "threshold_pct": morning_filter_pct}
+                if check_market_hours:
+                    filter_kwargs["enforce_quote_window"] = True
                 is_trend_day, filter_details = self.check_morning_trend_filter(
-                    kite, underlying=underlying, threshold_pct=morning_filter_pct
+                    kite, **filter_kwargs
                 )
                 if is_trend_day:
                     err_msg = (
@@ -761,7 +934,7 @@ class StrangleDesk:
                     raise
 
             mode = getattr(self.order_manager, "mode", "PAPER")
-            self._print_plan(strikes, mode=mode)
+            self._print_plan(strikes, mode=mode, exit_time_str=exit_time_str)
 
             if dry_run:
                 logger.info("Dry-run complete. Strike plan displayed above. No orders submitted.")
@@ -798,6 +971,9 @@ class StrangleDesk:
             except Exception as e:
                 pe_err = e
 
+            if getattr(self.order_manager, "kite", None) is not None:
+                kite = self.order_manager.kite
+
             # Handle failures
             if ce_err and pe_err:
                 err_msg = f"Failed to place CE entry order ({ce_info['symbol']}): {ce_err} (PE also failed: {pe_err})"
@@ -829,13 +1005,32 @@ class StrangleDesk:
                         pe_filled = int(pe_status.get("filled_quantity") or 0)
                         if pe_filled > 0:
                             logger.warning("PE leg was partially/fully filled (%d qty). Buying back to close exposure...", pe_filled)
-                            self.order_manager.buy_to_cover(
+                            leg_prod = getattr(self.order_manager, "product", "MIS")
+                            rb_res = self.order_manager.buy_to_cover(
                                 symbol=pe_info["symbol"],
                                 quantity=pe_filled,
-                                price=pe_info["ltp"] * 1.05,
+                                price=pe_info["ltp"],
                                 reason="ABORT_CLEANUP",
-                                order_type=order_type
+                                order_type=order_type,
+                                buffer_pct=limit_buffer_pct,
+                                product=leg_prod,
                             )
+                            rb_id = rb_res.get("order_id") if isinstance(rb_res, dict) else None
+                            if mode == "LIVE" and isinstance(rb_id, str):
+                                rb_st = self.wait_for_order_completion(rb_id, timeout_seconds=10, poll_seconds=1)
+                                if rb_st.get("status") != "COMPLETE" and order_type.upper() != "MARKET":
+                                    self.order_manager.cancel_order(rb_id)
+                                    rb_post = self.wait_for_order_completion(rb_id, timeout_seconds=5, poll_seconds=1, execute_once=True)
+                                    rem_rb = max(0, pe_filled - int(rb_post.get("filled_quantity") or 0))
+                                    if rem_rb > 0:
+                                        self.order_manager.buy_to_cover(
+                                            symbol=pe_info["symbol"],
+                                            quantity=rem_rb,
+                                            price=pe_info["ltp"],
+                                            reason="ABORT_CLEANUP",
+                                            order_type="MARKET",
+                                            product=leg_prod,
+                                        )
                     except Exception as clean_err:
                         logger.error("Failed to clean up PE leg after CE entry failure: %s", clean_err)
                 aborted_state = {
@@ -862,13 +1057,32 @@ class StrangleDesk:
                         ce_filled = int(ce_status.get("filled_quantity") or 0)
                         if ce_filled > 0:
                             logger.warning("CE leg was partially/fully filled (%d qty). Buying back to close exposure...", ce_filled)
-                            self.order_manager.buy_to_cover(
+                            leg_prod = getattr(self.order_manager, "product", "MIS")
+                            rb_res = self.order_manager.buy_to_cover(
                                 symbol=ce_info["symbol"],
                                 quantity=ce_filled,
-                                price=ce_info["ltp"] * 1.05,
+                                price=ce_info["ltp"],
                                 reason="ABORT_CLEANUP",
-                                order_type=order_type
+                                order_type=order_type,
+                                buffer_pct=limit_buffer_pct,
+                                product=leg_prod,
                             )
+                            rb_id = rb_res.get("order_id") if isinstance(rb_res, dict) else None
+                            if mode == "LIVE" and isinstance(rb_id, str):
+                                rb_st = self.wait_for_order_completion(rb_id, timeout_seconds=10, poll_seconds=1)
+                                if rb_st.get("status") != "COMPLETE" and order_type.upper() != "MARKET":
+                                    self.order_manager.cancel_order(rb_id)
+                                    rb_post = self.wait_for_order_completion(rb_id, timeout_seconds=5, poll_seconds=1, execute_once=True)
+                                    rem_rb = max(0, ce_filled - int(rb_post.get("filled_quantity") or 0))
+                                    if rem_rb > 0:
+                                        self.order_manager.buy_to_cover(
+                                            symbol=ce_info["symbol"],
+                                            quantity=rem_rb,
+                                            price=ce_info["ltp"],
+                                            reason="ABORT_CLEANUP",
+                                            order_type="MARKET",
+                                            product=leg_prod,
+                                        )
                     except Exception as clean_err:
                         logger.error("Failed to clean up CE leg after PE entry failure: %s", clean_err)
                 aborted_state = {
@@ -910,11 +1124,15 @@ class StrangleDesk:
                     pe_filled,
                     total_qty
                 )
-                # 1. Cancel remaining open/pending order quantity on exchange
+                # 1. Cancel remaining open/pending order quantity on exchange and re-read settled fill count
                 if ce_status.get("status") not in ("COMPLETE", "REJECTED", "CANCELLED") or ce_status.get("pending_quantity", 0) > 0:
                     self.order_manager.cancel_order(ce_id)
+                    ce_post = self.wait_for_order_completion(ce_id, timeout_seconds=5, poll_seconds=1, execute_once=True)
+                    ce_filled = max(ce_filled, int(ce_post.get("filled_quantity") or 0))
                 if pe_status.get("status") not in ("COMPLETE", "REJECTED", "CANCELLED") or pe_status.get("pending_quantity", 0) > 0:
                     self.order_manager.cancel_order(pe_id)
+                    pe_post = self.wait_for_order_completion(pe_id, timeout_seconds=5, poll_seconds=1, execute_once=True)
+                    pe_filled = max(pe_filled, int(pe_post.get("filled_quantity") or 0))
 
                 # 2. Fetch latest quotes to exit any filled quantities
                 exit_quotes: Dict[str, Any] = {}
@@ -930,20 +1148,29 @@ class StrangleDesk:
                 ce_exit_ltp = self._extract_ltp(exit_quotes, ce_info['symbol'], default=ce_info['ltp'])
                 pe_exit_ltp = self._extract_ltp(exit_quotes, pe_info['symbol'], default=pe_info['ltp'])
 
-                # 3. Square off any filled positions immediately
-                if ce_filled > 0:
-                    ce_reason = "ABORT_PARTIAL_FILL" if ce_filled < total_qty else "ABORT_UNMATCHED_LEG"
-                    logger.warning("Exiting %d filled shares of CE %s (%s)", ce_filled, ce_info['symbol'], ce_reason)
-                    self.order_manager.buy_to_cover(
-                        ce_info['symbol'], ce_filled, ce_exit_ltp, reason=ce_reason, order_type=order_type, buffer_pct=limit_buffer_pct
+                # 3. Square off any filled positions immediately (and verify completion / escalate in LIVE)
+                for leg_sym, leg_filled, leg_exit_ltp, leg_side_lbl in (
+                    (ce_info["symbol"], ce_filled, ce_exit_ltp, "CE"),
+                    (pe_info["symbol"], pe_filled, pe_exit_ltp, "PE"),
+                ):
+                    if leg_filled <= 0:
+                        continue
+                    abort_reason = "ABORT_PARTIAL_FILL" if leg_filled < total_qty else "ABORT_UNMATCHED_LEG"
+                    logger.warning("Exiting %d filled shares of %s %s (%s)", leg_filled, leg_side_lbl, leg_sym, abort_reason)
+                    rb_res = self.order_manager.buy_to_cover(
+                        leg_sym, leg_filled, leg_exit_ltp, reason=abort_reason, order_type=order_type, buffer_pct=limit_buffer_pct
                     )
-
-                if pe_filled > 0:
-                    pe_reason = "ABORT_PARTIAL_FILL" if pe_filled < total_qty else "ABORT_UNMATCHED_LEG"
-                    logger.warning("Exiting %d filled shares of PE %s (%s)", pe_filled, pe_info['symbol'], pe_reason)
-                    self.order_manager.buy_to_cover(
-                        pe_info['symbol'], pe_filled, pe_exit_ltp, reason=pe_reason, order_type=order_type, buffer_pct=limit_buffer_pct
-                    )
+                    rb_id = rb_res.get("order_id") if isinstance(rb_res, dict) else None
+                    if mode == "LIVE" and isinstance(rb_id, str):
+                        rb_st = self.wait_for_order_completion(rb_id, timeout_seconds=10, poll_seconds=1)
+                        if rb_st.get("status") != "COMPLETE" and order_type.upper() != "MARKET":
+                            self.order_manager.cancel_order(rb_id)
+                            rb_post = self.wait_for_order_completion(rb_id, timeout_seconds=5, poll_seconds=1, execute_once=True)
+                            rem_rb = max(0, leg_filled - int(rb_post.get("filled_quantity") or 0))
+                            if rem_rb > 0:
+                                self.order_manager.buy_to_cover(
+                                    leg_sym, rem_rb, leg_exit_ltp, reason=abort_reason, order_type="MARKET"
+                                )
 
                 # 4. Telegram alert
                 if self.notifier:
@@ -996,9 +1223,9 @@ class StrangleDesk:
             if self.notifier:
                 risk_cap_str = f"Max Rs {strategy_max_loss:,.0f} portfolio loss" if strategy_max_loss is not None else "None"
                 exit_rule_desc = (
-                    f"Single-Leg 50% SL (winner stays open & trails to cost) | Target: 80% decay | Cutoff: 14:45 IST"
+                    f"Single-Leg 50% SL (winner stays open & trails to cost) | Target: 80% decay | Cutoff: {exit_time_str} IST"
                     if use_leg_sl
-                    else f"Portfolio SL: {risk_cap_str} | Target: 80% decay (both exit) | Cutoff: 14:45 IST"
+                    else f"Portfolio SL: {risk_cap_str} | Target: 80% decay (both exit) | Cutoff: {exit_time_str} IST"
                 )
                 entry_msg = (
                     f"🚀 <b>NIFTY 10:00 AM Strangle Opened [{mode}]</b>\n"
@@ -1012,10 +1239,12 @@ class StrangleDesk:
 
             state = {
                 "status": "OPEN",
+                "mode": mode,
                 "date": today_str,
                 "underlying": underlying,
                 "expiry": str(strikes["expiry"]),
                 "lots": strikes["total_lots"],
+                "lot_size": strikes.get("lot_size", 65),
                 "quantity": total_qty,
                 "ce": {
                     "symbol": ce_info["symbol"],
@@ -1025,6 +1254,7 @@ class StrangleDesk:
                     "target_price": ce_tgt,
                     "status": "OPEN",
                     "order_id": ce_id,
+                    **({"order_ids": ce_order["order_ids"]} if isinstance(ce_order, dict) and ce_order.get("order_ids") else {}),
                     "exit_price": None,
                     "exit_reason": None
                 },
@@ -1036,6 +1266,7 @@ class StrangleDesk:
                     "target_price": pe_tgt,
                     "status": "OPEN",
                     "order_id": pe_id,
+                    **({"order_ids": pe_order["order_ids"]} if isinstance(pe_order, dict) and pe_order.get("order_ids") else {}),
                     "exit_price": None,
                     "exit_reason": None
                 }
@@ -1046,14 +1277,27 @@ class StrangleDesk:
         if kite is None:
             kite = getattr(self.order_manager, "kite", None)
 
+        exit_h, exit_m = map(int, exit_time_str.split(":"))
+        cutoff_time = dt_time(exit_h, exit_m)
+        last_intraday_reconcile_ts = time.time()
+
         ce_sym = state["ce"]["symbol"]
         pe_sym = state["pe"]["symbol"]
-        qty = state.get("quantity", lots * 65)
+        qty = int(state.get("quantity") or (lots * int(state.get("lot_size") or 65)))
 
         while state.get("status") == "OPEN":
-            # Current time check: 2:45 PM cutoff (avoids 3pm expiry gamma spikes)
-            if datetime.now().time() >= dt_time(14, 45):
-                logger.info("Intraday 14:45 cutoff reached. Closing all open strangle legs.")
+            # Periodic intraday broker reconciliation (LIVE) so manual Kite exits aren't re-entered
+            if mode == "LIVE" and kite is not None and not execute_once and (time.time() - last_intraday_reconcile_ts) >= 60.0:
+                reconciled = self.reconcile_with_broker(kite, state, underlying=underlying)
+                if isinstance(reconciled, dict):
+                    state = reconciled
+                last_intraday_reconcile_ts = time.time()
+                if state.get("status") != "OPEN":
+                    break
+
+            # Current time check: configured intraday cutoff (default 14:45 IST)
+            if datetime.now().time() >= cutoff_time:
+                logger.info("Intraday %s cutoff reached. Closing all open strangle legs.", exit_time_str)
                 quotes: Dict[str, Any] = {}
                 if kite is not None:
                     try:
@@ -1062,25 +1306,35 @@ class StrangleDesk:
                     except Exception as e:
                         logger.warning("Could not fetch final quotes at cutoff: %s", e)
 
-                ce_ltp = self._extract_ltp(quotes, ce_sym, default=state["ce"]["entry_price"])
-                pe_ltp = self._extract_ltp(quotes, pe_sym, default=state["pe"]["entry_price"])
+                ce_fallback = state["ce"].get("last_ltp") or state["ce"]["entry_price"]
+                pe_fallback = state["pe"].get("last_ltp") or state["pe"]["entry_price"]
+                ce_ltp = self._extract_ltp(quotes, ce_sym, default=ce_fallback)
+                pe_ltp = self._extract_ltp(quotes, pe_sym, default=pe_fallback)
 
                 if state["ce"].get("status") == "OPEN":
-                    self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "TIME_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                    self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "TIME_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5, escalate_to_market=True)
 
                 if state["pe"].get("status") == "OPEN":
-                    self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "TIME_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                    self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "TIME_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5, escalate_to_market=True)
 
                 if state["ce"].get("status") == "CLOSED" and state["pe"].get("status") == "CLOSED":
+                    total_day_pnl = self._get_current_day_pnl(state, qty)
                     state["status"] = "COMPLETED"
+                    state["realized_pnl"] = total_day_pnl
                     self.save_state(state)
                     if self.notifier:
-                        total_day_pnl = self._get_current_day_pnl(state, qty)
+                        ce_fin = float(state["ce"]["exit_price"]) if state["ce"].get("exit_price") is not None else ce_ltp
+                        pe_fin = float(state["pe"]["exit_price"]) if state["pe"].get("exit_price") is not None else pe_ltp
                         self.notifier.send_message(
-                            f"🏁 <b>14:45 Cutoff Exit</b>: Closed open legs (CE @ ₹{ce_ltp:.2f}, PE @ ₹{pe_ltp:.2f})\n\n"
+                            f"🏁 <b>{exit_time_str} Cutoff Exit</b>: Closed open legs (CE @ ₹{ce_fin:.2f}, PE @ ₹{pe_fin:.2f})\n\n"
                             f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
                         )
                     break
+
+                if execute_once:
+                    break
+                time.sleep(poll_seconds)
+                continue
 
             # Fetch live quotes
             if kite is None:
@@ -1109,15 +1363,29 @@ class StrangleDesk:
                     time.sleep(poll_seconds)
                     continue
 
-            ce_ltp = self._extract_ltp(quotes, ce_sym, default=state["ce"]["entry_price"])
-            pe_ltp = self._extract_ltp(quotes, pe_sym, default=state["pe"]["entry_price"])
+            ce_ltp = self._extract_ltp(quotes, ce_sym, default=state["ce"].get("last_ltp") or state["ce"]["entry_price"])
+            pe_ltp = self._extract_ltp(quotes, pe_sym, default=state["pe"].get("last_ltp") or state["pe"]["entry_price"])
+            state["ce"]["last_ltp"] = ce_ltp
+            state["pe"]["last_ltp"] = pe_ltp
 
             ce_status = state["ce"].get("status")
             pe_status = state["pe"].get("status")
             ce_entry = float(state["ce"]["entry_price"])
             pe_entry = float(state["pe"]["entry_price"])
-            ce_pnl = (ce_entry - ce_ltp) * qty if ce_status == "OPEN" else (ce_entry - float(state["ce"].get("exit_price") or ce_ltp)) * qty
-            pe_pnl = (pe_entry - pe_ltp) * qty if pe_status == "OPEN" else (pe_entry - float(state["pe"].get("exit_price") or pe_ltp)) * qty
+            ce_done_qty = int(state["ce"].get("exit_filled_qty") or 0)
+            pe_done_qty = int(state["pe"].get("exit_filled_qty") or 0)
+            ce_exit_val = float(state["ce"]["exit_price"]) if state["ce"].get("exit_price") is not None else ce_ltp
+            pe_exit_val = float(state["pe"]["exit_price"]) if state["pe"].get("exit_price") is not None else pe_ltp
+            ce_pnl = (
+                ((ce_entry - ce_exit_val) * ce_done_qty + (ce_entry - ce_ltp) * max(0, qty - ce_done_qty))
+                if ce_status == "OPEN"
+                else (ce_entry - ce_exit_val) * qty
+            )
+            pe_pnl = (
+                ((pe_entry - pe_exit_val) * pe_done_qty + (pe_entry - pe_ltp) * max(0, qty - pe_done_qty))
+                if pe_status == "OPEN"
+                else (pe_entry - pe_exit_val) * qty
+            )
             total_strategy_pnl = ce_pnl + pe_pnl
             logger.info(
                 "Tick | CE (%s): LTP=%.2f, P&L=Rs %.2f [%s] | PE (%s): LTP=%.2f, P&L=Rs %.2f [%s] | Total Strangle P&L=Rs %.2f",
@@ -1128,26 +1396,34 @@ class StrangleDesk:
 
             # 1. Evaluate strategy-level portfolio stop loss (circuit breaker)
             effective_max_loss = strategy_max_loss if strategy_max_loss is not None else 10000.0
+            single_leg_exited_this_tick = False
+            attempted_exit_legs = set()
             if total_strategy_pnl <= -effective_max_loss:
                 if use_leg_sl:
-                    # In single-leg mode, do NOT dump both legs simultaneously!
-                    # Only exit the losing leg, letting the winning leg cushion the drawdown
+                    # In single-leg mode, exit ONLY the losing leg and arm cost trail (never cascade in the same tick!)
                     if state["ce"].get("status") == "OPEN" and state["pe"].get("status") == "OPEN":
                         if ce_pnl < pe_pnl:
                             logger.warning(
                                 "Combined loss Rs %.2f >= limit Rs %.2f. Exiting losing CE leg (PnL: Rs %.2f). PE remains OPEN.",
                                 abs(total_strategy_pnl), effective_max_loss, ce_pnl
                             )
-                            if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "SINGLE_LEG_10K_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
+                            attempted_exit_legs.add("ce")
+                            if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "SINGLE_LEG_10K_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5, escalate_to_market=True):
+                                single_leg_exited_this_tick = True
                                 if trail_to_cost and state["pe"].get("status") == "OPEN":
-                                    state["pe"]["sl_price"] = pe_entry
+                                    state["pe"]["cost_trail_pending"] = True
+                                    if pe_ltp < pe_entry:
+                                        state["pe"]["sl_price"] = pe_entry
+                                        state["pe"]["cost_trail_pending"] = False
                                     self.save_state(state)
                                 if self.notifier:
                                     total_day_pnl = self._get_current_day_pnl(state, qty)
+                                    ce_fin = float(state["ce"]["exit_price"]) if state["ce"].get("exit_price") is not None else ce_ltp
+                                    ce_realized_pnl = (ce_entry - ce_fin) * qty
                                     self.notifier.send_message(
                                         f"🚨 <b>PORTFOLIO 10K THRESHOLD HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}.\n"
-                                        f"Exited losing CE leg @ ₹{ce_ltp:.2f} (Loss: ₹{ce_pnl:+,.2f}).\n"
-                                        f"PE leg remains <b>OPEN</b> (trailed to cost ₹{pe_entry:.2f}) to harvest decay!\n\n"
+                                        f"Exited losing CE leg @ ₹{ce_fin:.2f} (Loss: ₹{ce_realized_pnl:+,.2f}).\n"
+                                        f"PE leg remains <b>OPEN</b> (cost trail armed at ₹{pe_entry:.2f}) to harvest decay!\n\n"
                                         f"📊 <b>Current Day P&L: ₹{total_day_pnl:+,.2f}</b>"
                                     )
                         else:
@@ -1155,141 +1431,181 @@ class StrangleDesk:
                                 "Combined loss Rs %.2f >= limit Rs %.2f. Exiting losing PE leg (PnL: Rs %.2f). CE remains OPEN.",
                                 abs(total_strategy_pnl), effective_max_loss, pe_pnl
                             )
-                            if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "SINGLE_LEG_10K_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
+                            attempted_exit_legs.add("pe")
+                            if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "SINGLE_LEG_10K_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5, escalate_to_market=True):
+                                single_leg_exited_this_tick = True
                                 if trail_to_cost and state["ce"].get("status") == "OPEN":
-                                    state["ce"]["sl_price"] = ce_entry
+                                    state["ce"]["cost_trail_pending"] = True
+                                    if ce_ltp < ce_entry:
+                                        state["ce"]["sl_price"] = ce_entry
+                                        state["ce"]["cost_trail_pending"] = False
                                     self.save_state(state)
                                 if self.notifier:
                                     total_day_pnl = self._get_current_day_pnl(state, qty)
+                                    pe_fin = float(state["pe"]["exit_price"]) if state["pe"].get("exit_price") is not None else pe_ltp
+                                    pe_realized_pnl = (pe_entry - pe_fin) * qty
                                     self.notifier.send_message(
                                         f"🚨 <b>PORTFOLIO 10K THRESHOLD HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}.\n"
-                                        f"Exited losing PE leg @ ₹{pe_ltp:.2f} (Loss: ₹{pe_pnl:+,.2f}).\n"
-                                        f"CE leg remains <b>OPEN</b> (trailed to cost ₹{ce_entry:.2f}) to harvest decay!\n\n"
+                                        f"Exited losing PE leg @ ₹{pe_fin:.2f} (Loss: ₹{pe_realized_pnl:+,.2f}).\n"
+                                        f"CE leg remains <b>OPEN</b> (cost trail armed at ₹{ce_entry:.2f}) to harvest decay!\n\n"
                                         f"📊 <b>Current Day P&L: ₹{total_day_pnl:+,.2f}</b>"
                                     )
                     elif state["ce"].get("status") == "OPEN":
-                        # Only CE leg was still open
-                        self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
-                        if self.notifier:
-                            total_day_pnl = self._get_current_day_pnl(state, qty)
-                            self.notifier.send_message(
-                                f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}. Exited remaining CE leg!\n\n"
-                                f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
-                            )
+                        attempted_exit_legs.add("ce")
+                        if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5, escalate_to_market=True):
+                            if self.notifier:
+                                total_day_pnl = self._get_current_day_pnl(state, qty)
+                                self.notifier.send_message(
+                                    f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}. Exited remaining CE leg!\n\n"
+                                    f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
+                                )
                     elif state["pe"].get("status") == "OPEN":
-                        # Only PE leg was still open
-                        self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
-                        if self.notifier:
-                            total_day_pnl = self._get_current_day_pnl(state, qty)
-                            self.notifier.send_message(
-                                f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}. Exited remaining PE leg!\n\n"
-                                f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
-                            )
+                        attempted_exit_legs.add("pe")
+                        if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5, escalate_to_market=True):
+                            if self.notifier:
+                                total_day_pnl = self._get_current_day_pnl(state, qty)
+                                self.notifier.send_message(
+                                    f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}. Exited remaining PE leg!\n\n"
+                                    f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
+                                )
                 else:
-                    # Legacy Option 3 dual-leg simultaneous exit
                     logger.warning(
                         "Total strategy loss Rs %.2f >= limit Rs %.2f. Triggering immediate portfolio exit for all open legs simultaneously.",
                         abs(total_strategy_pnl), effective_max_loss
                     )
+                    ce_closed_ok = True
+                    pe_closed_ok = True
                     if state["ce"].get("status") == "OPEN":
-                        self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                        attempted_exit_legs.add("ce")
+                        ce_closed_ok = self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5, escalate_to_market=True)
                     if state["pe"].get("status") == "OPEN":
-                        self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
-                    if self.notifier:
+                        attempted_exit_legs.add("pe")
+                        pe_closed_ok = self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STRATEGY_MAX_LOSS_10K", order_type, limit_buffer_pct, state, min_buffer_rs=1.5, escalate_to_market=True)
+                    if self.notifier and ce_closed_ok and pe_closed_ok:
                         total_day_pnl = self._get_current_day_pnl(state, qty)
                         self.notifier.send_message(
                             f"🚨 <b>PORTFOLIO STOP LOSS HIT</b>: Total loss ₹{abs(total_strategy_pnl):,.2f} >= ₹{effective_max_loss:,.2f}. Exited all open legs!\n\n"
                             f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
                         )
 
-            # 2. Evaluate individual CE leg
-            if state["ce"].get("status") == "OPEN":
-                ce_sl = state["ce"].get("sl_price")
-                ce_target = state["ce"].get("target_price")
-
-                if use_leg_sl and ce_sl is not None and ce_ltp >= ce_sl:
-                    logger.warning("CE Stop-Loss hit! LTP: %.2f >= SL: %.2f. Exiting CE leg only.", ce_ltp, ce_sl)
-                    if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
-                        # Trail opposite PE leg to breakeven/cost
-                        if trail_to_cost and state["pe"].get("status") == "OPEN":
-                            state["pe"]["sl_price"] = pe_entry
+            # Skip leg SL check on same tick after SINGLE_LEG_10K_EXIT to prevent instant cascade double-exit
+            if not single_leg_exited_this_tick:
+                # 2. Apply any pending cost trail once surviving leg moves below entry
+                for l_name, l_ltp, l_entry in (("ce", ce_ltp, ce_entry), ("pe", pe_ltp, pe_entry)):
+                    leg_d = state[l_name]
+                    cur_sl = float(leg_d["sl_price"]) if leg_d.get("sl_price") is not None else l_entry
+                    if leg_d.get("status") == "OPEN" and leg_d.get("cost_trail_pending") and cur_sl > l_entry:
+                        if l_ltp < l_entry:
+                            leg_d["sl_price"] = l_entry
+                            leg_d["cost_trail_pending"] = False
                             self.save_state(state)
-                            logger.info("Trailed PE stop-loss to cost/breakeven: %.2f", pe_entry)
-                        if self.notifier:
-                            leg_pnl = (ce_entry - ce_ltp) * qty
-                            total_day_pnl = self._get_current_day_pnl(state, qty)
-                            trail_note = f"\nPE leg stop loss trailed to cost (₹{pe_entry:.2f})." if (trail_to_cost and state['pe'].get('status') == 'OPEN') else ""
-                            self.notifier.send_message(
-                                f"🛑 <b>STOP LOSS HIT</b>: CE <code>{ce_sym}</code> exited @ ₹{ce_ltp:.2f} (SL: ₹{ce_sl:.2f})\n"
-                                f"PE leg remains <b>OPEN</b> to harvest theta decay!{trail_note}\n"
-                                f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
-                                f"📊 <b>Current Day P&L: ₹{total_day_pnl:+,.2f}</b>"
-                            )
+                            logger.info("Locked pending cost trail for %s @ Rs %.2f", l_name.upper(), l_entry)
 
-                elif ce_target is not None and ce_ltp <= ce_target:
-                    logger.info("CE Decay Target reached! LTP: %.2f <= Target: %.2f.", ce_ltp, ce_target)
-                    if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
-                        # If legacy dual-leg mode, close opposite PE
-                        if not use_leg_sl and state["pe"].get("status") == "OPEN":
-                            self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
-                        if self.notifier:
-                            ce_entry = float(state["ce"]["entry_price"])
-                            leg_pnl = (ce_entry - ce_ltp) * qty
-                            total_day_pnl = self._get_current_day_pnl(state, qty)
-                            self.notifier.send_message(
-                                f"🎯 <b>DECAY TARGET REACHED</b>: CE <code>{ce_sym}</code> exited @ ₹{ce_ltp:.2f} (Target: ₹{ce_target:.2f})\n"
-                                f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
-                                f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
-                            )
+                # 3. Evaluate individual CE leg
+                if state["ce"].get("status") == "OPEN" and "ce" not in attempted_exit_legs:
+                    ce_sl = state["ce"].get("sl_price")
+                    ce_target = state["ce"].get("target_price")
 
-            # 3. Evaluate individual PE leg
-            if state["pe"].get("status") == "OPEN":
-                pe_sl = state["pe"].get("sl_price")
-                pe_target = state["pe"].get("target_price")
-
-                if use_leg_sl and pe_sl is not None and pe_ltp >= pe_sl:
-                    logger.warning("PE Stop-Loss hit! LTP: %.2f >= SL: %.2f. Exiting PE leg only.", pe_ltp, pe_sl)
-                    if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
-                        # Trail opposite CE leg to breakeven/cost
-                        if trail_to_cost and state["ce"].get("status") == "OPEN":
-                            state["ce"]["sl_price"] = ce_entry
+                    if use_leg_sl and ce_sl is not None and ce_ltp >= ce_sl:
+                        logger.warning("CE Stop-Loss hit! LTP: %.2f >= SL: %.2f. Exiting CE leg only.", ce_ltp, ce_sl)
+                        sl_retry = int(state["ce"].get("sl_retry_count") or 0)
+                        if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state, min_buffer_rs=1.5, escalate_to_market=(sl_retry >= 1)):
+                            if trail_to_cost and state["pe"].get("status") == "OPEN":
+                                state["pe"]["cost_trail_pending"] = True
+                                if pe_ltp < pe_entry:
+                                    state["pe"]["sl_price"] = pe_entry
+                                    state["pe"]["cost_trail_pending"] = False
+                                    logger.info("Trailed PE stop-loss to cost/breakeven: %.2f", pe_entry)
+                                self.save_state(state)
+                            if self.notifier:
+                                ce_fin = float(state["ce"]["exit_price"]) if state["ce"].get("exit_price") is not None else ce_ltp
+                                leg_pnl = (ce_entry - ce_fin) * qty
+                                total_day_pnl = self._get_current_day_pnl(state, qty)
+                                trail_note = f"\nPE leg stop loss trailed to cost (₹{pe_entry:.2f})." if (trail_to_cost and state['pe'].get('status') == 'OPEN' and state['pe'].get('sl_price') == pe_entry) else ""
+                                self.notifier.send_message(
+                                    f"🛑 <b>STOP LOSS HIT</b>: CE <code>{ce_sym}</code> exited @ ₹{ce_fin:.2f} (SL: ₹{ce_sl:.2f})\n"
+                                    f"PE leg remains <b>OPEN</b> to harvest theta decay!{trail_note}\n"
+                                    f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
+                                    f"📊 <b>Current Day P&L: ₹{total_day_pnl:+,.2f}</b>"
+                                )
+                        else:
+                            state["ce"]["sl_retry_count"] = sl_retry + 1
                             self.save_state(state)
-                            logger.info("Trailed CE stop-loss to cost/breakeven: %.2f", ce_entry)
-                        if self.notifier:
-                            leg_pnl = (pe_entry - pe_ltp) * qty
-                            total_day_pnl = self._get_current_day_pnl(state, qty)
-                            trail_note = f"\nCE leg stop loss trailed to cost (₹{ce_entry:.2f})." if (trail_to_cost and state['ce'].get('status') == 'OPEN') else ""
-                            self.notifier.send_message(
-                                f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ ₹{pe_ltp:.2f} (SL: ₹{pe_sl:.2f})\n"
-                                f"CE leg remains <b>OPEN</b> to harvest theta decay!{trail_note}\n"
-                                f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
-                                f"📊 <b>Current Day P&L: ₹{total_day_pnl:+,.2f}</b>"
-                            )
 
-                elif pe_target is not None and pe_ltp <= pe_target:
-                    logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f.", pe_ltp, pe_target)
-                    if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
-                        # If legacy dual-leg mode, close opposite CE
-                        if not use_leg_sl and state["ce"].get("status") == "OPEN":
-                            self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
-                        if self.notifier:
-                            pe_entry = float(state["pe"]["entry_price"])
-                            leg_pnl = (pe_entry - pe_ltp) * qty
-                            total_day_pnl = self._get_current_day_pnl(state, qty)
-                            self.notifier.send_message(
-                                f"🎯 <b>DECAY TARGET REACHED</b>: PE <code>{pe_sym}</code> exited @ ₹{pe_ltp:.2f} (Target: ₹{pe_target:.2f})\n"
-                                f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
-                                f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
-                            )
+                    elif ce_target is not None and ce_ltp <= ce_target:
+                        logger.info("CE Decay Target reached! LTP: %.2f <= Target: %.2f.", ce_ltp, ce_target)
+                        if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
+                            if not use_leg_sl and state["pe"].get("status") == "OPEN":
+                                self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                            if self.notifier:
+                                ce_entry = float(state["ce"]["entry_price"])
+                                ce_fin = float(state["ce"]["exit_price"]) if state["ce"].get("exit_price") is not None else ce_ltp
+                                leg_pnl = (ce_entry - ce_fin) * qty
+                                total_day_pnl = self._get_current_day_pnl(state, qty)
+                                self.notifier.send_message(
+                                    f"🎯 <b>DECAY TARGET REACHED</b>: CE <code>{ce_sym}</code> exited @ ₹{ce_fin:.2f} (Target: ₹{ce_target:.2f})\n"
+                                    f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
+                                    f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
+                                )
+
+                # 4. Evaluate individual PE leg
+                if state["pe"].get("status") == "OPEN" and "pe" not in attempted_exit_legs:
+                    pe_sl = state["pe"].get("sl_price")
+                    pe_target = state["pe"].get("target_price")
+
+                    if use_leg_sl and pe_sl is not None and pe_ltp >= pe_sl:
+                        logger.warning("PE Stop-Loss hit! LTP: %.2f >= SL: %.2f. Exiting PE leg only.", pe_ltp, pe_sl)
+                        sl_retry = int(state["pe"].get("sl_retry_count") or 0)
+                        if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "STOP_LOSS", order_type, limit_buffer_pct, state, min_buffer_rs=1.5, escalate_to_market=(sl_retry >= 1)):
+                            if trail_to_cost and state["ce"].get("status") == "OPEN":
+                                state["ce"]["cost_trail_pending"] = True
+                                if ce_ltp < ce_entry:
+                                    state["ce"]["sl_price"] = ce_entry
+                                    state["ce"]["cost_trail_pending"] = False
+                                    logger.info("Trailed CE stop-loss to cost/breakeven: %.2f", ce_entry)
+                                self.save_state(state)
+                            if self.notifier:
+                                pe_fin = float(state["pe"]["exit_price"]) if state["pe"].get("exit_price") is not None else pe_ltp
+                                leg_pnl = (pe_entry - pe_fin) * qty
+                                total_day_pnl = self._get_current_day_pnl(state, qty)
+                                trail_note = f"\nCE leg stop loss trailed to cost (₹{ce_entry:.2f})." if (trail_to_cost and state['ce'].get('status') == 'OPEN' and state['ce'].get('sl_price') == ce_entry) else ""
+                                self.notifier.send_message(
+                                    f"🛑 <b>STOP LOSS HIT</b>: PE <code>{pe_sym}</code> exited @ ₹{pe_fin:.2f} (SL: ₹{pe_sl:.2f})\n"
+                                    f"CE leg remains <b>OPEN</b> to harvest theta decay!{trail_note}\n"
+                                    f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
+                                    f"📊 <b>Current Day P&L: ₹{total_day_pnl:+,.2f}</b>"
+                                )
+                        else:
+                            state["pe"]["sl_retry_count"] = sl_retry + 1
+                            self.save_state(state)
+
+                    elif pe_target is not None and pe_ltp <= pe_target:
+                        logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f.", pe_ltp, pe_target)
+                        if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
+                            if not use_leg_sl and state["ce"].get("status") == "OPEN":
+                                self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                            if self.notifier:
+                                pe_entry = float(state["pe"]["entry_price"])
+                                pe_fin = float(state["pe"]["exit_price"]) if state["pe"].get("exit_price") is not None else pe_ltp
+                                leg_pnl = (pe_entry - pe_fin) * qty
+                                total_day_pnl = self._get_current_day_pnl(state, qty)
+                                self.notifier.send_message(
+                                    f"🎯 <b>DECAY TARGET REACHED</b>: PE <code>{pe_sym}</code> exited @ ₹{pe_fin:.2f} (Target: ₹{pe_target:.2f})\n"
+                                    f"Leg Realized P&L: <b>₹{leg_pnl:+,.2f}</b>\n\n"
+                                    f"📊 <b>Total Day Realized P&L: ₹{total_day_pnl:+,.2f}</b>"
+                                )
 
             # If both legs closed, complete session
             if state["ce"].get("status") == "CLOSED" and state["pe"].get("status") == "CLOSED":
                 logger.info("Both strangle legs closed. Marking session as COMPLETED.")
                 state["status"] = "COMPLETED"
+                gross_pnl = self._get_current_day_pnl(state, qty)
+                state["realized_pnl"] = gross_pnl
                 if self.notifier:
-                    ce_pnl = (state["ce"]["entry_price"] - (state["ce"]["exit_price"] or state["ce"]["entry_price"])) * qty
-                    pe_pnl = (state["pe"]["entry_price"] - (state["pe"]["exit_price"] or state["pe"]["entry_price"])) * qty
-                    gross_pnl = ce_pnl + pe_pnl
+                    ce_fin = float(state["ce"]["exit_price"]) if state["ce"].get("exit_price") is not None else float(state["ce"]["entry_price"])
+                    pe_fin = float(state["pe"]["exit_price"]) if state["pe"].get("exit_price") is not None else float(state["pe"]["entry_price"])
+                    ce_pnl = (float(state["ce"]["entry_price"]) - ce_fin) * qty
+                    pe_pnl = (float(state["pe"]["entry_price"]) - pe_fin) * qty
                     summary_msg = (
                         f"📊 <b>Strangle Session Completed</b>\n\n"
                         f"• CE ({state['ce']['exit_reason']}): ₹{ce_pnl:+,.2f}\n"
@@ -1352,6 +1668,8 @@ class StrangleDesk:
         # Daemon started notification removed per policy (alerts only on entry, exit, sl)
 
         entry_h, entry_m = map(int, entry_time_str.split(":"))
+        exit_h, exit_m = map(int, exit_time_str.split(":"))
+        cutoff_time = dt_time(exit_h, exit_m)
         last_heartbeat_hour: int = -1
         last_holiday_date: Optional[date] = None
         last_totp_login_date: Optional[date] = None
@@ -1372,7 +1690,8 @@ class StrangleDesk:
             if now.hour != last_heartbeat_hour:
                 last_heartbeat_hour = now.hour
                 state = self.load_state() or {}
-                market_status = "OPEN" if dt_time(9, 15) <= current_t <= dt_time(15, 30) and now.weekday() < 5 else "CLOSED"
+                hol_closed, _ = is_trading_holiday(check_date=today_d) if not ignore_holidays else (False, None)
+                market_status = "OPEN" if (dt_time(9, 15) <= current_t <= dt_time(15, 30) and not hol_closed) else "CLOSED"
                 logger.info(
                     "Strangle scheduler heartbeat [%s] | Market: %s | Today State: %s | Realized P&L: Rs %.2f",
                     now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1426,10 +1745,12 @@ class StrangleDesk:
                         morning_filter_pct=morning_filter_pct,
                         strike_mode=strike_mode,
                         atr_multiplier=atr_multiplier,
-                        target_price=target_price
+                        target_price=target_price,
+                        exit_time_str=exit_time_str,
                     )
                 except Exception as e:
                     logger.exception("Error during active strangle session: %s", e)
+                time.sleep(idle_sleep_seconds)
                 continue
 
             # 2. If today's session is already completed, aborted, or skipped by morning filter, wait for next trading day
@@ -1465,8 +1786,11 @@ class StrangleDesk:
                 time.sleep(idle_sleep_seconds)
                 continue
 
-            # 6. If at 10:00 AM (entry window: 10:00 - 10:05 IST on trading days):
-            if dt_time(entry_h, entry_m) <= current_t <= dt_time(entry_h, entry_m + 5):
+            # 6. If within 5-minute entry window on trading days (safe across hour boundaries and before cutoff):
+            entry_window_start = dt_time(entry_h, entry_m)
+            end_total_m = min(entry_h * 60 + entry_m + 5, 23 * 60 + 59)
+            entry_window_end = dt_time(end_total_m // 60, end_total_m % 60)
+            if entry_window_start <= current_t <= entry_window_end and current_t < cutoff_time:
                 logger.info("Triggering 10:00 AM Strangle entry for %s...", today_str)
                 try:
                     kite = self._ensure_kite_session(kite, check_market_hours=True, ignore_holidays=ignore_holidays)
@@ -1486,7 +1810,8 @@ class StrangleDesk:
                         morning_filter_pct=morning_filter_pct,
                         strike_mode=strike_mode,
                         atr_multiplier=atr_multiplier,
-                        target_price=target_price
+                        target_price=target_price,
+                        exit_time_str=exit_time_str,
                     )
                     if isinstance(session_res, dict) and session_res.get("status") in ("ABORTED", "COMPLETED", "SKIPPED_TREND_DAY"):
                         logger.info("Strangle session returned %s. Pausing before next scheduler cycle.", session_res.get("status"))

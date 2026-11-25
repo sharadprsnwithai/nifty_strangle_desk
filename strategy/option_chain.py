@@ -47,6 +47,9 @@ def fetch_daily_atr(
         logger.info("Calculated %d-day Daily ATR: %.2f pts (sample size: %d days)", period, calculated_atr, len(sample))
         return calculated_atr
     except Exception as e:
+        from kite.client import is_token_error
+        if is_token_error(e):
+            raise
         logger.warning("Failed to fetch daily ATR (%s). Falling back to default ATR %.1f pts.", e, default_atr)
         return default_atr
 
@@ -146,7 +149,15 @@ def find_strangle_strikes(
     total_quantity = lots * lot_size
 
     # Batch query prices in chunks of 100 to avoid payload / URL length limits
-    spot_sym = "NSE:NIFTY 50" if underlying == "NIFTY" else f"NSE:{underlying}"
+    if underlying == "NIFTY":
+        spot_sym = "NSE:NIFTY 50"
+        index_token: Optional[int] = NIFTY_INDEX_TOKEN
+    elif underlying == "BANKNIFTY":
+        spot_sym = "NSE:NIFTY BANK"
+        index_token = 260105
+    else:
+        spot_sym = f"NSE:{underlying}"
+        index_token = None
     symbols_to_query = [spot_sym] + [f"NFO:{c['tradingsymbol']}" for c in ce_contracts + pe_contracts]
     quotes: Dict[str, Any] = {}
     for i in range(0, len(symbols_to_query), 100):
@@ -155,25 +166,31 @@ def find_strangle_strikes(
             batch_quotes = kite.ltp(batch)
             quotes.update(batch_quotes)
         except Exception as e:
-            err_msg = str(e).lower()
-            if "token" in err_msg or "api_key" in err_msg or "access_token" in err_msg or "tokenexception" in type(e).__name__.lower():
+            from kite.client import is_token_error
+            if is_token_error(e):
                 logger.error("Authentication failed querying batch LTP quotes for %d instruments: %s", len(batch), e)
                 raise
             logger.error("Failed to query batch LTP quotes for %d instruments: %s", len(batch), e)
 
+    spot = float(quotes.get(spot_sym, {}).get("last_price") or 0.0)
+
     # Try ATR-based strike discovery if requested and spot price was returned
     if strike_mode.upper() == "ATR":
         try:
-            spot = float(quotes.get(spot_sym, {}).get("last_price") or 0.0)
             if spot > 0.0:
-                atr = fetch_daily_atr(kite, instrument_token=NIFTY_INDEX_TOKEN if underlying == "NIFTY" else None)
+                atr = fetch_daily_atr(kite, instrument_token=index_token) if index_token else 150.0
                 target_distance = max(atr * atr_multiplier, 150.0)
-                target_ce_strike = round((spot + target_distance) / 50.0) * 50.0
-                target_pe_strike = round((spot - target_distance) / 50.0) * 50.0
+                strike_step = 100.0 if underlying == "BANKNIFTY" else 50.0
+                target_ce_strike = round((spot + target_distance) / strike_step) * strike_step
+                target_pe_strike = round((spot - target_distance) / strike_step) * strike_step
 
-                # Find closest available contracts to target strikes
-                chosen_ce = min(ce_contracts, key=lambda c: abs(float(c["strike"]) - target_ce_strike))
-                chosen_pe = min(pe_contracts, key=lambda p: abs(float(p["strike"]) - target_pe_strike))
+                # Prefer OTM strikes with non-zero LTP closest to the ATR target strike
+                ce_sorted = sorted(ce_contracts, key=lambda c: abs(float(c["strike"]) - target_ce_strike))
+                pe_sorted = sorted(pe_contracts, key=lambda p: abs(float(p["strike"]) - target_pe_strike))
+                liquid_ce = [c for c in ce_sorted if float(quotes.get(f"NFO:{c['tradingsymbol']}", {}).get("last_price") or 0.0) > 0.0]
+                liquid_pe = [p for p in pe_sorted if float(quotes.get(f"NFO:{p['tradingsymbol']}", {}).get("last_price") or 0.0) > 0.0]
+                chosen_ce = liquid_ce[0] if liquid_ce else ce_sorted[0]
+                chosen_pe = liquid_pe[0] if liquid_pe else pe_sorted[0]
 
                 ce_sym_key = f"NFO:{chosen_ce['tradingsymbol']}"
                 pe_sym_key = f"NFO:{chosen_pe['tradingsymbol']}"
@@ -210,11 +227,17 @@ def find_strangle_strikes(
                         }
                     }
         except Exception as e:
+            from kite.client import is_token_error
+            if is_token_error(e):
+                raise
             logger.warning("ATR strike selection failed (%s). Gracefully falling back to PRICE mode (target_price=%.1f)...", e, target_price)
 
-    # Find CE >= target_price with lowest LTP
+    # Find CE >= target_price with lowest LTP (prefer OTM when spot is known)
+    ce_pool = [c for c in ce_contracts if float(c.get("strike", 0.0)) >= spot] if spot > 0.0 else ce_contracts
+    if not ce_pool:
+        ce_pool = ce_contracts
     valid_ce = []
-    for c in ce_contracts:
+    for c in ce_pool:
         sym = c["tradingsymbol"]
         ltp_data = quotes.get(f"NFO:{sym}", {})
         ltp = float(ltp_data.get("last_price") or 0.0)
@@ -226,9 +249,12 @@ def find_strangle_strikes(
     valid_ce.sort(key=lambda x: x[0])
     chosen_ce_ltp, chosen_ce = valid_ce[0]
 
-    # Find PE >= target_price with lowest LTP
+    # Find PE >= target_price with lowest LTP (prefer OTM when spot is known)
+    pe_pool = [p for p in pe_contracts if float(p.get("strike", 0.0)) <= spot] if spot > 0.0 else pe_contracts
+    if not pe_pool:
+        pe_pool = pe_contracts
     valid_pe = []
-    for p in pe_contracts:
+    for p in pe_pool:
         sym = p["tradingsymbol"]
         ltp_data = quotes.get(f"NFO:{sym}", {})
         ltp = float(ltp_data.get("last_price") or 0.0)

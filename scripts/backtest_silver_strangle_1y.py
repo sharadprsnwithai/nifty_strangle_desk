@@ -53,18 +53,19 @@ def main():
     print(results.tail(10)[["date", "spot_entry", "ce_strike", "pe_strike", "ce_pts", "pe_pts", "total_pts", "ce_reason", "pe_reason"]])
 
     total_pts = results["total_pts"].sum()
-    win_days = (results["total_pts"] > 0).sum()
-    loss_days = (results["total_pts"] < 0).sum()
+    win_days = (results["net_pnl_inr"] > 0).sum()
+    loss_days = (results["net_pnl_inr"] <= 0).sum()
     win_rate = win_days / len(results) * 100
 
     avg_win = results[results["total_pts"] > 0]["total_pts"].mean()
     avg_loss = results[results["total_pts"] < 0]["total_pts"].mean()
-    profit_factor = abs(results[results["total_pts"] > 0]["total_pts"].sum() / results[results["total_pts"] < 0]["total_pts"].sum()) if loss_days > 0 else 999.0
+    profit_factor = abs(results[results["net_pnl_inr"] > 0]["net_pnl_inr"].sum() / results[results["net_pnl_inr"] < 0]["net_pnl_inr"].sum()) if (results["net_pnl_inr"] < 0).any() else 999.0
 
-    cum_pts = results["total_pts"].cumsum()
-    peak = cum_pts.cummax()
-    dd = peak - cum_pts
-    max_dd_pts = dd.max()
+    cum_net = results["net_pnl_inr"].cumsum()
+    peak = cum_net.cummax()
+    dd = peak - cum_net
+    silverm_max_dd = dd.max()
+    max_dd_pts = (results["total_pts"].cumsum().cummax() - results["total_pts"].cumsum()).max()
 
     print("\n--- 1-YEAR OVERALL PERFORMANCE SUMMARY ---")
     print(f"Date Range: {results['date'].min()} to {results['date'].max()}")
@@ -76,11 +77,10 @@ def main():
     print(f"Avg Win: +{avg_win:.2f} pts | Avg Loss: {avg_loss:.2f} pts")
     print(f"Max Drawdown: {max_dd_pts:,.2f} pts")
 
-    # Multiplier for SILVERM (Silver Mini: 1 lot = 5 kg, 2 lots = 10 kg -> 1 pt = Rs 10)
-    silverm_gross = total_pts * 10.0
-    silverm_costs = len(results) * 120.0
-    silverm_net = silverm_gross - silverm_costs
-    silverm_max_dd = max_dd_pts * 10.0
+    # Exact SILVERM (10 kg) figures & statutory MCX charges from models.calculate_silver_mcx_costs
+    silverm_gross = results["gross_pnl_inr"].sum()
+    silverm_costs = results["costs_inr"].sum()
+    silverm_net = results["net_pnl_inr"].sum()
 
     # Capital assumptions
     margin_req = 120000.0 # ~Rs 1.2 Lakhs for 2 lots
@@ -94,8 +94,8 @@ def main():
     print("\n" + "=" * 65)
     print("      MCX SILVERM EVENING STRANGLE (2 LOTS = 10 KG) 1-YEAR ROI")
     print("=" * 65)
-    print(f"Gross P&L (10 kg multiplier) : Rs {silverm_gross:,.2f}")
-    print(f"Taxes & Charges (Rs 120/day) : -Rs {silverm_costs:,.2f}")
+    print(f"Gross P&L (after slippage)   : Rs {silverm_gross:,.2f}")
+    print(f"Exact MCX Taxes & Charges    : -Rs {silverm_costs:,.2f}")
     print(f"NET REALIZED P&L             : Rs {silverm_net:,.2f}")
     print(f"Max Peak-to-Trough Drawdown  : Rs {silverm_max_dd:,.2f} ({(silverm_max_dd/safe_capital)*100:.1f}% of Safe Cap)")
     print("-" * 65)
@@ -107,14 +107,14 @@ def main():
     # Monthly breakdown
     m_grp = results.groupby('month').agg(
         sessions=('total_pts', 'count'),
-        wins=('total_pts', lambda x: (x > 0).sum()),
-        losses=('total_pts', lambda x: (x <= 0).sum()),
+        wins=('net_pnl_inr', lambda x: (x > 0).sum()),
+        losses=('net_pnl_inr', lambda x: (x <= 0).sum()),
         pts=('total_pts', 'sum'),
+        gross_pnl=('gross_pnl_inr', 'sum'),
+        costs=('costs_inr', 'sum'),
+        net_pnl=('net_pnl_inr', 'sum'),
     ).reset_index()
     m_grp['win_rate'] = (m_grp['wins'] / m_grp['sessions']) * 100.0
-    m_grp['gross_pnl'] = m_grp['pts'] * 10.0
-    m_grp['costs'] = m_grp['sessions'] * 120.0
-    m_grp['net_pnl'] = m_grp['gross_pnl'] - m_grp['costs']
     m_grp['roi_safe'] = (m_grp['net_pnl'] / safe_capital) * 100.0
 
     print("\n--- MONTHLY PERFORMANCE BREAKDOWN ---")

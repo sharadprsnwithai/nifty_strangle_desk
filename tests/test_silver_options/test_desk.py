@@ -255,6 +255,7 @@ def _make_live_mock_kite(mock_chain_data, ce_sell_id="CE_ORD_1", pe_fail_exc=Non
     mock_kite.TRANSACTION_TYPE_SELL = "SELL"
     mock_kite.TRANSACTION_TYPE_BUY = "BUY"
     mock_kite.ORDER_TYPE_LIMIT = "LIMIT"
+    mock_kite.ORDER_TYPE_MARKET = "MARKET"
     mock_kite.PRODUCT_MIS = "MIS"
     mock_kite.VALIDITY_DAY = "DAY"
     mock_kite.instruments.return_value = mock_chain_data
@@ -287,7 +288,9 @@ def test_live_partial_pe_rejection_rolls_back_ce_and_prevents_restart_loop(temp_
     om = SilverOrderManager(mode="LIVE", kite=mock_kite, config=config)
     desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
 
-    now = datetime(2026, 11, 25, 20, 14, 0)
+    from datetime import time as dt_time
+    today = datetime.now().date()
+    now = datetime.combine(today, dt_time(20, 14, 0))
     entered = desk.enter_strangle(now)
     assert entered is False
     assert desk.position is not None
@@ -303,7 +306,7 @@ def test_live_partial_pe_rejection_rolls_back_ce_and_prevents_restart_loop(temp_
     # Simulate container restart reloading the same state file on the same day -> must NOT place any orders!
     calls_before_restart = mock_kite.place_order.call_count
     desk2 = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
-    assert desk2.enter_strangle(datetime(2026, 11, 25, 20, 15, 0)) is False
+    assert desk2.enter_strangle(datetime.combine(today, dt_time(20, 15, 0))) is False
     assert mock_kite.place_order.call_count == calls_before_restart
 
 
@@ -373,5 +376,325 @@ def test_stale_state_cleared_from_memory_and_file_next_day(temp_state_file, mock
     assert desk.position.trade_date == "2026-11-25"
     assert desk.position.status == "OPEN"
     assert temp_state_file.exists()
+
+
+def test_live_square_off_escalates_unfilled_limit_to_market(temp_state_file, mock_chain_data):
+    mock_kite = _make_live_mock_kite(mock_chain_data)
+    # Buy limit stays OPEN -> cancel -> Market order completes at actual avg price 585.0
+    mock_kite.place_order.side_effect = ["BUY_LIMIT_1", "BUY_MKT_2"]
+    mock_kite.order_history.side_effect = [
+        [{"status": "OPEN", "filled_quantity": 0, "pending_quantity": 2, "average_price": 0.0}],
+        [{"status": "CANCELLED", "filled_quantity": 0, "pending_quantity": 0, "average_price": 0.0}],
+        [{"status": "COMPLETE", "filled_quantity": 2, "pending_quantity": 0, "average_price": 585.0}],
+    ]
+    mock_kite.quote.return_value = {
+        "MCX:SILVERM26NOV157000CE": {"last_price": 580.0},
+        "MCX:SILVERM26NOV153000PE": {"last_price": 300.0},
+    }
+
+    config = SilverOptionsConfig(lots=2, sl_pct=0.40, order_type="LIMIT")
+    om = SilverOrderManager(mode="LIVE", kite=mock_kite, config=config)
+    desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
+    desk._wait_for_orders = lambda ids, timeout_seconds=10, poll_seconds=1: {
+        oid: om.get_order_status(oid) for oid in ids if oid
+    }
+
+    ce = SilverStrangleLeg(
+        symbol="SILVERM26NOV157000CE", strike=157000.0, option_type="CE",
+        entry_price=400.0, entry_time="20:00:00", stop_loss_price=560.0, current_price=400.0,
+    )
+    pe = SilverStrangleLeg(
+        symbol="SILVERM26NOV153000PE", strike=153000.0, option_type="PE",
+        entry_price=400.0, entry_time="20:00:00", stop_loss_price=560.0, current_price=400.0,
+    )
+    desk.position = SilverStranglePosition(
+        trade_date="2026-11-25", underlying_spot=155000.0, lots=2, multiplier=10.0,
+        max_loss_cap=6000.0, ce_leg=ce, pe_leg=pe, status="OPEN",
+    )
+
+    active = desk.monitor_cycle(datetime(2026, 11, 25, 21, 0, 0))
+    assert active is True
+    assert desk.position.ce_leg.status == "SL"
+    assert desk.position.ce_leg.exit_price == 585.0
+    assert desk.position.ce_leg.exit_order_id == "BUY_MKT_2"
+    # Verify escalation placed a MARKET order for remaining 2 lots
+    assert mock_kite.place_order.call_count == 2
+    assert mock_kite.place_order.call_args_list[1].kwargs["order_type"] == "MARKET"
+
+
+def test_live_unfilled_eod_keeps_position_open_for_retry(temp_state_file, mock_chain_data):
+    mock_kite = _make_live_mock_kite(mock_chain_data)
+    mock_kite.place_order.side_effect = ["BUY_1", "BUY_MKT_2"]
+    mock_kite.order_history.return_value = [
+        {"status": "REJECTED", "filled_quantity": 0, "pending_quantity": 0, "average_price": 0.0, "status_message": "Margin shortfall"}
+    ]
+    mock_kite.quote.return_value = {
+        "MCX:SILVERM26NOV157000CE": {"last_price": 300.0},
+        "MCX:SILVERM26NOV153000PE": {"last_price": 300.0},
+    }
+
+    config = SilverOptionsConfig(lots=2, exit_time="23:15", order_type="LIMIT")
+    om = SilverOrderManager(mode="LIVE", kite=mock_kite, config=config)
+    desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
+    desk._wait_for_orders = lambda ids, timeout_seconds=10, poll_seconds=1: {
+        oid: om.get_order_status(oid) for oid in ids if oid
+    }
+
+    ce = SilverStrangleLeg(
+        symbol="SILVERM26NOV157000CE", strike=157000.0, option_type="CE",
+        entry_price=400.0, entry_time="20:00:00", stop_loss_price=560.0, current_price=300.0,
+    )
+    pe = SilverStrangleLeg(
+        symbol="SILVERM26NOV153000PE", strike=153000.0, option_type="PE",
+        entry_price=400.0, entry_time="20:00:00", stop_loss_price=560.0, current_price=300.0,
+    )
+    desk.position = SilverStranglePosition(
+        trade_date="2026-11-25", underlying_spot=155000.0, lots=2, multiplier=10.0,
+        max_loss_cap=6000.0, ce_leg=ce, pe_leg=pe, status="OPEN",
+    )
+
+    active = desk.monitor_cycle(datetime(2026, 11, 25, 23, 15, 0))
+    # Must NOT mark CLOSED if broker buy-back failed/rejected!
+    assert active is True
+    assert desk.position.status == "OPEN"
+    assert desk.position.ce_leg.status == "OPEN"
+    assert desk.position.pe_leg.status == "OPEN"
+
+
+def test_trail_to_cost_waits_if_surviving_leg_is_underwater_then_locks_and_takes_single_decay(temp_state_file):
+    mock_kite = MagicMock()
+    config = SilverOptionsConfig(lots=2, sl_pct=0.40, trail_to_cost=True, target_decay_pct=0.70)
+    om = SilverOrderManager(mode="PAPER", config=config)
+    desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
+
+    ce = SilverStrangleLeg(
+        symbol="SILVERM26NOV157000CE", strike=157000.0, option_type="CE",
+        entry_price=400.0, entry_time="20:00:00", stop_loss_price=560.0, current_price=400.0,
+    )
+    pe = SilverStrangleLeg(
+        symbol="SILVERM26NOV153000PE", strike=153000.0, option_type="PE",
+        entry_price=400.0, entry_time="20:00:00", stop_loss_price=560.0, current_price=400.0,
+    )
+    desk.position = SilverStranglePosition(
+        trade_date="2026-11-25", underlying_spot=155000.0, lots=2, multiplier=10.0,
+        max_loss_cap=6000.0, ce_leg=ce, pe_leg=pe, status="OPEN",
+    )
+
+    # Tick 1: IV spike -> CE stops at 570 while PE is slightly underwater at 430 (> 400 entry)
+    mock_kite.quote.return_value = {
+        "MCX:SILVERM26NOV157000CE": {"last_price": 570.0},
+        "MCX:SILVERM26NOV153000PE": {"last_price": 430.0},
+    }
+    assert desk.monitor_cycle(datetime(2026, 11, 25, 20, 30, 0)) is True
+    assert desk.position.ce_leg.status == "SL"
+    assert desk.position.pe_leg.status == "OPEN"
+    assert desk.position.pe_leg.cost_trail_pending is True
+    # PE SL must NOT jump down to 400 while PE is at 430 (would cause instant double stop-out!)
+    assert desk.position.pe_leg.stop_loss_price == 560.0
+
+    # Tick 2: PE stays at 435 -> survives without premature breakeven stop
+    mock_kite.quote.return_value = {
+        "MCX:SILVERM26NOV157000CE": {"last_price": 570.0},
+        "MCX:SILVERM26NOV153000PE": {"last_price": 435.0},
+    }
+    assert desk.monitor_cycle(datetime(2026, 11, 25, 20, 30, 5)) is True
+    assert desk.position.pe_leg.status == "OPEN"
+
+    # Tick 3: PE drops into profit (380 < 400) -> cost SL locks at 400!
+    mock_kite.quote.return_value = {
+        "MCX:SILVERM26NOV157000CE": {"last_price": 570.0},
+        "MCX:SILVERM26NOV153000PE": {"last_price": 380.0},
+    }
+    assert desk.monitor_cycle(datetime(2026, 11, 25, 21, 0, 0)) is True
+    assert desk.position.pe_leg.stop_loss_price == 400.0
+
+    # Tick 4: Surviving PE decays 70%+ (110 <= 400 * 0.30) -> closes on TARGET_DECAY
+    mock_kite.quote.return_value = {
+        "MCX:SILVERM26NOV157000CE": {"last_price": 570.0},
+        "MCX:SILVERM26NOV153000PE": {"last_price": 110.0},
+    }
+    assert desk.monitor_cycle(datetime(2026, 11, 25, 22, 0, 0)) is False
+    assert desk.position.status == "CLOSED"
+    assert desk.position.pe_leg.status == "TARGET_DECAY"
+
+
+def test_monitor_cycle_refreshes_expired_token_and_syncs_order_manager(temp_state_file, monkeypatch):
+    mock_kite = MagicMock()
+    refreshed_kite = MagicMock()
+    refreshed_kite.quote.return_value = {
+        "MCX:SILVERM26NOV157000CE": {"last_price": 350.0},
+        "MCX:SILVERM26NOV153000PE": {"last_price": 350.0},
+    }
+    mock_kite.quote.side_effect = Exception("Incorrect `api_key` or `access_token`.")
+
+    import kite.client as kite_client_mod
+    monkeypatch.setattr(kite_client_mod, "ensure_kite_session", lambda k, force_login=False: refreshed_kite)
+
+    config = SilverOptionsConfig(lots=2)
+    om = SilverOrderManager(mode="PAPER", kite=mock_kite, config=config)
+    desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
+
+    ce = SilverStrangleLeg(
+        symbol="SILVERM26NOV157000CE", strike=157000.0, option_type="CE",
+        entry_price=400.0, entry_time="20:00:00", stop_loss_price=560.0, current_price=400.0,
+    )
+    pe = SilverStrangleLeg(
+        symbol="SILVERM26NOV153000PE", strike=153000.0, option_type="PE",
+        entry_price=400.0, entry_time="20:00:00", stop_loss_price=560.0, current_price=400.0,
+    )
+    desk.position = SilverStranglePosition(
+        trade_date="2026-11-25", underlying_spot=155000.0, lots=2, multiplier=10.0,
+        max_loss_cap=6000.0, ce_leg=ce, pe_leg=pe, status="OPEN",
+    )
+
+    assert desk.monitor_cycle(datetime(2026, 11, 25, 21, 0, 0)) is True
+    assert desk.kite is refreshed_kite
+    assert desk.order_manager.kite is refreshed_kite
+    assert desk.position.ce_leg.current_price == 350.0
+    assert desk.position.pe_leg.current_price == 350.0
+
+
+def test_mcx_fixed_holidays_work_in_2027():
+    from strategy.holidays import is_mcx_trading_holiday
+    is_hol, reason = is_mcx_trading_holiday(date(2027, 1, 26), session="EVENING")
+    assert is_hol is True
+    assert "Republic Day" in reason
+
+
+def test_partial_exit_escalation_failure_retries_only_remaining_lots(temp_state_file, mock_chain_data):
+    mock_kite = _make_live_mock_kite(mock_chain_data)
+    # Cycle 1: LIMIT fills 1/2 @ 580.0, cancel leaves 1, MARKET fallback rejected -> Cycle 2: retries ONLY 1 lot @ 590.0
+    mock_kite.place_order.side_effect = ["BUY_L1", "BUY_M1", "BUY_L2"]
+    mock_kite.order_history.side_effect = [
+        [{"status": "OPEN", "filled_quantity": 1, "pending_quantity": 1, "average_price": 580.0}],
+        [{"status": "CANCELLED", "filled_quantity": 1, "pending_quantity": 0, "average_price": 580.0}],
+        [{"status": "REJECTED", "filled_quantity": 0, "pending_quantity": 0, "average_price": 0.0}],
+        [{"status": "COMPLETE", "filled_quantity": 1, "pending_quantity": 0, "average_price": 590.0}],
+    ]
+    mock_kite.quote.return_value = {
+        "MCX:SILVERM26NOV157000CE": {"last_price": 585.0},
+        "MCX:SILVERM26NOV153000PE": {"last_price": 300.0},
+    }
+
+    config = SilverOptionsConfig(lots=2, sl_pct=0.40, order_type="LIMIT")
+    om = SilverOrderManager(mode="LIVE", kite=mock_kite, config=config)
+    desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
+    desk._wait_for_orders = lambda ids, timeout_seconds=10, poll_seconds=1: {
+        oid: om.get_order_status(oid) for oid in ids if oid
+    }
+
+    ce = SilverStrangleLeg(
+        symbol="SILVERM26NOV157000CE", strike=157000.0, option_type="CE",
+        entry_price=400.0, entry_time="20:00:00", stop_loss_price=560.0, current_price=400.0,
+    )
+    pe = SilverStrangleLeg(
+        symbol="SILVERM26NOV153000PE", strike=153000.0, option_type="PE",
+        entry_price=400.0, entry_time="20:00:00", stop_loss_price=560.0, current_price=400.0,
+    )
+    desk.position = SilverStranglePosition(
+        trade_date="2026-11-25", underlying_spot=155000.0, lots=2, multiplier=10.0,
+        max_loss_cap=6000.0, ce_leg=ce, pe_leg=pe, status="OPEN",
+    )
+
+    # Poll 1: 1 lot filled, 1 remaining -> stays OPEN with exit_filled_lots=1
+    assert desk.monitor_cycle(datetime(2026, 11, 25, 21, 0, 0)) is True
+    assert desk.position.ce_leg.status == "OPEN"
+    assert desk.position.ce_leg.exit_filled_lots == 1
+
+    # Poll 2: retries ONLY remaining 1 lot (never 2!)
+    assert desk.monitor_cycle(datetime(2026, 11, 25, 21, 0, 5)) is True
+    assert mock_kite.place_order.call_args_list[2].kwargs["quantity"] == 1
+    assert desk.position.ce_leg.status == "SL"
+    assert desk.position.ce_leg.exit_filled_lots == 2
+    assert desk.position.ce_leg.exit_price == 585.0  # weighted average (580 + 590) / 2
+
+
+def test_live_pure_limit_timeout_allows_single_retry_before_abort(temp_state_file, mock_chain_data):
+    mock_kite = _make_live_mock_kite(mock_chain_data)
+    mock_kite.order_history.return_value = [
+        {"status": "OPEN", "filled_quantity": 0, "pending_quantity": 2, "average_price": 0.0}
+    ]
+    config = SilverOptionsConfig(lots=2, order_type="LIMIT")
+    om = SilverOrderManager(mode="LIVE", kite=mock_kite, config=config)
+    desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
+    desk._wait_for_orders = lambda ids, timeout_seconds=10, poll_seconds=1: {
+        oid: om.get_order_status(oid) for oid in ids if oid
+    }
+    # Force rollback status check to report clean CANCELLED so no rollback buy is needed
+    om.get_order_status = lambda oid: {"order_id": oid, "status": "CANCELLED", "filled_quantity": 0, "pending_quantity": 0, "average_price": 0.0}
+
+    now = datetime(2026, 11, 25, 20, 0, 0)
+    # 1st timeout -> clean rollback, NOT aborted yet (allows 1 retry)
+    assert desk.enter_strangle(now) is False
+    assert desk.position is None
+
+    # 2nd timeout -> persists ABORTED to stop infinite loop
+    assert desk.enter_strangle(datetime(2026, 11, 25, 20, 1, 0)) is False
+    assert desk.position is not None
+    assert desk.position.status == "ABORTED"
+
+
+def test_target_decay_does_not_escalate_to_market_in_live(temp_state_file, mock_chain_data):
+    mock_kite = _make_live_mock_kite(mock_chain_data)
+    mock_kite.place_order.side_effect = ["BUY_LIM_1", "BUY_LIM_2"]
+    mock_kite.order_history.return_value = [
+        {"status": "OPEN", "filled_quantity": 0, "pending_quantity": 2, "average_price": 0.0}
+    ]
+    mock_kite.quote.return_value = {
+        "MCX:SILVERM26NOV157000CE": {"last_price": 100.0},
+        "MCX:SILVERM26NOV153000PE": {"last_price": 100.0},
+    }
+    config = SilverOptionsConfig(lots=2, target_decay_pct=0.70, order_type="LIMIT")
+    om = SilverOrderManager(mode="LIVE", kite=mock_kite, config=config)
+    desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
+    desk._wait_for_orders = lambda ids, timeout_seconds=10, poll_seconds=1: {
+        oid: om.get_order_status(oid) for oid in ids if oid
+    }
+    desk.position = SilverStranglePosition(
+        trade_date="2026-11-26", underlying_spot=155000.0, lots=2, multiplier=10.0, max_loss_cap=6000.0,
+        ce_leg=SilverStrangleLeg("SILVERM26NOV157000CE", 157000.0, "CE", 400.0, "20:00:00", 560.0, 400.0),
+        pe_leg=SilverStrangleLeg("SILVERM26NOV153000PE", 153000.0, "PE", 400.0, "20:00:00", 560.0, 400.0),
+        status="OPEN",
+    )
+    active = desk.monitor_cycle(datetime(2026, 11, 26, 22, 0, 0))
+    assert active is True
+    # Only the 2 initial LIMIT orders placed; ZERO MARKET orders for TARGET_DECAY
+    assert mock_kite.place_order.call_count == 2
+    assert all(c.kwargs["order_type"] == "LIMIT" for c in mock_kite.place_order.call_args_list)
+
+
+def test_reconcile_with_broker_marks_manual_flat_leg_closed(temp_state_file, mock_chain_data):
+    mock_kite = _make_live_mock_kite(mock_chain_data)
+    mock_kite.positions.return_value = {
+        "net": [
+            {"exchange": "MCX", "tradingsymbol": "SILVERM26NOV157000CE", "quantity": 0, "buy_price": 250.0},
+            {"exchange": "MCX", "tradingsymbol": "SILVERM26NOV153000PE", "quantity": -2, "sell_price": 400.0},
+        ]
+    }
+    config = SilverOptionsConfig(lots=2)
+    om = SilverOrderManager(mode="LIVE", kite=mock_kite, config=config)
+    desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
+    desk.position = SilverStranglePosition(
+        trade_date="2026-11-26", underlying_spot=155000.0, lots=2, multiplier=10.0, max_loss_cap=6000.0,
+        ce_leg=SilverStrangleLeg("SILVERM26NOV157000CE", 157000.0, "CE", 400.0, "20:00:00", 560.0, 300.0),
+        pe_leg=SilverStrangleLeg("SILVERM26NOV153000PE", 153000.0, "PE", 400.0, "20:00:00", 560.0, 300.0),
+        status="OPEN",
+    )
+    desk.reconcile_with_broker(now=datetime(2026, 11, 26, 21, 0, 0))
+    assert desk.position.ce_leg.status == "BROKER_RECONCILED"
+    assert desk.position.ce_leg.exit_price == 250.0
+    assert desk.position.pe_leg.status == "OPEN"
+
+
+def test_run_session_refuses_entry_at_or_after_exit_time_and_isolates_paper_state(monkeypatch):
+    monkeypatch.delenv("SILVER_STATE_FILE", raising=False)
+    config = SilverOptionsConfig(lots=2, entry_time="20:00", exit_time="23:10")
+    om = SilverOrderManager(mode="PAPER", config=config)
+    desk = SilverStrangleDesk(order_manager=om, config=config)
+    assert desk.state_file.name == "silver_paper_trades_today.json"
+
+    desk.enter_strangle = MagicMock()
+    desk.run_session(execute_once=True, now=datetime(2026, 11, 26, 23, 10, 0))
+    desk.enter_strangle.assert_not_called()
 
 

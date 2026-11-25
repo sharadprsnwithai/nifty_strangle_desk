@@ -34,8 +34,17 @@ class SilverStrangleDesk:
         self.order_manager = order_manager
         self.kite = kite_client or getattr(order_manager, "kite", None)
         self.notifier = notifier
-        self.state_file = Path(state_file or self.config.state_file)
+        om_mode = getattr(order_manager, "mode", "LIVE")
+        if state_file is not None:
+            self.state_file = Path(state_file)
+        elif om_mode == "PAPER" and not os.getenv("SILVER_STATE_FILE") and self.config.state_file == "data/silver_trades_today.json":
+            self.state_file = Path("data/silver_paper_trades_today.json")
+        else:
+            self.state_file = Path(self.config.state_file)
         self.position: Optional[SilverStranglePosition] = None
+        self._entry_timeout_count: int = 0
+        self._entry_timeout_date: Optional[str] = None
+        self._last_reconcile_ts: float = time.time()
         self.load_state()
 
     def load_state(self, today_str: Optional[str] = None) -> Optional[SilverStranglePosition]:
@@ -43,8 +52,13 @@ class SilverStrangleDesk:
             self.position = None
             return None
         try:
-            with open(self.state_file, "r") as f:
+            with open(self.state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            om_mode = getattr(self.order_manager, "mode", "LIVE")
+            if "mode" in data and data["mode"] != om_mode:
+                logger.warning("Silver state file mode mismatch (%s != %s). Ignoring.", data["mode"], om_mode)
+                self.position = None
+                return None
             pos = SilverStranglePosition.from_dict(data)
             today = today_str or datetime.now().strftime("%Y-%m-%d")
             if pos.trade_date != today:
@@ -67,8 +81,10 @@ class SilverStrangleDesk:
             return
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.state_file, "w") as f:
+            tmp_file = self.state_file.with_suffix(".tmp")
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(self.position.to_dict(), f, indent=2)
+            tmp_file.replace(self.state_file)
         except Exception as e:
             logger.error("Failed to save Silver state to %s: %s", self.state_file, e)
 
@@ -94,6 +110,7 @@ class SilverStrangleDesk:
             ce_leg=None,
             pe_leg=None,
             status="ABORTED",
+            mode=getattr(self.order_manager, "mode", "LIVE"),
             created_at=now.isoformat(),
             closed_at=now.isoformat(),
             abort_reason=reason,
@@ -147,45 +164,93 @@ class SilverStrangleDesk:
             return f"Existing open MCX {self.config.underlying} option position(s) found on broker: {summary}"
         return None
 
-    def _rollback_submitted_leg(self, order_info: Optional[Dict[str, Any]], symbol: str, ref_ltp: float):
-        """Cancels any pending order and buys back any filled quantity for a single leg on abort."""
-        if not isinstance(order_info, dict):
-            return
-        order_id = order_info.get("order_id")
-        if not order_id:
+    def _sync_kite(self, kite_client: Optional[KiteConnect]):
+        """Keeps Desk and OrderManager synchronized on the latest KiteConnect session."""
+        if kite_client is not None:
+            self.kite = kite_client
+            self.order_manager.kite = kite_client
+
+    def _ensure_active_kite(self):
+        """Refreshes expired MCX Kite session if needed and syncs Desk + OrderManager."""
+        if self.kite is None:
             return
         try:
-            self.order_manager.cancel_order(order_id)
-            status_info = self.order_manager.get_order_status(order_id)
-            filled_qty = int(status_info.get("filled_quantity") or 0)
-            if filled_qty > 0:
-                logger.warning("Rolling back filled leg %s (%d lots) via BUY square-off...", symbol, filled_qty)
-                self.order_manager.buy(
-                    symbol=symbol,
-                    quantity=filled_qty,
-                    price=ref_ltp * 1.05,
-                    order_type=self.config.order_type,
-                    buffer_pct=self.config.limit_buffer_pct,
-                )
-        except Exception as clean_err:
-            logger.error("CRITICAL: Failed to roll back %s leg (%s): %s", symbol, order_id, clean_err)
+            from kite.client import ensure_kite_session
+            refreshed = ensure_kite_session(self.kite, force_login=False)
+            self._sync_kite(refreshed)
+        except Exception as e:
+            logger.warning("Silver session validation/refresh skipped (%s)", e)
 
-    def _wait_for_entry_orders(
+    def reconcile_with_broker(self, now: Optional[datetime] = None) -> None:
+        """
+        Reconciles OPEN Silver Strangle legs against Kite net MCX positions.
+        If a tracked leg was manually closed on Kite (`quantity == 0`), marks it CLOSED (`BROKER_RECONCILED`)
+        so monitor_cycle() does not fire duplicate BUY orders and flip net LONG.
+        """
+        mode = getattr(self.order_manager, "mode", "PAPER")
+        if mode != "LIVE" or self.kite is None or self.position is None or self.position.status != "OPEN":
+            return
+        if self.position.ce_leg is None or self.position.pe_leg is None:
+            return
+        now = now or datetime.now()
+        try:
+            raw_pos = self.kite.positions()
+        except Exception as e:
+            from kite.client import is_token_error
+            if is_token_error(e):
+                self._ensure_active_kite()
+                try:
+                    raw_pos = self.kite.positions()
+                except Exception as retry_e:
+                    logger.warning("Silver reconciliation retry failed: %s", retry_e)
+                    return
+            else:
+                logger.warning("Silver broker reconciliation failed: %s", e)
+                return
+
+        net_positions = raw_pos.get("net", []) if isinstance(raw_pos, dict) else []
+        net_map = {
+            p.get("tradingsymbol", ""): p
+            for p in net_positions
+            if p.get("exchange") == self.config.exchange
+        }
+        changed = False
+        for leg in (self.position.ce_leg, self.position.pe_leg):
+            if leg.status != "OPEN":
+                continue
+            pos_row = net_map.get(leg.symbol, {})
+            if int(pos_row.get("quantity") or 0) == 0:
+                broker_buy_px = float(pos_row.get("buy_price") or 0.0)
+                leg.exit_price = broker_buy_px if broker_buy_px > 0 else float(leg.current_price or leg.entry_price)
+                leg.exit_filled_lots = self.config.lots
+                leg.exit_time = now.strftime("%H:%M:%S")
+                leg.exit_reason = "BROKER_RECONCILED"
+                leg.status = "BROKER_RECONCILED"
+                changed = True
+                logger.warning("Silver Reconciliation: %s leg %s is flat on MCX. Marked CLOSED (@ %.2f).", leg.option_type, leg.symbol, leg.exit_price)
+
+        if self.position.is_fully_closed():
+            self._finalize_close(now, reason="BROKER_RECONCILED")
+        elif changed:
+            self.save_state()
+
+    def _wait_for_orders(
         self,
-        ce_id: Optional[str],
-        pe_id: Optional[str],
+        order_ids: list,
         timeout_seconds: int = 20,
         poll_seconds: int = 1,
     ) -> Dict[str, Dict[str, Any]]:
-        """Polls both entry orders until terminal status or timeout_seconds."""
-        order_ids = [oid for oid in (ce_id, pe_id) if oid]
+        """Polls submitted order IDs until terminal status or timeout_seconds."""
+        clean_ids = [oid for oid in order_ids if oid]
+        if not clean_ids:
+            return {}
         terminal_statuses = {"COMPLETE", "REJECTED", "CANCELLED"}
         results: Dict[str, Dict[str, Any]] = {}
         start_ts = time.time()
 
         while True:
             all_terminal = True
-            for oid in order_ids:
+            for oid in clean_ids:
                 if oid not in results or results[oid].get("status") not in terminal_statuses:
                     results[oid] = self.order_manager.get_order_status(oid)
                 if results[oid].get("status") not in terminal_statuses:
@@ -197,6 +262,130 @@ class SilverStrangleDesk:
             if elapsed >= timeout_seconds:
                 return results
             time.sleep(min(poll_seconds, max(0.2, timeout_seconds - elapsed)))
+
+    def _wait_for_entry_orders(
+        self,
+        ce_id: Optional[str],
+        pe_id: Optional[str],
+        timeout_seconds: int = 20,
+        poll_seconds: int = 1,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Polls both entry orders until terminal status or timeout_seconds."""
+        return self._wait_for_orders([ce_id, pe_id], timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
+
+    def _execute_live_buy_with_escalation(
+        self,
+        symbol: str,
+        qty_needed: int,
+        ltp: float,
+        best_ask: Optional[float] = None,
+        allow_market_escalation: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Executes a LIVE MCX BUY order and verifies fill completion.
+        If the initial LIMIT order does not fill within 10s, cancels remaining open qty
+        and (when allow_market_escalation=True) escalates the unfilled balance via MARKET order.
+        """
+        initial_order = self.order_manager.buy(
+            symbol=symbol,
+            quantity=qty_needed,
+            price=ltp,
+            order_type=self.config.order_type,
+            buffer_pct=self.config.limit_buffer_pct,
+            best_ask=best_ask,
+            max_slippage_pct=self.config.max_limit_slippage_pct,
+        )
+        self._sync_kite(getattr(self.order_manager, "kite", None))
+        oid = initial_order.get("order_id")
+        if not oid:
+            return {"filled_qty": 0, "avg_price": ltp, "last_order_id": None}
+
+        statuses = self._wait_for_orders([oid], timeout_seconds=10, poll_seconds=1)
+        st = statuses.get(oid, {})
+        filled_qty = int(st.get("filled_quantity") or 0)
+        avg_px = float(st.get("average_price") or 0.0) or ltp
+        last_oid = oid
+
+        if st.get("status") == "COMPLETE" and filled_qty >= qty_needed:
+            return {"filled_qty": filled_qty, "avg_price": avg_px, "last_order_id": last_oid}
+
+        # Cancel any still-open remainder before computing exact balance to re-submit
+        if st.get("status") not in ("COMPLETE", "REJECTED", "CANCELLED"):
+            self.order_manager.cancel_order(oid)
+            post_cancel = self._wait_for_orders([oid], timeout_seconds=5, poll_seconds=1).get(oid, {})
+            filled_qty = int(post_cancel.get("filled_quantity") or filled_qty)
+            if float(post_cancel.get("average_price") or 0.0) > 0:
+                avg_px = float(post_cancel["average_price"])
+
+        remaining = max(0, qty_needed - filled_qty)
+        if remaining == 0:
+            return {"filled_qty": filled_qty, "avg_price": avg_px, "last_order_id": last_oid}
+
+        if allow_market_escalation and self.config.order_type.upper() != "MARKET":
+            logger.warning(
+                "Square-off LIMIT order %s for %s filled %d/%d. Escalating %d lot(s) via MARKET...",
+                oid, symbol, filled_qty, qty_needed, remaining,
+            )
+            esc_order = self.order_manager.buy(
+                symbol=symbol,
+                quantity=remaining,
+                price=ltp,
+                order_type="MARKET",
+            )
+            self._sync_kite(getattr(self.order_manager, "kite", None))
+            esc_id = esc_order.get("order_id")
+            if esc_id:
+                last_oid = esc_id
+                esc_st = self._wait_for_orders([esc_id], timeout_seconds=10, poll_seconds=1).get(esc_id, {})
+                esc_filled = int(esc_st.get("filled_quantity") or 0)
+                esc_px = float(esc_st.get("average_price") or 0.0) or ltp
+                if esc_filled > 0:
+                    total_qty = filled_qty + esc_filled
+                    avg_px = round(((filled_qty * avg_px) + (esc_filled * esc_px)) / total_qty, 2)
+                    filled_qty = total_qty
+
+        return {"filled_qty": filled_qty, "avg_price": avg_px, "last_order_id": last_oid}
+
+    def _rollback_submitted_leg(self, order_info: Optional[Dict[str, Any]], symbol: str, ref_ltp: float) -> bool:
+        """Cancels pending entry order, waits for cancel settlement, and squares off any filled qty."""
+        if not isinstance(order_info, dict):
+            return True
+        order_id = order_info.get("order_id")
+        if not order_id:
+            return True
+        mode = getattr(self.order_manager, "mode", "PAPER")
+        try:
+            self.order_manager.cancel_order(order_id)
+            if mode == "LIVE":
+                status_info = self._wait_for_orders([order_id], timeout_seconds=5, poll_seconds=1).get(order_id, {})
+            else:
+                status_info = self.order_manager.get_order_status(order_id)
+            filled_qty = int(status_info.get("filled_quantity") or 0)
+            if filled_qty > 0:
+                logger.warning("Rolling back filled leg %s (%d lots) via BUY square-off...", symbol, filled_qty)
+                if mode == "LIVE":
+                    res = self._execute_live_buy_with_escalation(symbol, filled_qty, ref_ltp)
+                    if res["filled_qty"] < filled_qty:
+                        logger.error(
+                            "CRITICAL: Rollback for %s only filled %d/%d lots!",
+                            symbol, res["filled_qty"], filled_qty,
+                        )
+                        return False
+                else:
+                    self.order_manager.buy(
+                        symbol=symbol,
+                        quantity=filled_qty,
+                        price=ref_ltp,
+                        order_type=self.config.order_type,
+                        buffer_pct=self.config.limit_buffer_pct,
+                    )
+            elif mode == "LIVE" and status_info.get("status") not in ("CANCELLED", "REJECTED", "COMPLETE"):
+                logger.error("CRITICAL: Rollback cancel for %s (%s) left non-terminal status=%s", symbol, order_id, status_info.get("status"))
+                return False
+            return True
+        except Exception as clean_err:
+            logger.error("CRITICAL: Failed to roll back %s leg (%s): %s", symbol, order_id, clean_err)
+            return False
 
     def enter_strangle(self, now: Optional[datetime] = None) -> bool:
         """
@@ -235,6 +424,7 @@ class SilverStrangleDesk:
                 min_oi=self.config.min_option_oi,
                 max_spread_pct=self.config.max_bid_ask_spread_pct,
                 scan_steps=self.config.strike_scan_steps,
+                skip_0dte=self.config.skip_0dte,
             )
         except Exception as e:
             self._save_aborted_state(now, f"Strike resolution failed: {e}")
@@ -283,6 +473,8 @@ class SilverStrangleDesk:
         except Exception as e:
             pe_err = e
 
+        self._sync_kite(getattr(self.order_manager, "kite", None))
+
         if ce_err or pe_err:
             if not ce_err and ce_order:
                 self._rollback_submitted_leg(ce_order, ce_sym, ce_ltp)
@@ -309,14 +501,30 @@ class SilverStrangleDesk:
             pe_ok = pe_st.get("status") == "COMPLETE" and pe_filled == self.config.lots
 
             if not (ce_ok and pe_ok):
-                self._rollback_submitted_leg(ce_order, ce_sym, ce_ltp)
-                self._rollback_submitted_leg(pe_order, pe_sym, pe_ltp)
+                rb_ce = self._rollback_submitted_leg(ce_order, ce_sym, ce_ltp)
+                rb_pe = self._rollback_submitted_leg(pe_order, pe_sym, pe_ltp)
                 reason = (
                     f"Entry verification failed: CE({ce_sym}: {ce_st.get('status')}, "
                     f"filled={ce_filled}/{self.config.lots}, msg={ce_st.get('status_message')}); "
                     f"PE({pe_sym}: {pe_st.get('status')}, "
                     f"filled={pe_filled}/{self.config.lots}, msg={pe_st.get('status_message')})"
                 )
+                is_pure_timeout = (
+                    ce_filled == 0
+                    and pe_filled == 0
+                    and ce_st.get("status") != "REJECTED"
+                    and pe_st.get("status") != "REJECTED"
+                    and rb_ce
+                    and rb_pe
+                )
+                if self._entry_timeout_date != today_str:
+                    self._entry_timeout_date = today_str
+                    self._entry_timeout_count = 0
+                if is_pure_timeout and self._entry_timeout_count < 1:
+                    self._entry_timeout_count += 1
+                    logger.warning("Entry LIMIT orders timed out with 0 fills (attempt %d). Will retry next cycle: %s", self._entry_timeout_count, reason)
+                    return False
+
                 self._save_aborted_state(now, reason, spot=spot)
                 return False
 
@@ -362,6 +570,7 @@ class SilverStrangleDesk:
             ce_leg=ce_leg,
             pe_leg=pe_leg,
             status="OPEN",
+            mode=mode,
             created_at=now.isoformat(),
         )
 
@@ -409,6 +618,14 @@ class SilverStrangleDesk:
         now = now or datetime.now()
         curr_time_str = now.strftime("%H:%M")
 
+        # Periodic LIVE broker reconciliation every >= 60s so manual exits aren't double-bought
+        mode = getattr(self.order_manager, "mode", "PAPER")
+        if mode == "LIVE" and self.kite is not None and (time.time() - self._last_reconcile_ts) >= 60.0:
+            self.reconcile_with_broker(now=now)
+            self._last_reconcile_ts = time.time()
+            if not self.position or self.position.status in ("CLOSED", "ABORTED"):
+                return False
+
         # 1. Update live quotes
         ce_sym = self.position.ce_leg.symbol
         pe_sym = self.position.pe_leg.symbol
@@ -420,7 +637,18 @@ class SilverStrangleDesk:
 
         if self.kite is not None:
             try:
-                quotes = self.kite.quote([f"{self.config.exchange}:{ce_sym}", f"{self.config.exchange}:{pe_sym}"])
+                q_keys = [f"{self.config.exchange}:{ce_sym}", f"{self.config.exchange}:{pe_sym}"]
+                try:
+                    quotes = self.kite.quote(q_keys)
+                except Exception as q_err:
+                    from kite.client import is_token_error, ensure_kite_session
+                    if is_token_error(q_err):
+                        logger.warning("Token error during monitor quote (%s). Refreshing session...", q_err)
+                        refreshed = ensure_kite_session(self.kite, force_login=False)
+                        self._sync_kite(refreshed)
+                        quotes = self.kite.quote(q_keys)
+                    else:
+                        raise
                 ce_key = f"{self.config.exchange}:{ce_sym}"
                 pe_key = f"{self.config.exchange}:{pe_sym}"
                 if ce_key in quotes and quotes[ce_key].get("last_price"):
@@ -446,8 +674,11 @@ class SilverStrangleDesk:
             logger.info("23:15 IST EOD Cutoff reached. Squaring off all open legs.")
             self._square_off_leg(self.position.ce_leg, ce_ltp, now, reason="EOD", best_ask=ce_ask)
             self._square_off_leg(self.position.pe_leg, pe_ltp, now, reason="EOD", best_ask=pe_ask)
-            self._finalize_close(now, reason="EOD")
-            return False
+            if self.position.is_fully_closed():
+                self._finalize_close(now, reason="EOD")
+                return False
+            self.save_state()
+            return True
 
         # 3. Check Portfolio Max Loss Cap (derived from number of lots)
         current_pnl = self.position.total_pnl
@@ -455,8 +686,11 @@ class SilverStrangleDesk:
             logger.warning("Portfolio max loss limit breached (P&L: Rs %.2f <= -Rs %.2f). Emergency square-off!", current_pnl, self.position.max_loss_cap)
             self._square_off_leg(self.position.ce_leg, ce_ltp, now, reason="MAX_PORTFOLIO_LOSS", best_ask=ce_ask)
             self._square_off_leg(self.position.pe_leg, pe_ltp, now, reason="MAX_PORTFOLIO_LOSS", best_ask=pe_ask)
-            self._finalize_close(now, reason="MAX_PORTFOLIO_LOSS")
-            return False
+            if self.position.is_fully_closed():
+                self._finalize_close(now, reason="MAX_PORTFOLIO_LOSS")
+                return False
+            self.save_state()
+            return True
 
         # 4. Check Single-Leg Stop Losses
         ce_stopped = False
@@ -464,40 +698,41 @@ class SilverStrangleDesk:
 
         if self.position.ce_leg.status == "OPEN" and ce_ltp >= self.position.ce_leg.stop_loss_price:
             logger.warning("CE Leg hit Stop Loss (LTP: Rs %.2f >= SL: Rs %.2f)", ce_ltp, self.position.ce_leg.stop_loss_price)
-            self._square_off_leg(self.position.ce_leg, ce_ltp, now, reason="SL", best_ask=ce_ask)
-            ce_stopped = True
+            ce_stopped = self._square_off_leg(self.position.ce_leg, ce_ltp, now, reason="SL", best_ask=ce_ask)
+            if ce_stopped and not self.config.single_leg_exit and self.position.pe_leg.status == "OPEN":
+                self._square_off_leg(self.position.pe_leg, pe_ltp, now, reason="SL_CO_EXIT", best_ask=pe_ask)
 
         if self.position.pe_leg.status == "OPEN" and pe_ltp >= self.position.pe_leg.stop_loss_price:
             logger.warning("PE Leg hit Stop Loss (LTP: Rs %.2f >= SL: Rs %.2f)", pe_ltp, self.position.pe_leg.stop_loss_price)
-            self._square_off_leg(self.position.pe_leg, pe_ltp, now, reason="SL", best_ask=pe_ask)
-            pe_stopped = True
+            pe_stopped = self._square_off_leg(self.position.pe_leg, pe_ltp, now, reason="SL", best_ask=pe_ask)
+            if pe_stopped and not self.config.single_leg_exit and self.position.ce_leg.status == "OPEN":
+                self._square_off_leg(self.position.ce_leg, ce_ltp, now, reason="SL_CO_EXIT", best_ask=ce_ask)
 
-        # 5. Trail to Cost Logic
-        if self.config.trail_to_cost:
-            # If CE stopped out, trail PE to cost
+        # 5. Trail to Cost Logic (arms pending trail, only locks cost once surviving leg is < entry_price)
+        if self.config.trail_to_cost and self.config.single_leg_exit:
             if ce_stopped and self.position.pe_leg.status == "OPEN":
-                old_sl = self.position.pe_leg.stop_loss_price
-                self.position.pe_leg.stop_loss_price = self.position.pe_leg.entry_price
-                logger.info("Trailed PE SL to cost: Rs %.2f -> Rs %.2f", old_sl, self.position.pe_leg.stop_loss_price)
+                self.position.pe_leg.cost_trail_pending = True
 
-            # If PE stopped out, trail CE to cost
             if pe_stopped and self.position.ce_leg.status == "OPEN":
-                old_sl = self.position.ce_leg.stop_loss_price
-                self.position.ce_leg.stop_loss_price = self.position.ce_leg.entry_price
-                logger.info("Trailed CE SL to cost: Rs %.2f -> Rs %.2f", old_sl, self.position.ce_leg.stop_loss_price)
+                self.position.ce_leg.cost_trail_pending = True
 
-            # Proactive trailing: if winning leg decayed by 30%+, lock other leg to cost
             if self.position.ce_leg.status == "OPEN" and self.position.pe_leg.status == "OPEN":
                 ce_decay = (self.position.ce_leg.entry_price - ce_ltp) / self.position.ce_leg.entry_price
                 pe_decay = (self.position.pe_leg.entry_price - pe_ltp) / self.position.pe_leg.entry_price
-                if ce_decay >= self.config.trail_activation_decay_pct and self.position.pe_leg.stop_loss_price > self.position.pe_leg.entry_price:
-                    self.position.pe_leg.stop_loss_price = self.position.pe_leg.entry_price
-                    logger.info("CE decayed %.1f%% -> Trailed PE SL to cost (Rs %.2f)", ce_decay * 100, self.position.pe_leg.stop_loss_price)
-                if pe_decay >= self.config.trail_activation_decay_pct and self.position.ce_leg.stop_loss_price > self.position.ce_leg.entry_price:
-                    self.position.ce_leg.stop_loss_price = self.position.ce_leg.entry_price
-                    logger.info("PE decayed %.1f%% -> Trailed CE SL to cost (Rs %.2f)", pe_decay * 100, self.position.ce_leg.stop_loss_price)
+                if ce_decay >= self.config.trail_activation_decay_pct:
+                    self.position.pe_leg.cost_trail_pending = True
+                if pe_decay >= self.config.trail_activation_decay_pct:
+                    self.position.ce_leg.cost_trail_pending = True
 
-        # 6. Check Target Combined Decay (70%)
+            for leg in (self.position.ce_leg, self.position.pe_leg):
+                if leg.status == "OPEN" and leg.cost_trail_pending and leg.stop_loss_price > leg.entry_price:
+                    if leg.current_price < leg.entry_price:
+                        old_sl = leg.stop_loss_price
+                        leg.stop_loss_price = leg.entry_price
+                        leg.cost_trail_pending = False
+                        logger.info("Trailed %s SL to cost: Rs %.2f -> Rs %.2f", leg.option_type, old_sl, leg.stop_loss_price)
+
+        # 6. Check Target Decay (70%) — both combined when dual-open AND single surviving leg when one closed
         if self.position.ce_leg.status == "OPEN" and self.position.pe_leg.status == "OPEN":
             total_entry = self.position.ce_leg.entry_price + self.position.pe_leg.entry_price
             total_curr = ce_ltp + pe_ltp
@@ -506,8 +741,24 @@ class SilverStrangleDesk:
                 logger.info("Target Decay achieved (%.1f%% >= %.1f%%). Taking profit on both legs!", combined_decay * 100, self.config.target_decay_pct * 100)
                 self._square_off_leg(self.position.ce_leg, ce_ltp, now, reason="TARGET_DECAY", best_ask=ce_ask)
                 self._square_off_leg(self.position.pe_leg, pe_ltp, now, reason="TARGET_DECAY", best_ask=pe_ask)
-                self._finalize_close(now, reason="TARGET_DECAY")
-                return False
+                if self.position.is_fully_closed():
+                    self._finalize_close(now, reason="TARGET_DECAY")
+                    return False
+                self.save_state()
+                return True
+        else:
+            for leg, ltp_val, ask_val in (
+                (self.position.ce_leg, ce_ltp, ce_ask),
+                (self.position.pe_leg, pe_ltp, pe_ask),
+            ):
+                if leg.status == "OPEN" and leg.entry_price > 0:
+                    single_decay = (leg.entry_price - ltp_val) / leg.entry_price
+                    if single_decay >= self.config.target_decay_pct:
+                        logger.info(
+                            "Surviving %s leg hit Target Decay (%.1f%% >= %.1f%%). Taking profit!",
+                            leg.option_type, single_decay * 100, self.config.target_decay_pct * 100,
+                        )
+                        self._square_off_leg(leg, ltp_val, now, reason="TARGET_DECAY", best_ask=ask_val)
 
         if self.position.is_fully_closed():
             self._finalize_close(now, reason="BOTH_LEGS_CLOSED")
@@ -523,25 +774,78 @@ class SilverStrangleDesk:
         now: datetime,
         reason: str,
         best_ask: Optional[float] = None,
-    ):
+    ) -> bool:
         if leg.status != "OPEN":
-            return
-        logger.info("Squaring off %s leg %s @ Rs %.2f (Reason: %s)", leg.option_type, leg.symbol, ltp, reason)
-        buy_order = self.order_manager.buy(
-            symbol=leg.symbol,
-            quantity=self.config.lots,
-            price=ltp,
-            order_type=self.config.order_type,
-            buffer_pct=self.config.limit_buffer_pct,
-            best_ask=best_ask,
-            max_slippage_pct=self.config.max_limit_slippage_pct,
-        )
-        fill_price = float(buy_order.get("fill_price", ltp))
-        leg.exit_price = fill_price
+            return True
+        remaining_lots = max(0, self.config.lots - leg.exit_filled_lots)
+        if remaining_lots == 0:
+            leg.exit_time = leg.exit_time or now.strftime("%H:%M:%S")
+            leg.exit_reason = reason
+            leg.status = reason
+            return True
+
+        logger.info("Squaring off %s leg %s x %d/%d @ Rs %.2f (Reason: %s)", leg.option_type, leg.symbol, remaining_lots, self.config.lots, ltp, reason)
+        mode = getattr(self.order_manager, "mode", "PAPER")
+
+        try:
+            if mode == "LIVE":
+                res = self._execute_live_buy_with_escalation(
+                    leg.symbol,
+                    remaining_lots,
+                    ltp,
+                    best_ask=best_ask,
+                    allow_market_escalation=(reason != "TARGET_DECAY"),
+                )
+                new_filled = int(res["filled_qty"] or 0)
+                if new_filled > 0:
+                    prev_qty = leg.exit_filled_lots
+                    prev_px = float(leg.exit_price or 0.0)
+                    total_qty = prev_qty + new_filled
+                    leg.exit_price = round(((prev_qty * prev_px) + (new_filled * float(res["avg_price"]))) / total_qty, 2)
+                    leg.exit_filled_lots = total_qty
+                    leg.exit_order_id = res["last_order_id"]
+
+                if leg.exit_filled_lots < self.config.lots:
+                    err_msg = (
+                        f"Square-off for {leg.symbol} ({reason}) filled {leg.exit_filled_lots}/{self.config.lots} lots; "
+                        f"keeping leg OPEN to retry {self.config.lots - leg.exit_filled_lots} remaining lot(s)!"
+                    )
+                    logger.error("CRITICAL: %s", err_msg)
+                    if self.notifier:
+                        try:
+                            self.notifier.send_message(f"🚨 <b>MCX SILVERM SQUARE-OFF UNFILLED</b>\n• {html.escape(err_msg)}")
+                        except Exception:
+                            pass
+                    return False
+                fill_price = float(leg.exit_price)
+            else:
+                buy_order = self.order_manager.buy(
+                    symbol=leg.symbol,
+                    quantity=remaining_lots,
+                    price=ltp,
+                    order_type=self.config.order_type,
+                    buffer_pct=self.config.limit_buffer_pct,
+                    best_ask=best_ask,
+                    max_slippage_pct=self.config.max_limit_slippage_pct,
+                )
+                fill_price = float(buy_order.get("fill_price", ltp))
+                leg.exit_price = fill_price
+                leg.exit_filled_lots = self.config.lots
+                leg.exit_order_id = buy_order.get("order_id")
+        except Exception as e:
+            logger.error("CRITICAL: Square-off order error for %s (%s): %s", leg.symbol, reason, e)
+            if self.notifier:
+                try:
+                    self.notifier.send_message(
+                        f"🚨 <b>MCX SILVERM SQUARE-OFF ERROR</b>\n• {leg.symbol} ({reason}): {html.escape(str(e))}"
+                    )
+                except Exception:
+                    pass
+            return False
+
         leg.exit_time = now.strftime("%H:%M:%S")
         leg.exit_reason = reason
         leg.status = reason
-        leg.exit_order_id = buy_order.get("order_id")
 
         if self.notifier:
             try:
@@ -559,6 +863,7 @@ class SilverStrangleDesk:
                 self.notifier.send_message(msg)
             except Exception as e:
                 logger.error("Failed to send Telegram leg square-off alert: %s", e)
+        return True
 
     def _finalize_close(self, now: datetime, reason: str):
         if not self.position:
@@ -569,8 +874,13 @@ class SilverStrangleDesk:
 
         pts = self.position.total_points
         pnl = self.position.total_pnl
-        icon = "🎉" if pnl >= 0 else "⚠️"
-        logger.info("Silver Strangle Session Finalized! Combined Points: %+.2f pts | Net P&L: Rs %+.2f (Reason: %s)", pts, pnl, reason)
+        est_costs = self.position.total_estimated_costs
+        est_net = self.position.estimated_net_pnl
+        icon = "🎉" if est_net >= 0 else "⚠️"
+        logger.info(
+            "Silver Strangle Session Finalized! Combined Points: %+.2f pts | Gross P&L: Rs %+.2f | Est. Charges: Rs %.2f | Est. Net P&L: Rs %+.2f (Reason: %s)",
+            pts, pnl, est_costs, est_net, reason,
+        )
 
         if self.notifier:
             try:
@@ -583,6 +893,7 @@ class SilverStrangleDesk:
                     f"• <b>Put Result</b>: {self.position.pe_leg.points_captured:+,.1f} pts ({self.position.pe_leg.exit_reason})\n"
                     f"• <b>Total Points</b>: {pts:+,.1f} pts\n"
                     f"• <b>Realized Gross P&L</b>: ₹{pnl:+,.2f}\n"
+                    f"• <b>Est. Net P&L (after taxes)</b>: ₹{est_net:+,.2f} (~₹{est_costs:,.2f} charges)\n"
                     f"• <b>Final Reason</b>: {reason}"
                 )
                 self.notifier.send_message(msg)
@@ -602,14 +913,17 @@ class SilverStrangleDesk:
             logger.info("Clearing prior day position (%s != %s) before session start.", self.position.trade_date, today_str)
             self.clear_state()
 
-        # Enter if not yet entered today
-        if curr_time >= self.config.entry_time:
+        # Enter only before exit cutoff if not yet entered today
+        if self.config.entry_time <= curr_time < self.config.exit_time:
             if not self.position or self.position.trade_date != today_str:
                 if not self.enter_strangle(now):
                     return
             elif self.position.status in ("CLOSED", "ABORTED"):
                 logger.info("Silver Strangle for %s is already %s. Skipping session.", today_str, self.position.status)
                 return
+        elif not self.position or self.position.trade_date != today_str:
+            logger.info("Current time %s is outside active entry window [%s, %s).", curr_time, self.config.entry_time, self.config.exit_time)
+            return
 
         loop_now = now
         while True:
@@ -635,6 +949,7 @@ class SilverStrangleDesk:
                     self.config.sl_per_lot, self.config.max_portfolio_loss)
         logger.info("=" * 80)
 
+        last_session_refresh_date: Optional[str] = None
         while True:
             try:
                 now = datetime.now()
@@ -655,13 +970,18 @@ class SilverStrangleDesk:
 
                 curr_time = now.strftime("%H:%M")
 
+                # Pre-entry daily session validation/renewal at >= 19:45 IST (once per trading day)
+                if getattr(self.order_manager, "mode", "PAPER") == "LIVE" and curr_time >= "19:45" and last_session_refresh_date != today_str:
+                    self._ensure_active_kite()
+                    last_session_refresh_date = today_str
+
                 # 2. Before 20:00 IST: Idle and wait
                 if curr_time < self.config.entry_time:
                     time.sleep(30)
                     continue
 
-                # 3. Active Window: 20:00 to 23:15 IST
-                if self.config.entry_time <= curr_time <= self.config.exit_time:
+                # 3. Active Window: [entry_time, exit_time) IST (never open fresh positions at/after cutoff)
+                if self.config.entry_time <= curr_time < self.config.exit_time:
                     if not self.position or self.position.trade_date != today_str:
                         entered = self.enter_strangle(now)
                         if not entered:
@@ -678,8 +998,17 @@ class SilverStrangleDesk:
                         time.sleep(60)
                         continue
 
-                # 4. Post 23:15 IST: Clear completed/aborted state from memory & file for tomorrow, then sleep
+                # 4. Post 23:15 IST: Force square-off if an OPEN position survived a late restart before clearing
                 elif curr_time > self.config.exit_time:
+                    if self.position and self.position.trade_date == today_str and self.position.status == "OPEN":
+                        logger.warning(
+                            "Post-%s IST restart found still-OPEN position (%s). Executing mandatory EOD square-off!",
+                            self.config.exit_time, today_str,
+                        )
+                        self.monitor_cycle(now)
+                        if self.position and self.position.status == "OPEN":
+                            time.sleep(self.config.poll_seconds)
+                            continue
                     if self.position or self.state_file.exists():
                         logger.info("Post-%s IST session ended (%s). Clearing today's state in memory & file for tomorrow.", self.config.exit_time, today)
                         self.clear_state()

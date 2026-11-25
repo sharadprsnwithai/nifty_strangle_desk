@@ -94,7 +94,7 @@ services:
       - SILVER_SL_PCT=${SILVER_SL_PCT:-0.40}
       - SILVER_STRIKE_OTM_PCT=${SILVER_STRIKE_OTM_PCT:-0.015}
       - SILVER_ENTRY_TIME=${SILVER_ENTRY_TIME:-20:00}
-      - SILVER_EXIT_TIME=${SILVER_EXIT_TIME:-23:15}
+      - SILVER_EXIT_TIME=${SILVER_EXIT_TIME:-23:10}
       - SILVER_STATE_FILE=/app/data/silver_trades_today.json
       - SILVER_POLL_SECONDS=${SILVER_POLL_SECONDS:-5}
     logging:
@@ -110,10 +110,10 @@ services:
     # -----------------------------------------------------------------------------------
     # Command Options:
     # 1. Live Production Execution (Active: Configurable lots, SL calculated from number of lots):
-    command: ["--live", "--lots", "2", "--sl-per-lot", "3000.0", "--sl-pct", "0.40", "--strike-otm-pct", "0.015", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--entry-time", "20:00", "--exit-time", "23:15", "--loop"]
+    command: ["--live", "--lots", "2", "--sl-per-lot", "3000.0", "--sl-pct", "0.40", "--strike-otm-pct", "0.015", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--entry-time", "20:00", "--exit-time", "23:10", "--loop"]
     #
     # 2. Paper Trading Simulation:
-    # command: ["--paper", "--lots", "2", "--sl-per-lot", "3000.0", "--sl-pct", "0.40", "--strike-otm-pct", "0.015", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--entry-time", "20:00", "--exit-time", "23:15", "--loop"]
+    # command: ["--paper", "--lots", "2", "--sl-per-lot", "3000.0", "--sl-pct", "0.40", "--strike-otm-pct", "0.015", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--entry-time", "20:00", "--exit-time", "23:10", "--loop"]
     # -----------------------------------------------------------------------------------
 
 

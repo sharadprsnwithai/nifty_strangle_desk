@@ -19,7 +19,7 @@ def test_silver_config_defaults():
     assert config.max_portfolio_loss == 6000.0
     assert config.sl_pct == 0.40
     assert config.entry_time == "20:00"
-    assert config.exit_time == "23:15"
+    assert config.exit_time == "23:10"
 
 
 def test_silver_config_dynamic_sl_from_lots():
@@ -95,6 +95,8 @@ def test_silver_strangle_position_lifecycle():
     assert pos.total_points == 600.0
     # 600 pts * 10 kg = Rs 6,000 P&L
     assert pos.total_pnl == 6000.0
+    assert pos.total_estimated_costs > 80.0
+    assert pos.estimated_net_pnl == round(pos.total_pnl - pos.total_estimated_costs, 2)
     assert not pos.is_fully_closed()
 
     # Serialization roundtrip
@@ -114,3 +116,26 @@ def test_calculate_silver_mcx_costs():
     assert costs > 20.0  # includes brokerage (Rs 20) + exchange fee + STT + GST
     # Zero premium gives zero cost
     assert calculate_silver_mcx_costs(0.0, 10.0) == 0.0
+
+
+def test_silver_partial_exit_pnl_reflects_open_lots_and_macro_30kg():
+    ce = SilverStrangleLeg(
+        symbol="SILVERM26NOV160000CE", strike=160000.0, option_type="CE",
+        entry_price=400.0, entry_time="20:00:00", stop_loss_price=560.0,
+        current_price=1200.0, status="OPEN", exit_price=200.0, exit_filled_lots=1,
+    )
+    pe = SilverStrangleLeg(
+        symbol="SILVERM26NOV150000PE", strike=150000.0, option_type="PE",
+        entry_price=400.0, entry_time="20:00:00", stop_loss_price=560.0,
+        current_price=400.0, status="OPEN",
+    )
+    pos = SilverStranglePosition(
+        trade_date="2026-11-26", underlying_spot=155000.0, lots=2, multiplier=10.0,
+        max_loss_cap=6000.0, ce_leg=ce, pe_leg=pe, status="OPEN",
+    )
+    # CE: 1 lot exited @ 200 (+200 pts), 1 lot still OPEN @ 1200 (-800 pts) -> avg -300 pts -> -3000 Rs
+    assert ce.effective_points(2) == -300.0
+    assert pos.total_pnl == -3000.0
+
+    macro_cfg = SilverOptionsConfig(underlying="SILVER")
+    assert macro_cfg.lot_size_kg == 30

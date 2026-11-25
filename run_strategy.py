@@ -40,6 +40,7 @@ def run_strategy_cli(args=None) -> int:
     parser.add_argument("--ignore-holidays", action="store_true", help="Ignore NSE holiday and weekend checks")
     parser.add_argument("--order-timeout", type=int, default=300, help="Order fill timeout in seconds before cancellation (default: 300)")
     parser.add_argument("--entry-time", type=str, default="10:00", help="Daily execution entry time in IST (default: 10:00)")
+    parser.add_argument("--exit-time", type=str, default=os.getenv("STRANGLE_EXIT_TIME", "14:45"), help="Mandatory intraday square-off cutoff in IST (default: 14:45)")
     parser.add_argument("--product", choices=["MIS", "NRML"], default="MIS", help="Order product type (MIS for intraday, NRML for normal carry/margin, default: MIS)")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default=os.getenv("LOG_LEVEL", "INFO"), help="Logging verbosity level (default: INFO)")
     parser.add_argument("--log-dir", type=str, default=os.getenv("LOG_DIR", "logs"), help="Directory for host log files (default: logs)")
@@ -69,7 +70,7 @@ def run_strategy_cli(args=None) -> int:
     logger.info("Initializing 10:00 AM NIFTY Short Strangle Desk in [%s] mode...", mode)
     config = load_config()
     kite = get_kite_client(
-        config=config,
+        config=None,
         force_login=parsed.morning_login,
         validate=True if parsed.morning_login else None,
         check_market_hours=True,
@@ -112,16 +113,22 @@ def run_strategy_cli(args=None) -> int:
             "trail_to_cost": parsed.trail_to_cost
         }
 
+        extra_time_kwargs = {"exit_time_str": parsed.exit_time} if parsed.exit_time != "14:45" else {}
+        if mode == "LIVE" and (parsed.dry_run or parsed.once):
+            extra_time_kwargs["check_market_hours"] = True
+
         if parsed.dry_run or parsed.once:
             desk.run_session(
                 dry_run=parsed.dry_run,
                 execute_once=parsed.once,
+                **extra_time_kwargs,
                 **session_kwargs
             )
             return 0
         else:
             desk.run_scheduler(
                 entry_time_str=parsed.entry_time,
+                **extra_time_kwargs,
                 **session_kwargs
             )
             return 0

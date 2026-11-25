@@ -6,6 +6,19 @@ from kiteconnect import KiteConnect
 logger = logging.getLogger("strategy.silver.chain")
 
 
+def _normalize_date(d: Any) -> Optional[date]:
+    if isinstance(d, datetime):
+        return d.date()
+    if isinstance(d, date):
+        return d
+    if isinstance(d, str):
+        try:
+            return datetime.strptime(d[:10], "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    return None
+
+
 def get_strike_step(spot_price: float) -> float:
     """MCX Silver strikes are structured in 500 or 1000 increments."""
     if spot_price > 120000:
@@ -63,6 +76,9 @@ def _select_liquid_candidate(
         if metrics["ltp"] <= 0.0:
             rejected.append(f"{sym}: LTP=0")
             continue
+        if isinstance(q.get("depth"), dict) and (metrics["best_bid"] is None or metrics["best_ask"] is None):
+            rejected.append(f"{sym}: empty bid/ask depth")
+            continue
         if min_oi > 0 and metrics["oi"] is not None and metrics["oi"] < min_oi:
             rejected.append(f"{sym}: OI={metrics['oi']}<{min_oi}")
             continue
@@ -84,6 +100,7 @@ def find_silver_strangle_strikes(
     min_oi: int = 100,
     max_spread_pct: float = 0.03,
     scan_steps: int = 5,
+    skip_0dte: bool = True,
 ) -> Dict[str, Any]:
     """
     Identifies the active near-month monthly expiry and OTM Strangle strikes on MCX.
@@ -129,14 +146,45 @@ def find_silver_strangle_strikes(
     spot_price = mock_spot
 
     today = datetime.now().date()
+
+    # Resolve active options expiry first (roll past 0-DTE expiry day if next expiry exists)
+    active_expiry = None
+    if opts:
+        future_expiries = sorted({
+            d for d in (_normalize_date(o.get("expiry")) for o in opts)
+            if d is not None and d >= today
+        })
+        if future_expiries:
+            if skip_0dte and future_expiries[0] == today and len(future_expiries) > 1:
+                logger.info("Today (%s) is %s option expiry (0-DTE). Rolling to next expiry: %s", today, underlying, future_expiries[1])
+                active_expiry = future_expiries[1]
+            else:
+                active_expiry = future_expiries[0]
+
+    if active_expiry is None:
+        active_expiry = today
+
+    # Resolve active futures aligned with the target option expiry (avoids tender/expiring front-month basis distortion)
+    fut_symbol = None
+    fut_token = None
+    spot_price = mock_spot
+
     if futs:
-        # Sort futures by expiry
-        future_futs = [f for f in futs if f.get("expiry") and f["expiry"] >= today]
-        future_futs.sort(key=lambda x: x["expiry"])
-        if future_futs:
-            active_fut = future_futs[0]
+        future_futs = sorted(
+            [
+                (exp_d, f)
+                for f in futs
+                for exp_d in [_normalize_date(f.get("expiry"))]
+                if exp_d is not None and exp_d >= today
+            ],
+            key=lambda x: x[0],
+        )
+        aligned_futs = [f for exp_d, f in future_futs if exp_d >= active_expiry]
+        selected_pool = aligned_futs or [f for _, f in future_futs]
+        if selected_pool:
+            active_fut = selected_pool[0]
             fut_symbol = active_fut["tradingsymbol"]
-            fut_token = active_fut["instrument_token"]
+            fut_token = active_fut.get("instrument_token")
 
     # If spot price not mocked, fetch live quote from Kite
     if spot_price is None and fut_symbol and kite is not None:
@@ -168,16 +216,6 @@ def find_silver_strangle_strikes(
         spot_price = 155000.0  # Conservative typical price benchmark for Silver
         logger.warning("Using fallback spot price for %s: Rs %.2f", underlying, spot_price)
 
-    # 3. Resolve active options expiry
-    active_expiry = None
-    if opts:
-        future_expiries = sorted(list({o["expiry"] for o in opts if o.get("expiry") and o["expiry"] >= today}))
-        if future_expiries:
-            active_expiry = future_expiries[0]
-
-    if active_expiry is None:
-        active_expiry = today
-
     # 4. Compute target strikes
     step = get_strike_step(spot_price)
     target_ce_strike = round_to_strike_step(spot_price * (1.0 + strike_otm_pct), step)
@@ -190,7 +228,7 @@ def find_silver_strangle_strikes(
     pe_candidates: List[Dict[str, Any]] = []
 
     if opts and active_expiry:
-        expiry_opts = [o for o in opts if o.get("expiry") == active_expiry]
+        expiry_opts = [o for o in opts if _normalize_date(o.get("expiry")) == active_expiry]
         all_ce = [o for o in expiry_opts if o["instrument_type"] == "CE"]
         all_pe = [o for o in expiry_opts if o["instrument_type"] == "PE"]
 
@@ -198,8 +236,15 @@ def find_silver_strangle_strikes(
         otm_pe = [o for o in all_pe if o["strike"] < spot_price] or all_pe
 
         max_cands = max(1, scan_steps * 2 + 1)
-        ce_candidates = sorted(otm_ce, key=lambda x: abs(x["strike"] - target_ce_strike))[:max_cands]
-        pe_candidates = sorted(otm_pe, key=lambda x: abs(x["strike"] - target_pe_strike))[:max_cands]
+        # Prefer further-OTM strikes over stepping inward toward ATM if liquidity scan skips the primary strike
+        ce_candidates = sorted(
+            otm_ce,
+            key=lambda x: (0 if x["strike"] >= target_ce_strike else 1, abs(x["strike"] - target_ce_strike)),
+        )[:max_cands]
+        pe_candidates = sorted(
+            otm_pe,
+            key=lambda x: (0 if x["strike"] <= target_pe_strike else 1, abs(x["strike"] - target_pe_strike)),
+        )[:max_cands]
 
         if ce_candidates:
             ce_opt = ce_candidates[0]

@@ -19,12 +19,28 @@ class SilverStrangleLeg:
     exit_reason: Optional[str] = None
     order_id: Optional[str] = None
     exit_order_id: Optional[str] = None
+    cost_trail_pending: bool = False
+    exit_filled_lots: int = 0
 
     @property
     def points_captured(self) -> float:
         """Points won or lost on this short option leg."""
         exit_p = self.exit_price if self.exit_price is not None else self.current_price
         return round(self.entry_price - exit_p, 2)
+
+    def effective_points(self, total_lots: int) -> float:
+        """
+        Accurate per-lot average points even when partially squared off
+        (`status == "OPEN"` and `0 < exit_filled_lots < total_lots`).
+        """
+        if self.status != "OPEN" or self.exit_filled_lots <= 0 or total_lots <= 0:
+            return self.points_captured
+        closed_lots = min(self.exit_filled_lots, total_lots)
+        open_lots = max(0, total_lots - closed_lots)
+        closed_px = self.exit_price if self.exit_price is not None else self.current_price
+        closed_pts = self.entry_price - closed_px
+        open_pts = self.entry_price - self.current_price
+        return round(((closed_lots * closed_pts) + (open_lots * open_pts)) / total_lots, 2)
 
     def pnl(self, multiplier: float) -> float:
         """Calculates P&L in Rupees for this leg given total kg multiplier."""
@@ -35,7 +51,8 @@ class SilverStrangleLeg:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SilverStrangleLeg":
-        return cls(**data)
+        valid = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        return cls(**valid)
 
 
 @dataclass
@@ -49,21 +66,39 @@ class SilverStranglePosition:
     ce_leg: Optional[SilverStrangleLeg] = None
     pe_leg: Optional[SilverStrangleLeg] = None
     status: str = "OPEN"       # OPEN, PARTIAL, CLOSED, ABORTED
+    mode: str = "LIVE"
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     closed_at: Optional[str] = None
     abort_reason: Optional[str] = None
 
     @property
     def total_points(self) -> float:
-        """Combined points captured across both legs."""
-        ce_pts = self.ce_leg.points_captured if self.ce_leg else 0.0
-        pe_pts = self.pe_leg.points_captured if self.pe_leg else 0.0
+        """Combined points captured across both legs (accounting for partial exits)."""
+        ce_pts = self.ce_leg.effective_points(self.lots) if self.ce_leg else 0.0
+        pe_pts = self.pe_leg.effective_points(self.lots) if self.pe_leg else 0.0
         return round(ce_pts + pe_pts, 2)
 
     @property
     def total_pnl(self) -> float:
         """Combined gross P&L in Rs across both legs."""
         return round(self.total_points * self.multiplier, 2)
+
+    @property
+    def total_estimated_costs(self) -> float:
+        """Estimated round-trip MCX brokerage & statutory taxes across both legs."""
+        total = 0.0
+        for leg in (self.ce_leg, self.pe_leg):
+            if leg is None:
+                continue
+            exit_p = leg.exit_price if leg.exit_price is not None else leg.current_price
+            total += calculate_silver_mcx_costs(leg.entry_price, self.multiplier, is_sell=True)
+            total += calculate_silver_mcx_costs(exit_p, self.multiplier, is_sell=False)
+        return round(total, 2)
+
+    @property
+    def estimated_net_pnl(self) -> float:
+        """Estimated net P&L in Rs after MCX brokerage & statutory taxes."""
+        return round(self.total_pnl - self.total_estimated_costs, 2)
 
     def is_fully_closed(self) -> bool:
         ce_closed = self.ce_leg is None or self.ce_leg.status != "OPEN"
@@ -78,6 +113,7 @@ class SilverStranglePosition:
             "multiplier": self.multiplier,
             "max_loss_cap": self.max_loss_cap,
             "status": self.status,
+            "mode": self.mode,
             "created_at": self.created_at,
             "closed_at": self.closed_at,
             "abort_reason": self.abort_reason,
@@ -100,6 +136,7 @@ class SilverStranglePosition:
             ce_leg=SilverStrangleLeg.from_dict(ce_data) if ce_data else None,
             pe_leg=SilverStrangleLeg.from_dict(pe_data) if pe_data else None,
             status=data.get("status", "OPEN"),
+            mode=data.get("mode", "LIVE"),
             created_at=data.get("created_at", datetime.now().isoformat()),
             closed_at=data.get("closed_at"),
             abort_reason=data.get("abort_reason"),
