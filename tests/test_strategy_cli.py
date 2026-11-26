@@ -188,8 +188,8 @@ def test_run_strategy_cli_once_flag():
             strike_mode="ATR",
             atr_multiplier=1.25,
             target_price=30.0,
-            use_leg_sl=True,
-            trail_to_cost=True
+            use_leg_sl=False,
+            trail_to_cost=False
         )
 
 
@@ -504,8 +504,8 @@ def test_run_strategy_cli_max_loss_flag():
             strike_mode="ATR",
             atr_multiplier=1.25,
             target_price=30.0,
-            use_leg_sl=True,
-            trail_to_cost=True
+            use_leg_sl=False,
+            trail_to_cost=False
         )
 
 
@@ -538,8 +538,8 @@ def test_run_strategy_cli_strategy_max_loss_flag():
             strike_mode="ATR",
             atr_multiplier=1.25,
             target_price=30.0,
-            use_leg_sl=True,
-            trail_to_cost=True
+            use_leg_sl=False,
+            trail_to_cost=False
         )
 
 
@@ -585,8 +585,8 @@ def test_run_strategy_cli_order_type_and_holiday_flags():
             strike_mode="ATR",
             atr_multiplier=1.25,
             target_price=30.0,
-            use_leg_sl=True,
-            trail_to_cost=True
+            use_leg_sl=False,
+            trail_to_cost=False
         )
 
 
@@ -619,8 +619,8 @@ def test_run_strategy_cli_order_timeout_flag():
             strike_mode="ATR",
             atr_multiplier=1.25,
             target_price=30.0,
-            use_leg_sl=True,
-            trail_to_cost=True
+            use_leg_sl=False,
+            trail_to_cost=False
         )
 
 
