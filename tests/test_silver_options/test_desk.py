@@ -34,7 +34,7 @@ def test_desk_enter_strangle(temp_state_file, mock_chain_data):
         "MCX:SILVERM26NOV153000PE": {"last_price": 400.0},
     }
 
-    config = SilverOptionsConfig(lots=2, sl_per_lot=3000.0, sl_pct=0.40)
+    config = SilverOptionsConfig(lots=2, sl_per_lot=3000.0, sl_pct=0.40, strike_mode="PERCENT", vwap_entry_enabled=False, portfolio_sl_pct=0.0, max_dte_days=0)
     om = SilverOrderManager(mode="PAPER", config=config)
     desk = SilverStrangleDesk(
         order_manager=om,
@@ -204,7 +204,7 @@ def test_desk_clears_stale_position_from_previous_day(temp_state_file, mock_chai
         "MCX:SILVERM26NOV153000PE": {"last_price": 400.0},
     }
 
-    config = SilverOptionsConfig(lots=2)
+    config = SilverOptionsConfig(lots=2, strike_mode="PERCENT", vwap_entry_enabled=False, portfolio_sl_pct=0.0, max_dte_days=0)
     om = SilverOrderManager(mode="PAPER", config=config)
 
     # Pre-populate state file with a CLOSED position from yesterday (2026-11-23)
@@ -284,7 +284,7 @@ def test_live_partial_pe_rejection_rolls_back_ce_and_prevents_restart_loop(temp_
     oi_err = Exception("MIS LIMIT orders are blocked for this contract due to its open interest (OI) being less than 100 lots.")
     mock_kite = _make_live_mock_kite(mock_chain_data, pe_fail_exc=oi_err)
 
-    config = SilverOptionsConfig(lots=2, sl_per_lot=3000.0, sl_pct=0.40)
+    config = SilverOptionsConfig(lots=2, sl_per_lot=3000.0, sl_pct=0.40, strike_mode="PERCENT", vwap_entry_enabled=False, portfolio_sl_pct=0.0, max_dte_days=0)
     om = SilverOrderManager(mode="LIVE", kite=mock_kite, config=config)
     desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
 
@@ -317,7 +317,7 @@ def test_live_aborts_if_broker_already_has_open_silverm_position(temp_state_file
             {"exchange": "MCX", "tradingsymbol": "SILVERM26DEC140000CE", "quantity": -4},
         ]
     }
-    config = SilverOptionsConfig(lots=2)
+    config = SilverOptionsConfig(lots=2, strike_mode="PERCENT", vwap_entry_enabled=False, portfolio_sl_pct=0.0, max_dte_days=0)
     om = SilverOrderManager(mode="LIVE", kite=mock_kite, config=config)
     desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
 
@@ -331,7 +331,7 @@ def test_live_aborts_if_live_quotes_unavailable_no_fake_155000_fallback(temp_sta
     mock_kite = _make_live_mock_kite(mock_chain_data)
     mock_kite.quote.side_effect = Exception("Network error fetching quote")
 
-    config = SilverOptionsConfig(lots=2)
+    config = SilverOptionsConfig(lots=2, strike_mode="PERCENT", vwap_entry_enabled=False, portfolio_sl_pct=0.0, max_dte_days=0)
     om = SilverOrderManager(mode="LIVE", kite=mock_kite, config=config)
     desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
 
@@ -354,7 +354,7 @@ def test_stale_state_cleared_from_memory_and_file_next_day(temp_state_file, mock
             "abort_reason": "OI < 100",
         }, f)
 
-    config = SilverOptionsConfig(lots=2)
+    config = SilverOptionsConfig(lots=2, strike_mode="PERCENT", vwap_entry_enabled=False, portfolio_sl_pct=0.0, max_dte_days=0)
     om = SilverOrderManager(mode="PAPER", config=config)
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = mock_chain_data
@@ -530,7 +530,7 @@ def test_monitor_cycle_refreshes_expired_token_and_syncs_order_manager(temp_stat
     import kite.client as kite_client_mod
     monkeypatch.setattr(kite_client_mod, "ensure_kite_session", lambda k, force_login=False: refreshed_kite)
 
-    config = SilverOptionsConfig(lots=2)
+    config = SilverOptionsConfig(lots=2, strike_mode="PERCENT", vwap_entry_enabled=False, portfolio_sl_pct=0.0, max_dte_days=0)
     om = SilverOrderManager(mode="PAPER", kite=mock_kite, config=config)
     desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
 
@@ -614,7 +614,7 @@ def test_live_pure_limit_timeout_allows_single_retry_before_abort(temp_state_fil
     mock_kite.order_history.return_value = [
         {"status": "OPEN", "filled_quantity": 0, "pending_quantity": 2, "average_price": 0.0}
     ]
-    config = SilverOptionsConfig(lots=2, order_type="LIMIT")
+    config = SilverOptionsConfig(lots=2, order_type="LIMIT", strike_mode="PERCENT", vwap_entry_enabled=False, portfolio_sl_pct=0.0, max_dte_days=0)
     om = SilverOrderManager(mode="LIVE", kite=mock_kite, config=config)
     desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
     desk._wait_for_orders = lambda ids, timeout_seconds=10, poll_seconds=1: {
@@ -671,7 +671,7 @@ def test_reconcile_with_broker_marks_manual_flat_leg_closed(temp_state_file, moc
             {"exchange": "MCX", "tradingsymbol": "SILVERM26NOV153000PE", "quantity": -2, "sell_price": 400.0},
         ]
     }
-    config = SilverOptionsConfig(lots=2)
+    config = SilverOptionsConfig(lots=2, strike_mode="PERCENT", vwap_entry_enabled=False, portfolio_sl_pct=0.0, max_dte_days=0)
     om = SilverOrderManager(mode="LIVE", kite=mock_kite, config=config)
     desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
     desk.position = SilverStranglePosition(
@@ -696,5 +696,73 @@ def test_run_session_refuses_entry_at_or_after_exit_time_and_isolates_paper_stat
     desk.enter_strangle = MagicMock()
     desk.run_session(execute_once=True, now=datetime(2026, 11, 26, 23, 10, 0))
     desk.enter_strangle.assert_not_called()
+
+
+def test_vwap_entry_waits_until_comb_below_vwap_and_applies_portfolio_sl_pct(temp_state_file, mock_chain_data):
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = mock_chain_data
+    # Cycle 1 (20:00): Comb = 400 + 400 = 800 -> VWAP = 800 (samples=1 -> waits)
+    # Cycle 2 (20:05): Comb = 430 + 430 = 860 -> VWAP = 830 (860 >= 830 -> waits)
+    # Cycle 3 (20:10): Comb = 370 + 370 = 740 -> VWAP = 800 (740 < 800 -> ENTERS!)
+    mock_kite.quote.side_effect = [
+        {"MCX:SILVERM26NOVFUT": {"last_price": 155000.0}},
+        {
+            "MCX:SILVERM26NOV157000CE": {"last_price": 400.0, "volume": 10},
+            "MCX:SILVERM26NOV153000PE": {"last_price": 400.0, "volume": 10},
+        },
+        {
+            "MCX:SILVERM26NOV157000CE": {"last_price": 430.0, "volume": 20},
+            "MCX:SILVERM26NOV153000PE": {"last_price": 430.0, "volume": 20},
+        },
+        {
+            "MCX:SILVERM26NOV157000CE": {"last_price": 370.0, "volume": 30},
+            "MCX:SILVERM26NOV153000PE": {"last_price": 370.0, "volume": 30},
+        },
+    ]
+
+    config = SilverOptionsConfig(
+        lots=2,
+        vwap_entry_enabled=True,
+        vwap_entry_cutoff="21:45",
+        portfolio_sl_pct=0.25,
+    )
+    om = SilverOrderManager(mode="PAPER", config=config)
+    desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
+
+    assert desk.enter_strangle(datetime(2026, 11, 23, 20, 0, 0)) is False
+    assert desk.position is None
+    assert desk.enter_strangle(datetime(2026, 11, 23, 20, 5, 0)) is False
+    assert desk.position is None
+    assert desk.enter_strangle(datetime(2026, 11, 23, 20, 10, 0)) is True
+    assert desk.position is not None
+    assert desk.position.status == "OPEN"
+    # Combined credit = 740 pts * 25% * 10 kg = Rs 1,850 max loss cap
+    assert desk.position.max_loss_cap == 1850.0
+
+
+def test_max_dte_gate_skips_session_cleanly(temp_state_file):
+    from datetime import timedelta
+    today = datetime.now().date()
+    far_expiry = today + timedelta(days=20)
+    instruments = [
+        {"name": "SILVERM", "instrument_type": "FUT", "tradingsymbol": "SILVERM_FUT", "expiry": far_expiry, "instrument_token": 1001},
+        {"name": "SILVERM", "instrument_type": "CE", "tradingsymbol": "SILVERM_CE", "strike": 157000.0, "expiry": far_expiry, "instrument_token": 2001},
+        {"name": "SILVERM", "instrument_type": "PE", "tradingsymbol": "SILVERM_PE", "strike": 153000.0, "expiry": far_expiry, "instrument_token": 3001},
+    ]
+    mock_kite = MagicMock()
+    mock_kite.instruments.return_value = instruments
+    mock_kite.quote.side_effect = [
+        {"MCX:SILVERM_FUT": {"last_price": 155000.0}},
+        {"MCX:SILVERM_CE": {"last_price": 400.0}, "MCX:SILVERM_PE": {"last_price": 400.0}},
+    ]
+    config = SilverOptionsConfig(lots=2, max_dte_days=10)
+    om = SilverOrderManager(mode="PAPER", config=config)
+    desk = SilverStrangleDesk(order_manager=om, config=config, state_file=temp_state_file, kite_client=mock_kite)
+
+    now = datetime.combine(today, datetime.strptime("20:00", "%H:%M").time())
+    assert desk.enter_strangle(now) is False
+    assert desk.position is not None
+    assert desk.position.status == "SKIPPED"
+    assert "max_dte_days=10" in desk.position.abort_reason
 
 

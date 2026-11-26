@@ -50,11 +50,16 @@ class SilverOrderManager:
         For LIMIT orders, anchors to live best_bid (when available) with tight max_slippage_pct
         to prevent thin-book slippage, falling back to price - buffer_pct otherwise.
         """
+        if quantity <= 0:
+            raise ValueError(f"Invalid MCX SELL quantity: {quantity}")
+        if price <= 0:
+            raise ValueError(f"Invalid MCX SELL price: {price}")
         order_type_norm = order_type.upper()
+        tick = self.config.tick_size if self.config.tick_size and self.config.tick_size > 0 else 0.5
         anchor_price = best_bid if (best_bid is not None and best_bid > 0) else price
         effective_pct = max_slippage_pct if (best_bid is not None and best_bid > 0 and max_slippage_pct is not None) else buffer_pct
         buffer = max(anchor_price * effective_pct, min_buffer_rs)
-        limit_price = max(0.5, _round_to_mcx_tick(anchor_price - buffer, self.config.tick_size)) if order_type_norm == "LIMIT" else None
+        limit_price = max(0.5, _round_to_mcx_tick(anchor_price - buffer, tick)) if order_type_norm == "LIMIT" else None
 
         logger.info(
             "[%s] Executing MCX SELL (%s): %s x %d @ Rs %.2f%s",
@@ -143,11 +148,16 @@ class SilverOrderManager:
         For LIMIT orders, anchors to live best_ask (when available) with tight max_slippage_pct
         to guarantee execution without sweeping an empty book.
         """
+        if quantity <= 0:
+            raise ValueError(f"Invalid MCX BUY quantity: {quantity}")
+        if price <= 0:
+            raise ValueError(f"Invalid MCX BUY price: {price}")
         order_type_norm = order_type.upper()
+        tick = self.config.tick_size if self.config.tick_size and self.config.tick_size > 0 else 0.5
         anchor_price = best_ask if (best_ask is not None and best_ask > 0) else price
         effective_pct = max_slippage_pct if (best_ask is not None and best_ask > 0 and max_slippage_pct is not None) else buffer_pct
         buffer = max(anchor_price * effective_pct, min_buffer_rs)
-        limit_price = max(0.5, _round_to_mcx_tick(anchor_price + buffer, self.config.tick_size)) if order_type_norm == "LIMIT" else None
+        limit_price = max(0.5, _round_to_mcx_tick(anchor_price + buffer, tick)) if order_type_norm == "LIMIT" else None
 
         logger.info(
             "[%s] Executing MCX BUY square-off (%s): %s x %d @ Rs %.2f%s",

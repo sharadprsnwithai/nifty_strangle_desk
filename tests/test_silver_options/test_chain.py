@@ -219,3 +219,43 @@ def test_find_silver_strangle_strikes_rejects_empty_depth_and_prefers_outer_otm(
     )
     assert res["ce_symbol"] == "SILVERM_OUTER_CE"
     assert res["pe_symbol"] == "SILVERM_TARGET_PE"
+
+
+def test_find_silver_strangle_strikes_atr_mode_from_history():
+    from datetime import timedelta
+    expiry = date(2026, 11, 27)
+    mock_instruments = [
+        {"name": "SILVERM", "instrument_type": "FUT", "tradingsymbol": "SILVERM26NOVFUT", "expiry": expiry, "instrument_token": 1001},
+        {"name": "SILVERM", "instrument_type": "CE", "tradingsymbol": "SILVERM26NOV158000CE", "strike": 158000.0, "expiry": expiry, "instrument_token": 2001},
+        {"name": "SILVERM", "instrument_type": "PE", "tradingsymbol": "SILVERM26NOV152000PE", "strike": 152000.0, "expiry": expiry, "instrument_token": 3001},
+    ]
+    # 4 prior completed daily candles with TR = 4000 each -> ATR = 4000; * 0.75 = 3000 offset
+    # Spot = 155000 -> CE = 158000, PE = 152000
+    today = date.today()
+    mock_kite = MagicMock()
+    mock_kite.historical_data.return_value = [
+        {"date": today - timedelta(days=4), "open": 154000.0, "high": 157000.0, "low": 153000.0, "close": 155000.0},
+        {"date": today - timedelta(days=3), "open": 155000.0, "high": 157000.0, "low": 153000.0, "close": 155000.0},
+        {"date": today - timedelta(days=2), "open": 155000.0, "high": 157000.0, "low": 153000.0, "close": 155000.0},
+        {"date": today - timedelta(days=1), "open": 155000.0, "high": 157000.0, "low": 153000.0, "close": 155000.0},
+    ]
+    mock_kite.quote.side_effect = [
+        {"MCX:SILVERM26NOVFUT": {"last_price": 155000.0}},
+        {
+            "MCX:SILVERM26NOV158000CE": {"last_price": 380.0, "oi": 200},
+            "MCX:SILVERM26NOV152000PE": {"last_price": 390.0, "oi": 200},
+        },
+    ]
+    res = find_silver_strangle_strikes(
+        kite=mock_kite,
+        underlying="SILVERM",
+        instruments=mock_instruments,
+        allow_fallback=False,
+        strike_mode="ATR",
+        atr_multiplier=0.75,
+        atr_period=14,
+    )
+    assert res["strike_mode"] == "ATR"
+    assert res["daily_atr"] == 4000.0
+    assert res["ce_strike"] == 158000.0
+    assert res["pe_strike"] == 152000.0

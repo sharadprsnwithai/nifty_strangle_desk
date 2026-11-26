@@ -79,7 +79,15 @@ def calculate_dte_fraction(current_dt: datetime, expiry_date: date) -> float:
 
 def run_strangle_backtest(
     df: pd.DataFrame,
-    strike_otm_pct: float = 0.015,         # 1.5% OTM (~15 Delta)
+    strike_otm_pct: float = 0.015,         # Fallback 1.5% OTM
+    strike_mode: str = "ATR",              # Primary: ATR-scaled strikes (or PERCENT)
+    atr_period: int = 14,
+    atr_multiplier: float = 0.75,
+    atr_min_otm_pct: float = 0.01,
+    vwap_entry: bool = True,               # Primary: Wait for 20:00-anchored Comb < VWAP
+    vwap_cutoff: str = "21:45",
+    portfolio_sl_pct: float = 0.25,        # Primary: 25% of combined credit (0 = sl_per_lot * lots)
+    max_dte_days: int = 10,                # Primary: <=10 DTE (0 = unlimited)
     sl_pct: float = 0.40,                  # 40% single-leg SL
     trail_to_cost: bool = True,
     trail_activation_decay_pct: float = 0.30,
@@ -92,6 +100,7 @@ def run_strangle_backtest(
     exit_time_str: str = "23:10",
     skip_0dte: bool = True,
     slippage_pts: float = 0.5,             # Round-trip MCX tick slippage per leg
+    slippage_pct_per_leg_side: float = 0.0,  # Optional proportional bid-ask slippage per leg side
     base_iv: float = 0.30,                 # 30% annualized IV
     evening_iv_crush: float = 0.02,        # 2% IV drop across evening session
 ):
@@ -107,8 +116,29 @@ def run_strangle_backtest(
     else:
         active_days = sorted(df["day"].unique())
 
+    # Pre-compute prior-day shifted Daily ATR across active days when ATR mode is requested
+    daily_atr_map = {}
+    if str(strike_mode).upper() == "ATR" and active_days:
+        daily_bars = (
+            df[df["day"].isin(active_days)]
+            .groupby("day")
+            .agg(open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"))
+            .sort_index()
+        )
+        prev_close = daily_bars["close"].shift(1)
+        tr = pd.concat(
+            [
+                daily_bars["high"] - daily_bars["low"],
+                (daily_bars["high"] - prev_close).abs(),
+                (daily_bars["low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        daily_atr_series = tr.rolling(atr_period, min_periods=1).mean().shift(1)
+        daily_atr_map = daily_atr_series.to_dict()
+
     multiplier = float(lots * lot_size_kg)
-    max_loss_cap = round(float(sl_per_lot) * lots, 2) if sl_per_lot and sl_per_lot > 0 else None
+    fixed_max_loss_cap = round(float(sl_per_lot) * lots, 2) if sl_per_lot and sl_per_lot > 0 else None
     trade_logs = []
 
     for trade_day in active_days:
@@ -127,22 +157,48 @@ def run_strangle_backtest(
         spot_entry = float(entry_row["open"])
         entry_dt = entry_row["date"]
         expiry = get_monthly_expiry(trade_day, skip_0dte=skip_0dte)
+        cal_dte = (expiry - trade_day).days
+        if max_dte_days > 0 and cal_dte > max_dte_days:
+            continue
         dte_entry = calculate_dte_fraction(entry_dt, expiry)
 
-        # Strike Selection matched to live `chain.py`: step 1000 if spot > 120000 else 500
+        # Strike Selection matched to live `chain.py` (PERCENT or ATR)
         strike_step = get_strike_step(spot_entry)
-        ce_strike = round_to_strike_step(spot_entry * (1.0 + strike_otm_pct), strike_step)
-        pe_strike = round_to_strike_step(spot_entry * (1.0 - strike_otm_pct), strike_step)
+        if str(strike_mode).upper() == "ATR":
+            atr_val = daily_atr_map.get(trade_day)
+            if atr_val is not None and not pd.isna(atr_val) and float(atr_val) > 0:
+                offset = max(float(atr_val) * atr_multiplier, spot_entry * atr_min_otm_pct)
+                ce_strike = round_to_strike_step(spot_entry + offset, strike_step)
+                pe_strike = round_to_strike_step(spot_entry - offset, strike_step)
+            else:
+                ce_strike = round_to_strike_step(spot_entry * (1.0 + strike_otm_pct), strike_step)
+                pe_strike = round_to_strike_step(spot_entry * (1.0 - strike_otm_pct), strike_step)
+        else:
+            ce_strike = round_to_strike_step(spot_entry * (1.0 + strike_otm_pct), strike_step)
+            pe_strike = round_to_strike_step(spot_entry * (1.0 - strike_otm_pct), strike_step)
 
-        # Initial Option Prices (Black-76)
-        ce_entry = black_76_price(spot_entry, ce_strike, dte_entry, iv=base_iv, opt_type="CE")
-        pe_entry = black_76_price(spot_entry, pe_strike, dte_entry, iv=base_iv, opt_type="PE")
+        # Entry execution state (immediate at 20:00 OR wait for 20:00-anchored Comb < VWAP)
+        entered = not vwap_entry
+        ce_entry = 0.0
+        pe_entry = 0.0
+        ce_sl = 0.0
+        pe_sl = 0.0
+        max_loss_cap = fixed_max_loss_cap
+        cum_pv = 0.0
+        cum_vol = 0.0
+        vwap_samples = 0
 
-        if ce_entry <= 0.5 or pe_entry <= 0.5:
-            continue
-
-        ce_sl = round(ce_entry * (1.0 + sl_pct), 2)
-        pe_sl = round(pe_entry * (1.0 + sl_pct), 2)
+        if entered:
+            ce_theo = black_76_price(spot_entry, ce_strike, dte_entry, iv=base_iv, opt_type="CE")
+            pe_theo = black_76_price(spot_entry, pe_strike, dte_entry, iv=base_iv, opt_type="PE")
+            if ce_theo <= 0.5 or pe_theo <= 0.5:
+                continue
+            ce_entry = round(ce_theo * (1.0 - slippage_pct_per_leg_side), 2)
+            pe_entry = round(pe_theo * (1.0 - slippage_pct_per_leg_side), 2)
+            ce_sl = round(ce_entry * (1.0 + sl_pct), 2)
+            pe_sl = round(pe_entry * (1.0 + sl_pct), 2)
+            if portfolio_sl_pct > 0:
+                max_loss_cap = round((ce_entry + pe_entry) * portfolio_sl_pct * multiplier, 2)
 
         ce_status = "OPEN"
         pe_status = "OPEN"
@@ -163,6 +219,7 @@ def run_strangle_backtest(
             curr_high = float(row["high"])
             curr_low = float(row["low"])
             curr_time = row["time"]
+            bar_vol = float(row["volume"]) if ("volume" in row and float(row["volume"]) > 0) else 1.0
 
             # Linear IV crush across the evening session
             prog = idx / max(1, total_evening_candles - 1)
@@ -172,33 +229,63 @@ def run_strangle_backtest(
             ce_curr_price = black_76_price(curr_spot, ce_strike, curr_dte, iv=curr_iv, opt_type="CE")
             pe_curr_price = black_76_price(curr_spot, pe_strike, curr_dte, iv=curr_iv, opt_type="PE")
 
+            if not entered:
+                ce_h = black_76_price(curr_high, ce_strike, curr_dte, iv=curr_iv, opt_type="CE")
+                pe_h = black_76_price(curr_high, pe_strike, curr_dte, iv=curr_iv, opt_type="PE")
+                ce_l = black_76_price(curr_low, ce_strike, curr_dte, iv=curr_iv, opt_type="CE")
+                pe_l = black_76_price(curr_low, pe_strike, curr_dte, iv=curr_iv, opt_type="PE")
+                comb_curr = ce_curr_price + pe_curr_price
+                comb_typ = ((ce_h + pe_h) + (ce_l + pe_l) + comb_curr) / 3.0
+                cum_pv += comb_typ * bar_vol
+                cum_vol += bar_vol
+                vwap_samples += 1
+                comb_vwap = cum_pv / cum_vol if cum_vol > 0 else comb_curr
+
+                if curr_time > vwap_cutoff or curr_time >= exit_time_str:
+                    break
+                if vwap_samples >= 2 and comb_curr < comb_vwap:
+                    if ce_curr_price <= 0.5 or pe_curr_price <= 0.5:
+                        break
+                    entered = True
+                    spot_entry = curr_spot
+                    dte_entry = curr_dte
+                    ce_entry = round(ce_curr_price * (1.0 - slippage_pct_per_leg_side), 2)
+                    pe_entry = round(pe_curr_price * (1.0 - slippage_pct_per_leg_side), 2)
+                    ce_sl = round(ce_entry * (1.0 + sl_pct), 2)
+                    pe_sl = round(pe_entry * (1.0 + sl_pct), 2)
+                    ce_exit_price = ce_entry
+                    pe_exit_price = pe_entry
+                    if portfolio_sl_pct > 0:
+                        max_loss_cap = round((ce_entry + pe_entry) * portfolio_sl_pct * multiplier, 2)
+                continue
+
             # 1. EOD Cutoff (aligned with desk.monitor_cycle)
             if curr_time >= exit_time_str or idx == total_evening_candles - 1:
                 if ce_status == "OPEN":
                     ce_status = "EOD"
-                    ce_exit_price = ce_curr_price
+                    ce_exit_price = round(ce_curr_price * (1.0 + slippage_pct_per_leg_side), 2)
                     ce_exit_time = curr_time
                     ce_exit_reason = "EOD"
                 if pe_status == "OPEN":
                     pe_status = "EOD"
-                    pe_exit_price = pe_curr_price
+                    pe_exit_price = round(pe_curr_price * (1.0 + slippage_pct_per_leg_side), 2)
                     pe_exit_time = curr_time
                     pe_exit_reason = "EOD"
                 break
 
-            # 2. Portfolio Max-Loss Cap (sl_per_lot * lots) evaluated on bar close
+            # 2. Portfolio Max-Loss Cap evaluated on bar close
             ce_mark = ce_curr_price if ce_status == "OPEN" else ce_exit_price
             pe_mark = pe_curr_price if pe_status == "OPEN" else pe_exit_price
             curr_portfolio_pnl = ((ce_entry - ce_mark) + (pe_entry - pe_mark)) * multiplier
             if max_loss_cap is not None and curr_portfolio_pnl <= -max_loss_cap:
                 if ce_status == "OPEN":
                     ce_status = "MAX_PORTFOLIO_LOSS"
-                    ce_exit_price = ce_curr_price
+                    ce_exit_price = round(ce_curr_price * (1.0 + slippage_pct_per_leg_side), 2)
                     ce_exit_time = curr_time
                     ce_exit_reason = "MAX_PORTFOLIO_LOSS"
                 if pe_status == "OPEN":
                     pe_status = "MAX_PORTFOLIO_LOSS"
-                    pe_exit_price = pe_curr_price
+                    pe_exit_price = round(pe_curr_price * (1.0 + slippage_pct_per_leg_side), 2)
                     pe_exit_time = curr_time
                     pe_exit_reason = "MAX_PORTFOLIO_LOSS"
                 break
@@ -224,26 +311,26 @@ def run_strangle_backtest(
 
             if ce_status == "OPEN" and ce_worst_price >= ce_sl:
                 ce_status = "SL"
-                ce_exit_price = round(ce_sl, 2)
+                ce_exit_price = round(ce_sl * (1.0 + slippage_pct_per_leg_side), 2)
                 ce_exit_time = curr_time
                 ce_exit_reason = "SL"
                 ce_stopped_this_bar = True
                 if not single_leg_exit and pe_status == "OPEN":
                     pe_status = "SL_CO_EXIT"
-                    pe_exit_price = pe_curr_price
+                    pe_exit_price = round(pe_curr_price * (1.0 + slippage_pct_per_leg_side), 2)
                     pe_exit_time = curr_time
                     pe_exit_reason = "SL_CO_EXIT"
                     break
 
             if pe_status == "OPEN" and not ce_stopped_this_bar and pe_worst_price >= pe_sl:
                 pe_status = "SL"
-                pe_exit_price = round(pe_sl, 2)
+                pe_exit_price = round(pe_sl * (1.0 + slippage_pct_per_leg_side), 2)
                 pe_exit_time = curr_time
                 pe_exit_reason = "SL"
                 pe_stopped_this_bar = True
                 if not single_leg_exit and ce_status == "OPEN":
                     ce_status = "SL_CO_EXIT"
-                    ce_exit_price = ce_curr_price
+                    ce_exit_price = round(ce_curr_price * (1.0 + slippage_pct_per_leg_side), 2)
                     ce_exit_time = curr_time
                     ce_exit_reason = "SL_CO_EXIT"
                     break
@@ -277,8 +364,8 @@ def run_strangle_backtest(
                 if (combined_entry - combined_curr) / combined_entry >= target_decay_pct:
                     ce_status = "TARGET_DECAY"
                     pe_status = "TARGET_DECAY"
-                    ce_exit_price = ce_curr_price
-                    pe_exit_price = pe_curr_price
+                    ce_exit_price = round(ce_curr_price * (1.0 + slippage_pct_per_leg_side), 2)
+                    pe_exit_price = round(pe_curr_price * (1.0 + slippage_pct_per_leg_side), 2)
                     ce_exit_time = curr_time
                     pe_exit_time = curr_time
                     ce_exit_reason = "TARGET_DECAY"
@@ -287,17 +374,20 @@ def run_strangle_backtest(
             else:
                 if ce_status == "OPEN" and (ce_entry - ce_curr_price) / ce_entry >= target_decay_pct:
                     ce_status = "TARGET_DECAY"
-                    ce_exit_price = ce_curr_price
+                    ce_exit_price = round(ce_curr_price * (1.0 + slippage_pct_per_leg_side), 2)
                     ce_exit_time = curr_time
                     ce_exit_reason = "TARGET_DECAY"
                 if pe_status == "OPEN" and (pe_entry - pe_curr_price) / pe_entry >= target_decay_pct:
                     pe_status = "TARGET_DECAY"
-                    pe_exit_price = pe_curr_price
+                    pe_exit_price = round(pe_curr_price * (1.0 + slippage_pct_per_leg_side), 2)
                     pe_exit_time = curr_time
                     pe_exit_reason = "TARGET_DECAY"
 
             if ce_status != "OPEN" and pe_status != "OPEN":
                 break
+
+        if not entered:
+            continue
 
         ce_pts = (ce_entry - ce_exit_price) - slippage_pts
         pe_pts = (pe_entry - pe_exit_price) - slippage_pts

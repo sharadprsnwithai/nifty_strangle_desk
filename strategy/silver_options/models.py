@@ -177,3 +177,79 @@ def calculate_silver_mcx_costs(
 
     total = brokerage + exchange_fee + stt + sebi_fee + stamp_duty + gst
     return round(total, 2)
+
+
+@dataclass
+class SilverDirectionalPosition:
+    """Represents a single-leg LONG ATM option trade for the 18:00-20:00 Directional Buyer."""
+    trade_date: str
+    underlying_spot: float
+    symbol: str = ""
+    strike: float = 0.0
+    option_type: str = "CE"       # 'CE' or 'PE'
+    lots: int = 2
+    multiplier: float = 10.0
+    entry_price: float = 0.0
+    entry_time: str = ""
+    stop_loss_price: float = 0.0
+    initial_sl_price: float = 0.0
+    target_price: float = 0.0
+    current_price: float = 0.0
+    max_loss_cap: float = 6000.0
+    status: str = "OPEN"          # OPEN, TARGET, SL, MAX_LOSS, EOD, BROKER_RECONCILED, SKIPPED, ABORTED
+    mode: str = "LIVE"
+    order_id: Optional[str] = None
+    exit_order_id: Optional[str] = None
+    exit_price: Optional[float] = None
+    exit_time: Optional[str] = None
+    exit_reason: Optional[str] = None
+    exit_filled_lots: int = 0
+    breakeven_armed: bool = False
+    abort_reason: Optional[str] = None
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    closed_at: Optional[str] = None
+
+    @property
+    def points_captured(self) -> float:
+        """Points won or lost on this LONG option position (accounting for partial exits)."""
+        if self.entry_price <= 0:
+            return 0.0
+        if self.status == "OPEN" and 0 < self.exit_filled_lots < self.lots and self.lots > 0:
+            closed_lots = min(self.exit_filled_lots, self.lots)
+            open_lots = max(0, self.lots - closed_lots)
+            closed_px = self.exit_price if self.exit_price is not None else self.current_price
+            return round(((closed_lots * (closed_px - self.entry_price)) + (open_lots * (self.current_price - self.entry_price))) / self.lots, 2)
+        exit_p = self.exit_price if self.exit_price is not None else self.current_price
+        return round(exit_p - self.entry_price, 2)
+
+    @property
+    def total_pnl(self) -> float:
+        """Gross P&L in Rupees for this long option trade."""
+        return round(self.points_captured * self.multiplier, 2)
+
+    @property
+    def total_estimated_costs(self) -> float:
+        """Estimated MCX round-trip charges (buy entry + sell exit)."""
+        if self.entry_price <= 0:
+            return 0.0
+        exit_p = self.exit_price if self.exit_price is not None else self.current_price
+        total = (
+            calculate_silver_mcx_costs(self.entry_price, self.multiplier, is_sell=False)
+            + calculate_silver_mcx_costs(exit_p, self.multiplier, is_sell=True)
+        )
+        return round(total, 2)
+
+    @property
+    def estimated_net_pnl(self) -> float:
+        return round(self.total_pnl - self.total_estimated_costs, 2)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["points_captured"] = self.points_captured
+        d["total_pnl"] = self.total_pnl
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SilverDirectionalPosition":
+        valid = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        return cls(**valid)

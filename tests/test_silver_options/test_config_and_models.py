@@ -20,6 +20,21 @@ def test_silver_config_defaults():
     assert config.sl_pct == 0.40
     assert config.entry_time == "20:00"
     assert config.exit_time == "23:10"
+    assert config.strike_mode == "ATR"
+    assert config.atr_multiplier == 0.75
+    assert config.vwap_entry_enabled is True
+    assert config.vwap_entry_cutoff == "21:45"
+    assert config.portfolio_sl_pct == 0.25
+    assert config.max_dte_days == 10
+    assert config.effective_max_portfolio_loss(800.0) == 2000.0
+    assert config.strategy_mode == "BARBELL"
+    assert config.buyer_entry_start == "18:00"
+    assert config.buyer_entry_cutoff == "20:00"
+    assert config.buyer_max_dte_days == 10
+    assert config.buyer_min_atr_pct == 3.0
+    assert config.buyer_sl_pct == 0.30
+    assert config.buyer_target_pct == 0.60
+    assert config.buyer_max_loss_cap == 6000.0
 
 
 def test_silver_config_dynamic_sl_from_lots():

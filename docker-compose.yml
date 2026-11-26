@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: runtime
     container_name: nifty_strangle_desk
     image: ${DOCKER_USER:-sharadprsn}/nifty_strangle_desk:latest
     restart: unless-stopped
@@ -45,6 +46,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: etf
     container_name: etf_swing_desk
     image: ${DOCKER_USER:-sharadprsn}/etf_swing_desk:latest
     restart: unless-stopped
@@ -78,6 +80,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: runtime
     container_name: silver_desk
     image: ${DOCKER_USER:-sharadprsn}/silver_desk:latest
     restart: unless-stopped
@@ -89,13 +92,31 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-5}
       - SILVER_MODE=LIVE
+      - SILVER_STRATEGY_MODE=${SILVER_STRATEGY_MODE:-BARBELL}
       - SILVER_LOTS=${SILVER_LOTS:-2}
       - SILVER_SL_PER_LOT=${SILVER_SL_PER_LOT:-3000.0}
       - SILVER_SL_PCT=${SILVER_SL_PCT:-0.40}
+      - SILVER_STRIKE_MODE=${SILVER_STRIKE_MODE:-ATR}
+      - SILVER_ATR_PERIOD=${SILVER_ATR_PERIOD:-14}
+      - SILVER_ATR_MULTIPLIER=${SILVER_ATR_MULTIPLIER:-0.75}
       - SILVER_STRIKE_OTM_PCT=${SILVER_STRIKE_OTM_PCT:-0.015}
+      - SILVER_VWAP_ENTRY=${SILVER_VWAP_ENTRY:-true}
+      - SILVER_VWAP_CUTOFF=${SILVER_VWAP_CUTOFF:-21:45}
+      - SILVER_PORTFOLIO_SL_PCT=${SILVER_PORTFOLIO_SL_PCT:-0.25}
+      - SILVER_MAX_DTE_DAYS=${SILVER_MAX_DTE_DAYS:-10}
       - SILVER_ENTRY_TIME=${SILVER_ENTRY_TIME:-20:00}
       - SILVER_EXIT_TIME=${SILVER_EXIT_TIME:-23:10}
       - SILVER_STATE_FILE=/app/data/silver_trades_today.json
+      - SILVER_BUYER_ENTRY_START=${SILVER_BUYER_ENTRY_START:-18:00}
+      - SILVER_BUYER_ENTRY_CUTOFF=${SILVER_BUYER_ENTRY_CUTOFF:-20:00}
+      - SILVER_BUYER_MAX_DTE_DAYS=${SILVER_BUYER_MAX_DTE_DAYS:-10}
+      - SILVER_BUYER_MIN_ATR_PCT=${SILVER_BUYER_MIN_ATR_PCT:-3.0}
+      - SILVER_BUYER_VOL_MULT=${SILVER_BUYER_VOL_MULT:-1.3}
+      - SILVER_BUYER_SL_PCT=${SILVER_BUYER_SL_PCT:-0.30}
+      - SILVER_BUYER_SL_PER_LOT=${SILVER_BUYER_SL_PER_LOT:-3000.0}
+      - SILVER_BUYER_TARGET_PCT=${SILVER_BUYER_TARGET_PCT:-0.60}
+      - SILVER_BUYER_TRAIL_BE_PCT=${SILVER_BUYER_TRAIL_BE_PCT:-0.25}
+      - SILVER_BUYER_STATE_FILE=/app/data/silver_buyer_trades_today.json
       - SILVER_POLL_SECONDS=${SILVER_POLL_SECONDS:-5}
     logging:
       driver: "json-file"
@@ -109,11 +130,14 @@ services:
     entrypoint: ["python", "scripts/run_silver_desk.py"]
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Live Production Execution (Active: Configurable lots, SL calculated from number of lots):
-    command: ["--live", "--lots", "2", "--sl-per-lot", "3000.0", "--sl-pct", "0.40", "--strike-otm-pct", "0.015", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--entry-time", "20:00", "--exit-time", "23:10", "--loop"]
+    # 1. Live Production Combo 2A Barbell (18:00-20:00 Directional Buyer + 20:00-23:10 Primary Strangle):
+    command: ["--live", "--strategy-mode", "BARBELL", "--lots", "2", "--strike-mode", "ATR", "--atr-period", "14", "--atr-multiplier", "0.75", "--vwap-entry", "--vwap-cutoff", "21:45", "--portfolio-sl-pct", "0.25", "--max-dte-days", "10", "--sl-pct", "0.40", "--buyer-max-dte-days", "10", "--buyer-min-atr-pct", "3.0", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--entry-time", "20:00", "--exit-time", "23:10", "--loop"]
     #
-    # 2. Paper Trading Simulation:
-    # command: ["--paper", "--lots", "2", "--sl-per-lot", "3000.0", "--sl-pct", "0.40", "--strike-otm-pct", "0.015", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--entry-time", "20:00", "--exit-time", "23:10", "--loop"]
+    # 2. Live Strangle Only:
+    # command: ["--live", "--strategy-mode", "STRANGLE", "--lots", "2", "--strike-mode", "ATR", "--atr-period", "14", "--atr-multiplier", "0.75", "--vwap-entry", "--vwap-cutoff", "21:45", "--portfolio-sl-pct", "0.25", "--max-dte-days", "10", "--sl-pct", "0.40", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--entry-time", "20:00", "--exit-time", "23:10", "--loop"]
+    #
+    # 3. Paper Trading Simulation (Combo 2A Barbell):
+    # command: ["--paper", "--strategy-mode", "BARBELL", "--lots", "2", "--loop"]
     # -----------------------------------------------------------------------------------
 
 
