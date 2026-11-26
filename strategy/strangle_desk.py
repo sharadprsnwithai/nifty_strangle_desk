@@ -1674,6 +1674,7 @@ class StrangleDesk:
         last_holiday_date: Optional[date] = None
         last_totp_login_date: Optional[date] = None
         last_idle_reconcile_time: float = 0.0
+        last_phase_logged: Optional[str] = None
         iteration = 0
 
         while True:
@@ -1755,12 +1756,20 @@ class StrangleDesk:
 
             # 2. If today's session is already completed, aborted, or skipped by morning filter, wait for next trading day
             if state is not None and state.get("date") == today_str and state.get("status") in ("COMPLETED", "ABORTED", "SKIPPED_TREND_DAY"):
+                phase_key = f"DONE:{today_str}:{state.get('status')}"
+                if last_phase_logged != phase_key:
+                    logger.info("Today's session (%s) is %s. Waiting for next trading day.", today_str, state.get("status"))
+                    last_phase_logged = phase_key
                 time.sleep(idle_sleep_seconds)
                 continue
 
             # 3. Market Hours Guard: Outside regular NSE trading hours (09:15 - 15:30 IST) or on weekends, sleep peacefully
             is_market_hours = (dt_time(9, 15) <= current_t <= dt_time(15, 30)) and (now.weekday() < 5 or ignore_holidays)
             if not is_market_hours:
+                phase_key = f"CLOSED:{today_str}"
+                if last_phase_logged != phase_key:
+                    logger.info("Market closed (current IST: %s). Scheduler sleeping until market open.", now.strftime("%H:%M:%S"))
+                    last_phase_logged = phase_key
                 time.sleep(idle_sleep_seconds)
                 continue
 
@@ -1783,6 +1792,10 @@ class StrangleDesk:
 
             # 5. If before 10:00 AM (e.g. 09:15-09:59 IST), wait for entry time
             if current_t < dt_time(entry_h, entry_m):
+                phase_key = f"PRE_ENTRY:{today_str}"
+                if last_phase_logged != phase_key:
+                    logger.info("Market open; waiting for %s IST entry window (current: %s).", entry_time_str, now.strftime("%H:%M:%S"))
+                    last_phase_logged = phase_key
                 time.sleep(idle_sleep_seconds)
                 continue
 
@@ -1821,5 +1834,12 @@ class StrangleDesk:
                 time.sleep(idle_sleep_seconds)
                 continue
 
-            # 5. Outside entry window & market closed (e.g. evening 18:33 IST): sleep
+            # 7. Outside entry window during market hours (e.g. started after 10:05 IST with IDLE state): sleep
+            phase_key = f"POST_WINDOW:{today_str}"
+            if last_phase_logged != phase_key:
+                logger.info(
+                    "Entry window (%02d:%02d-%02d:%02d IST) has passed for %s and no open position found; idle until next trading day.",
+                    entry_h, entry_m, end_total_m // 60, end_total_m % 60, today_str,
+                )
+                last_phase_logged = phase_key
             time.sleep(idle_sleep_seconds)

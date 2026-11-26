@@ -87,11 +87,48 @@ def run_strategy_cli(args=None) -> int:
         state_file_path = Path(parsed.data_dir) / "trades_today.json"
 
     desk = StrangleDesk(order_manager=om, state_file=state_file_path, notifier=notifier)
+    logger.info(
+        "Strangle config | mode=%s lots=%d max_loss=Rs %.0f use_leg_sl=%s trail_to_cost=%s "
+        "strike_mode=%s atr_mult=%.2f morning_filter=%s (%.2f%%) exit_time=%s state_file=%s",
+        mode,
+        parsed.lots,
+        parsed.strategy_max_loss,
+        parsed.use_leg_sl,
+        parsed.trail_to_cost,
+        parsed.strike_mode,
+        parsed.atr_multiplier,
+        parsed.morning_filter,
+        parsed.morning_filter_pct,
+        parsed.exit_time,
+        desk.state_file,
+    )
 
     if parsed.morning_login:
         logger.info("Executing on-demand morning TOTP login renewal...")
         desk.perform_daily_morning_login(kite=kite)
         return 0
+
+    if kite is not None:
+        try:
+            prof = kite.profile()
+            if isinstance(prof, dict):
+                logger.info(
+                    "Kite connection verified: %s (%s)",
+                    prof.get("user_name", "Trader"),
+                    prof.get("user_id", "unknown"),
+                )
+        except Exception as e:
+            logger.warning("Kite profile check failed at startup: %s", e)
+
+        try:
+            ltp_data = kite.ltp(["NSE:NIFTY 50"])
+            nifty_ltp = ltp_data.get("NSE:NIFTY 50", {}).get("last_price") if isinstance(ltp_data, dict) else None
+            if nifty_ltp is not None:
+                logger.info("NIFTY 50 live data check OK: LTP = Rs %.2f", float(nifty_ltp))
+            elif isinstance(ltp_data, dict):
+                logger.warning("NIFTY 50 live data check returned empty payload: %s", ltp_data)
+        except Exception as e:
+            logger.warning("NIFTY 50 live data check failed at startup: %s", e)
 
     try:
         session_kwargs = {

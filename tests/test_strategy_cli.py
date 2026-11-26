@@ -1632,4 +1632,22 @@ def test_run_strategy_cli_live_once_enforces_check_market_hours():
         assert mock_desk.run_session.call_args.kwargs["check_market_hours"] is True
 
 
+def test_run_strategy_cli_logs_kite_profile_and_nifty_ltp(capsys):
+    mock_kite = MagicMock()
+    mock_kite.profile.return_value = {"user_name": "Sharad", "user_id": "AB1234"}
+    mock_kite.ltp.return_value = {"NSE:NIFTY 50": {"last_price": 24150.25}}
+
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client", return_value=mock_kite), \
+         patch("run_strategy.OrderManager"), \
+         patch("run_strategy.StrangleDesk"):
+        exit_code = run_strategy_cli(["--live", "--once"])
+
+    captured = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Kite connection verified: Sharad (AB1234)" in captured
+    assert "NIFTY 50 live data check OK: LTP = Rs 24150.25" in captured
+
+
+
 
