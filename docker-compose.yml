@@ -29,8 +29,8 @@ services:
       # Code is baked into the image; rebuild to apply code changes: docker compose up -d --build
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Live Production (10 Lots, Rs 10k Combined Loss Dual-Leg Exit Only, Morning Trend Filter, ATR Strikes):
-    command: ["--live", "--lots", "10", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "10000", "--no-single-leg-exit", "--no-trail-cost", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
+    # 1. Live Production (12 Lots, 10:00 -> 15:15 IST, 70% Single-Leg SL, No Max-Loss Cap, Roll Untested Leg, Morning Filter, ATR Strikes):
+    command: ["--live", "--lots", "12", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--no-max-loss", "--single-leg-exit", "--leg-sl-pct", "0.70", "--no-trail-cost", "--roll-untested", "--entry-time", "10:00", "--exit-time", "15:15", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
     #
     # 2. Live Conservative / Re-entry (5 Lots, Rs 5k Risk Cap, Single-Leg Exit + Cost Trailing):
     # command: ["--live", "--lots", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "5000", "--single-leg-exit", "--trail-cost", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
@@ -74,70 +74,6 @@ services:
     #
     # 2. Paper Trading Simulation:
     # command: ["--paper", "--capital", "1000000", "--slots", "3", "--loop"]
-    # -----------------------------------------------------------------------------------
-
-  silver-desk:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: runtime
-    container_name: silver_desk
-    image: ${DOCKER_USER:-sharadprsn}/silver_desk:latest
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      - TZ=Asia/Kolkata
-      - PYTHONUNBUFFERED=1
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-5}
-      - SILVER_MODE=LIVE
-      - SILVER_STRATEGY_MODE=${SILVER_STRATEGY_MODE:-BARBELL}
-      - SILVER_LOTS=${SILVER_LOTS:-2}
-      - SILVER_SL_PER_LOT=${SILVER_SL_PER_LOT:-3000.0}
-      - SILVER_SL_PCT=${SILVER_SL_PCT:-0.40}
-      - SILVER_STRIKE_MODE=${SILVER_STRIKE_MODE:-ATR}
-      - SILVER_ATR_PERIOD=${SILVER_ATR_PERIOD:-14}
-      - SILVER_ATR_MULTIPLIER=${SILVER_ATR_MULTIPLIER:-0.75}
-      - SILVER_STRIKE_OTM_PCT=${SILVER_STRIKE_OTM_PCT:-0.015}
-      - SILVER_VWAP_ENTRY=${SILVER_VWAP_ENTRY:-true}
-      - SILVER_VWAP_CUTOFF=${SILVER_VWAP_CUTOFF:-21:45}
-      - SILVER_PORTFOLIO_SL_PCT=${SILVER_PORTFOLIO_SL_PCT:-0.25}
-      - SILVER_MAX_DTE_DAYS=${SILVER_MAX_DTE_DAYS:-10}
-      - SILVER_ENTRY_TIME=${SILVER_ENTRY_TIME:-20:00}
-      - SILVER_EXIT_TIME=${SILVER_EXIT_TIME:-23:10}
-      - SILVER_STATE_FILE=/app/data/silver_trades_today.json
-      - SILVER_BUYER_ENTRY_START=${SILVER_BUYER_ENTRY_START:-18:00}
-      - SILVER_BUYER_ENTRY_CUTOFF=${SILVER_BUYER_ENTRY_CUTOFF:-20:00}
-      - SILVER_BUYER_MAX_DTE_DAYS=${SILVER_BUYER_MAX_DTE_DAYS:-10}
-      - SILVER_BUYER_MIN_ATR_PCT=${SILVER_BUYER_MIN_ATR_PCT:-3.0}
-      - SILVER_BUYER_VOL_MULT=${SILVER_BUYER_VOL_MULT:-1.3}
-      - SILVER_BUYER_SL_PCT=${SILVER_BUYER_SL_PCT:-0.30}
-      - SILVER_BUYER_SL_PER_LOT=${SILVER_BUYER_SL_PER_LOT:-3000.0}
-      - SILVER_BUYER_TARGET_PCT=${SILVER_BUYER_TARGET_PCT:-0.60}
-      - SILVER_BUYER_TRAIL_BE_PCT=${SILVER_BUYER_TRAIL_BE_PCT:-0.25}
-      - SILVER_BUYER_STATE_FILE=/app/data/silver_buyer_trades_today.json
-      - SILVER_POLL_SECONDS=${SILVER_POLL_SECONDS:-5}
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "5"
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./.env:/app/.env
-    entrypoint: ["python", "scripts/run_silver_desk.py"]
-    # -----------------------------------------------------------------------------------
-    # Command Options:
-    # 1. Live Production Combo 2A Barbell (18:00-20:00 Directional Buyer + 20:00-23:10 Primary Strangle):
-    command: ["--live", "--strategy-mode", "BARBELL", "--lots", "2", "--strike-mode", "ATR", "--atr-period", "14", "--atr-multiplier", "0.75", "--vwap-entry", "--vwap-cutoff", "21:45", "--portfolio-sl-pct", "0.25", "--max-dte-days", "10", "--sl-pct", "0.40", "--buyer-max-dte-days", "10", "--buyer-min-atr-pct", "3.0", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--entry-time", "20:00", "--exit-time", "23:10", "--loop"]
-    #
-    # 2. Live Strangle Only:
-    # command: ["--live", "--strategy-mode", "STRANGLE", "--lots", "2", "--strike-mode", "ATR", "--atr-period", "14", "--atr-multiplier", "0.75", "--vwap-entry", "--vwap-cutoff", "21:45", "--portfolio-sl-pct", "0.25", "--max-dte-days", "10", "--sl-pct", "0.40", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--entry-time", "20:00", "--exit-time", "23:10", "--loop"]
-    #
-    # 3. Paper Trading Simulation (Combo 2A Barbell):
-    # command: ["--paper", "--strategy-mode", "BARBELL", "--lots", "2", "--loop"]
     # -----------------------------------------------------------------------------------
 
 

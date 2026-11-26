@@ -178,7 +178,7 @@ def test_run_strategy_cli_once_flag():
             dry_run=False,
             execute_once=True,
             kite=mock_kite,
-            strategy_max_loss=10000.0,
+            strategy_max_loss=0.0,
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
@@ -188,7 +188,7 @@ def test_run_strategy_cli_once_flag():
             strike_mode="ATR",
             atr_multiplier=1.25,
             target_price=30.0,
-            use_leg_sl=False,
+            use_leg_sl=True,
             trail_to_cost=False
         )
 
@@ -248,7 +248,7 @@ def test_strangle_desk_run_session_single_leg_sl_exit(tmp_path):
 
     with patch("strategy.strangle_desk.datetime") as mock_dt:
         mock_dt.now.return_value = datetime(2026, 11, 3, 10, 15)
-        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite, use_leg_sl=True, trail_to_cost=True)
+        state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite, use_leg_sl=True, leg_sl_pct=0.50, trail_to_cost=True)
 
     assert state is not None
     assert state["status"] == "OPEN"
@@ -302,9 +302,9 @@ def test_strangle_desk_run_session_time_exit(tmp_path):
     om = OrderManager(mode="PAPER", kite=mock_kite)
     desk = StrangleDesk(order_manager=om, state_file=state_file)
 
-    # Freeze time past 15:00
+    # Freeze time past 15:15
     with patch("strategy.strangle_desk.datetime") as mock_dt:
-        mock_dt.now.return_value = datetime(2026, 11, 3, 15, 5)
+        mock_dt.now.return_value = datetime(2026, 11, 3, 15, 16)
         state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite)
 
     assert state is not None
@@ -330,9 +330,9 @@ def test_strangle_desk_run_session_1445_cutoff_exit(tmp_path):
     om = OrderManager(mode="PAPER", kite=mock_kite)
     desk = StrangleDesk(order_manager=om, state_file=state_file)
 
-    # Freeze time at 14:46 (past 14:45 cutoff)
+    # Freeze time at 15:16 (past 15:15 cutoff)
     with patch("strategy.strangle_desk.datetime") as mock_dt:
-        mock_dt.now.return_value = datetime(2026, 11, 3, 14, 46)
+        mock_dt.now.return_value = datetime(2026, 11, 3, 15, 16)
         state = desk.run_session(lots=1, poll_seconds=0, dry_run=False, execute_once=True, kite=mock_kite)
 
     assert state is not None
@@ -504,7 +504,7 @@ def test_run_strategy_cli_max_loss_flag():
             strike_mode="ATR",
             atr_multiplier=1.25,
             target_price=30.0,
-            use_leg_sl=False,
+            use_leg_sl=True,
             trail_to_cost=False
         )
 
@@ -538,7 +538,7 @@ def test_run_strategy_cli_strategy_max_loss_flag():
             strike_mode="ATR",
             atr_multiplier=1.25,
             target_price=30.0,
-            use_leg_sl=False,
+            use_leg_sl=True,
             trail_to_cost=False
         )
 
@@ -575,7 +575,7 @@ def test_run_strategy_cli_order_type_and_holiday_flags():
             dry_run=False,
             execute_once=True,
             kite=mock_kite,
-            strategy_max_loss=10000.0,
+            strategy_max_loss=0.0,
             order_type="MARKET",
             limit_buffer_pct=0.08,
             ignore_holidays=True,
@@ -585,7 +585,7 @@ def test_run_strategy_cli_order_type_and_holiday_flags():
             strike_mode="ATR",
             atr_multiplier=1.25,
             target_price=30.0,
-            use_leg_sl=False,
+            use_leg_sl=True,
             trail_to_cost=False
         )
 
@@ -609,7 +609,7 @@ def test_run_strategy_cli_order_timeout_flag():
             dry_run=False,
             execute_once=True,
             kite=mock_kite,
-            strategy_max_loss=10000.0,
+            strategy_max_loss=0.0,
             order_type="LIMIT",
             limit_buffer_pct=0.05,
             ignore_holidays=False,
@@ -619,7 +619,7 @@ def test_run_strategy_cli_order_timeout_flag():
             strike_mode="ATR",
             atr_multiplier=1.25,
             target_price=30.0,
-            use_leg_sl=False,
+            use_leg_sl=True,
             trail_to_cost=False
         )
 

@@ -96,10 +96,13 @@ def run_backtest_simulation(
     iv: float = 0.13,
     r: float = 0.065,
     expiry_weekday: int = 1,
-    strategy_max_loss: Optional[float] = 10000.0,
-    use_leg_sl: bool = False,
+    strategy_max_loss: Optional[float] = 0.0,
+    use_leg_sl: bool = True,
+    leg_sl_pct: float = 0.70,
     trail_opposite_to_cost: bool = False,
-    exit_cutoff_time: time = time(14, 45),
+    roll_untested: bool = True,
+    entry_time: time = time(10, 0),
+    exit_cutoff_time: time = time(15, 15),
     morning_filter: bool = False,
     morning_filter_threshold_pct: float = 0.60,
     use_atr_strikes: bool = False,
@@ -149,9 +152,9 @@ def run_backtest_simulation(
     for t_date in trade_dates:
         day_df = df[df["trade_date"] == t_date].sort_values("dt")
 
-        # Evaluate Morning Range Trend Filter strictly before 10:00 AM (09:15 to 09:59)
+        # Evaluate Morning Range Trend Filter strictly before entry_time (e.g. 09:15 to 09:59)
         if morning_filter:
-            morning_bars = day_df[day_df["dt"].dt.time < time(10, 0)]
+            morning_bars = day_df[day_df["dt"].dt.time < entry_time]
             if not morning_bars.empty:
                 m_open = float(morning_bars.iloc[0]["open"])
                 m_high = float(morning_bars["high"].max())
@@ -161,19 +164,21 @@ def run_backtest_simulation(
                 if m_range_pct >= morning_filter_threshold_pct:
                     continue  # Skip violent trend session
 
-        # Locate entry candle around 10:00 AM (between 09:55 and 10:05)
-        entry_bars = day_df[(day_df["dt"].dt.hour == 10) & (day_df["dt"].dt.minute <= 5)]
+        # Locate entry candle around entry_time (within +5m, fallback -5m)
+        entry_end_t = (datetime.combine(t_date, entry_time) + timedelta(minutes=5)).time()
+        entry_start_t = (datetime.combine(t_date, entry_time) - timedelta(minutes=5)).time()
+        entry_bars = day_df[(day_df["dt"].dt.time >= entry_time) & (day_df["dt"].dt.time <= entry_end_t)]
         if entry_bars.empty:
-            entry_bars = day_df[(day_df["dt"].dt.hour == 9) & (day_df["dt"].dt.minute >= 55)]
+            entry_bars = day_df[(day_df["dt"].dt.time >= entry_start_t) & (day_df["dt"].dt.time < entry_time)]
         if entry_bars.empty:
             continue
 
         entry_bar = entry_bars.iloc[0]
-        entry_time = entry_bar["dt"]
+        entry_dt = entry_bar["dt"]
         spot_10am = float(entry_bar["open"])
 
         target_expiry, is_0dte = get_weekly_expiry_for_date(t_date, expiry_weekday=expiry_weekday)
-        entry_dte = compute_fractional_dte(target_expiry, entry_time)
+        entry_dte = compute_fractional_dte(target_expiry, entry_dt)
 
         # Strike Selection: Dynamic ATR or Static Price
         if use_atr_strikes:
@@ -191,13 +196,13 @@ def run_backtest_simulation(
             ce_entry = ce_theo_price
             pe_entry = pe_theo_price
 
-        ce_sl = round(ce_entry * 1.50, 2)
+        ce_sl = round(ce_entry * (1.0 + leg_sl_pct), 2)
         ce_target = round(ce_entry * 0.20, 2)
-        pe_sl = round(pe_entry * 1.50, 2)
+        pe_sl = round(pe_entry * (1.0 + leg_sl_pct), 2)
         pe_target = round(pe_entry * 0.20, 2)
 
         # Track legs throughout the day (including the entry bar from open -> close, matching live monitoring)
-        intraday_bars = day_df[(day_df["dt"] >= entry_time) & (day_df["dt"].dt.time <= exit_cutoff_time)]
+        intraday_bars = day_df[(day_df["dt"] >= entry_dt) & (day_df["dt"].dt.time <= exit_cutoff_time)]
 
         ce_active = True
         pe_active = True
@@ -207,8 +212,12 @@ def run_backtest_simulation(
         pe_exit_price = pe_entry
         ce_exit_reason = "TIME_EXIT"
         pe_exit_reason = "TIME_EXIT"
-        ce_exit_time = entry_time
-        pe_exit_time = entry_time
+        ce_exit_time = entry_dt
+        pe_exit_time = entry_dt
+        rolled_today = False
+        roll_gross_pnl = 0.0
+        roll_taxes = 0.0
+        roll_slippage = 0.0
 
         for _, bar in intraday_bars.iterrows():
             curr_dt = bar["dt"]
@@ -218,9 +227,14 @@ def run_backtest_simulation(
             bar_close_spot = float(bar["close"])
 
             # 1. 5-minute Strategy-Level Loss Check (both legs exit simultaneously if combined loss >= strategy_max_loss in legacy mode, or exit losing leg only in single-leg mode)
-            effective_max_loss = strategy_max_loss if strategy_max_loss is not None else 10000.0
+            if strategy_max_loss is None:
+                effective_max_loss: Optional[float] = 10000.0
+            elif strategy_max_loss <= 0:
+                effective_max_loss = None
+            else:
+                effective_max_loss = strategy_max_loss
             single_leg_exited_this_bar = False
-            if (ce_active or pe_active):
+            if (ce_active or pe_active) and effective_max_loss is not None:
                 ce_5m_price = black_76_price(bar_close_spot, ce_strike, curr_dte, iv, r, "CE") if ce_active else ce_exit_price
                 pe_5m_price = black_76_price(bar_close_spot, pe_strike, curr_dte, iv, r, "PE") if pe_active else pe_exit_price
                 current_loss = ((ce_5m_price - ce_entry) + (pe_5m_price - pe_entry)) * total_qty
@@ -311,13 +325,28 @@ def run_backtest_simulation(
                             ce_exit_price = ce_target
                             ce_exit_reason = "DECAY_TARGET"
                             ce_exit_time = curr_dt
-                            # Close opposite PE leg simultaneously to avoid naked single-leg risk in legacy mode
-                            if not use_leg_sl and pe_active:
+                            # Close opposite PE leg simultaneously or roll CE to ATM if underwater
+                            if pe_active:
                                 pe_5m_price = black_76_price(bar_close_spot, pe_strike, curr_dte, iv, r, "PE")
-                                pe_active = False
-                                pe_exit_price = round(pe_5m_price, 2)
-                                pe_exit_reason = "CO_TARGET_EXIT"
-                                pe_exit_time = curr_dt
+                                comb_pnl = ((ce_entry - ce_target) + (pe_entry - pe_5m_price)) * total_qty
+                                if roll_untested and comb_pnl <= 0 and not rolled_today:
+                                    rc = calculate_trade_costs(ce_entry, ce_target, total_qty, slippage_per_share=slippage)
+                                    roll_gross_pnl += rc["gross_pnl"]
+                                    roll_taxes += rc["statutory_taxes"]
+                                    roll_slippage += rc["total_slippage"]
+                                    ce_strike = round(bar_close_spot / 50.0) * 50.0
+                                    ce_entry = black_76_price(bar_close_spot, ce_strike, curr_dte, iv, r, "CE")
+                                    ce_sl = round(ce_entry * (1.0 + leg_sl_pct), 2)
+                                    ce_target = round(ce_entry * 0.20, 2)
+                                    ce_active = True
+                                    ce_exit_price = ce_entry
+                                    ce_exit_reason = "TIME_EXIT"
+                                    rolled_today = True
+                                elif not use_leg_sl:
+                                    pe_active = False
+                                    pe_exit_price = round(pe_5m_price, 2)
+                                    pe_exit_reason = "CO_TARGET_EXIT"
+                                    pe_exit_time = curr_dt
 
                 # 3. Evaluate individual PE leg
                 if pe_active and not ce_stopped_this_bar:
@@ -341,19 +370,34 @@ def run_backtest_simulation(
                             pe_exit_price = pe_target
                             pe_exit_reason = "DECAY_TARGET"
                             pe_exit_time = curr_dt
-                            # Close opposite CE leg simultaneously to avoid naked single-leg risk in legacy mode
-                            if not use_leg_sl and ce_active:
+                            # Close opposite CE leg simultaneously or roll PE to ATM if underwater
+                            if ce_active:
                                 ce_5m_price = black_76_price(bar_close_spot, ce_strike, curr_dte, iv, r, "CE")
-                                ce_active = False
-                                ce_exit_price = round(ce_5m_price, 2)
-                                ce_exit_reason = "CO_TARGET_EXIT"
-                                ce_exit_time = curr_dt
+                                comb_pnl = ((ce_entry - ce_5m_price) + (pe_entry - pe_target)) * total_qty
+                                if roll_untested and comb_pnl <= 0 and not rolled_today:
+                                    rc = calculate_trade_costs(pe_entry, pe_target, total_qty, slippage_per_share=slippage)
+                                    roll_gross_pnl += rc["gross_pnl"]
+                                    roll_taxes += rc["statutory_taxes"]
+                                    roll_slippage += rc["total_slippage"]
+                                    pe_strike = round(bar_close_spot / 50.0) * 50.0
+                                    pe_entry = black_76_price(bar_close_spot, pe_strike, curr_dte, iv, r, "PE")
+                                    pe_sl = round(pe_entry * (1.0 + leg_sl_pct), 2)
+                                    pe_target = round(pe_entry * 0.20, 2)
+                                    pe_active = True
+                                    pe_exit_price = pe_entry
+                                    pe_exit_reason = "TIME_EXIT"
+                                    rolled_today = True
+                                elif not use_leg_sl:
+                                    ce_active = False
+                                    ce_exit_price = round(ce_5m_price, 2)
+                                    ce_exit_reason = "CO_TARGET_EXIT"
+                                    ce_exit_time = curr_dt
 
             if not ce_active and not pe_active:
                 break
 
             # 4. If one leg exited intra-bar on decay target, re-evaluate strategy total loss with active opposite leg
-            if (ce_active or pe_active):
+            if (ce_active or pe_active) and effective_max_loss is not None:
                 ce_5m_price = black_76_price(bar_close_spot, ce_strike, curr_dte, iv, r, "CE") if ce_active else ce_exit_price
                 pe_5m_price = black_76_price(bar_close_spot, pe_strike, curr_dte, iv, r, "PE") if pe_active else pe_exit_price
                 current_loss = ((ce_5m_price - ce_entry) + (pe_5m_price - pe_entry)) * total_qty
@@ -390,10 +434,10 @@ def run_backtest_simulation(
         ce_cost = calculate_trade_costs(ce_entry, ce_exit_price, total_qty, slippage_per_share=slippage)
         pe_cost = calculate_trade_costs(pe_entry, pe_exit_price, total_qty, slippage_per_share=slippage)
 
-        day_gross_pnl = round(ce_cost["gross_pnl"] + pe_cost["gross_pnl"], 2)
-        day_taxes = round(ce_cost["statutory_taxes"] + pe_cost["statutory_taxes"], 2)
-        day_slippage = round(ce_cost["total_slippage"] + pe_cost["total_slippage"], 2)
-        day_net_pnl = round(ce_cost["net_pnl"] + pe_cost["net_pnl"], 2)
+        day_gross_pnl = round(ce_cost["gross_pnl"] + pe_cost["gross_pnl"] + roll_gross_pnl, 2)
+        day_taxes = round(ce_cost["statutory_taxes"] + pe_cost["statutory_taxes"] + roll_taxes, 2)
+        day_slippage = round(ce_cost["total_slippage"] + pe_cost["total_slippage"] + roll_slippage, 2)
+        day_net_pnl = round(day_gross_pnl - day_taxes - day_slippage, 2)
 
         trade_logs.append({
             "date": str(t_date),
@@ -413,7 +457,8 @@ def run_backtest_simulation(
             "gross_pnl": day_gross_pnl,
             "taxes": day_taxes,
             "slippage": day_slippage,
-            "net_pnl": day_net_pnl
+            "net_pnl": day_net_pnl,
+            "rolled": rolled_today
         })
 
     # Performance Analytics Aggregation

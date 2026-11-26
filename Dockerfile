@@ -1,6 +1,6 @@
 # Multi-stage production Dockerfile for Sharad's Trading Desks
 # Targets:
-#   - runtime (default): minimal image for strangle-desk & silver-desk
+#   - runtime (default): minimal image for strangle-desk
 #   - etf: adds pandas, numpy, and yfinance for etf-swing-desk
 
 FROM python:3.12-slim-bookworm AS builder-base
@@ -43,7 +43,7 @@ COPY config.py main.py run_strategy.py ./
 COPY kite/ ./kite/
 COPY notifications/ ./notifications/
 COPY strategy/ ./strategy/
-COPY scripts/run_silver_desk.py scripts/run_weekly_etf_desk.py ./scripts/
+COPY scripts/run_weekly_etf_desk.py ./scripts/
 
 RUN mkdir -p /app/data /app/logs
 

@@ -13,7 +13,6 @@ DEFAULT_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "10"))
 
 ACTIVE_LOG_NAMES: Set[str] = {
     "strangle_desk.log",
-    "silver_desk.log",
     "etf_swing.log",
 }
 

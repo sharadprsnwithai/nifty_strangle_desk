@@ -81,9 +81,9 @@ def test_run_backtest_simulation_structure(sample_5min_bars):
     assert summary["total_days_traded"] == 2
     assert len(results["trades"]) == 2
 
-    # Check Day 2 CE triggered portfolio max loss or stop loss due to sharp rally
+    # Check Day 2 CE hit 70% STOP_LOSS by default
     day2_trade = results["trades"][1]
-    assert day2_trade["ce_reason"] in ("STRATEGY_MAX_LOSS_10K", "STOP_LOSS")
+    assert day2_trade["ce_reason"] == "STOP_LOSS"
 
 def test_run_backtest_simulation_empty_df():
     empty_df = pd.DataFrame(columns=["timestamps", "open", "high", "low", "close"])
@@ -120,8 +120,8 @@ def test_run_backtest_simulation_tuesday_0dte():
     assert trade["expiry"] == "2026-11-10"
 
 
-def test_run_backtest_simulation_strategy_max_loss_default():
-    # Verify default strategy_max_loss=10000.0 is applied without passing explicit argument
+def test_run_backtest_simulation_70pct_sl_default():
+    # Verify default is 70% single-leg SL (strategy_max_loss=0.0, use_leg_sl=True, leg_sl_pct=0.70)
     rows = []
     base_time = datetime(2026, 11, 2, 9, 15)
     for i in range(75):
@@ -133,7 +133,7 @@ def test_run_backtest_simulation_strategy_max_loss_default():
     results = run_backtest_simulation(bars_df=df, lots=10, lot_size=65)
     assert results["summary"]["total_days_traded"] == 1
     trade = results["trades"][0]
-    assert trade["ce_reason"] in ("STRATEGY_MAX_LOSS_10K", "STOP_LOSS")
+    assert trade["ce_reason"] == "STOP_LOSS"
 
 
 def test_run_backtest_simulation_strategy_max_loss_exit():
@@ -239,24 +239,65 @@ def test_backtest_pending_cost_trail_uses_correct_favorable_extremum():
     assert trade["ce_exit"] == trade["ce_entry"]
 
 
-def test_silver_strangle_backtest_parity_and_0dte_roll():
-    from scripts.backtest_silver_strangle import get_monthly_expiry, run_strangle_backtest
-
-    # 2026-11-26 is monthly 0-DTE expiry in the helper -> skip_0dte=True must roll to Dec
-    assert get_monthly_expiry(date(2026, 11, 26), skip_0dte=True) == date(2026, 12, 26)
-    assert get_monthly_expiry(date(2026, 11, 26), skip_0dte=False) == date(2026, 11, 26)
-
-    # Simulate an evening session (20:00 -> 23:10) with sharp rally breaching Rs 6,000 portfolio max-loss cap
+def test_run_backtest_simulation_no_sl():
+    # Sharp rally that would normally trigger STOP_LOSS or STRATEGY_MAX_LOSS_10K
+    # must stay open until TIME_EXIT (or DECAY_TARGET) when SL is disabled.
     rows = []
-    base = datetime(2026, 11, 23, 20, 0)
-    for i in range(15):  # 20:00 .. 21:10
-        spot = 155000.0 if i == 0 else 155000.0 + (i * 400.0)
-        rows.append({"date": base + timedelta(minutes=i * 5), "open": spot, "high": spot + 50.0, "low": spot - 50.0, "close": spot, "volume": 500})
+    base_time = datetime(2026, 11, 2, 9, 15)
+    for i in range(75):
+        t = base_time + timedelta(minutes=i * 5)
+        spot = 24000.0 if i < 15 else 24000.0 + ((i - 14) * 15.0)
+        rows.append({"timestamps": t, "open": spot, "high": spot + 1.0, "low": spot - 1.0, "close": spot})
     df = pd.DataFrame(rows)
-    res = run_strangle_backtest(df, lots=2, lot_size_kg=5, sl_per_lot=3000.0, exit_time_str="23:10")
-    assert len(res) == 1
-    row = res.iloc[0]
-    assert row["ce_reason"] in ("SL", "MAX_PORTFOLIO_LOSS")
-    assert row["costs_inr"] > 0
-    assert row["net_pnl_inr"] == round(row["gross_pnl_inr"] - row["costs_inr"], 2)
+
+    results = run_backtest_simulation(
+        bars_df=df,
+        lots=10,
+        lot_size=65,
+        strategy_max_loss=0.0,
+        use_leg_sl=False,
+        trail_opposite_to_cost=False,
+    )
+    assert results["summary"]["total_days_traded"] == 1
+    trade = results["trades"][0]
+    assert trade["ce_reason"] in ("TIME_EXIT", "CO_TARGET_EXIT")
+    assert trade["pe_reason"] in ("TIME_EXIT", "DECAY_TARGET")
+    assert trade["ce_reason"] not in ("STOP_LOSS", "STRATEGY_MAX_LOSS_10K", "SINGLE_LEG_10K_EXIT")
+    assert trade["pe_reason"] not in ("STOP_LOSS", "STRATEGY_MAX_LOSS_10K", "SINGLE_LEG_10K_EXIT")
+    assert trade["gross_pnl"] < -10000.0
+
+
+def test_run_backtest_simulation_roll_untested_on_trend():
+    # Sharp rally where PE hits 80% DECAY_TARGET while combined P&L <= 0:
+    # roll_untested=True rolls PE to ATM once instead of CO_TARGET_EXIT on CE.
+    rows = []
+    base_time = datetime(2026, 11, 2, 9, 15)
+    for i in range(75):
+        t = base_time + timedelta(minutes=i * 5)
+        spot = 24000.0 if i < 15 else 24000.0 + ((i - 14) * 15.0)
+        rows.append({"timestamps": t, "open": spot, "high": spot + 1.0, "low": spot - 1.0, "close": spot})
+    df = pd.DataFrame(rows)
+
+    res_rolled = run_backtest_simulation(
+        bars_df=df,
+        lots=10,
+        lot_size=65,
+        strategy_max_loss=0.0,
+        use_leg_sl=False,
+        roll_untested=True,
+    )
+    assert res_rolled["summary"]["total_days_traded"] == 1
+    assert res_rolled["trades"][0]["rolled"] is True
+
+    res_no_roll = run_backtest_simulation(
+        bars_df=df,
+        lots=10,
+        lot_size=65,
+        strategy_max_loss=0.0,
+        use_leg_sl=False,
+        roll_untested=False,
+    )
+    assert res_no_roll["trades"][0]["rolled"] is False
+    assert res_no_roll["trades"][0]["ce_reason"] == "CO_TARGET_EXIT"
+
 

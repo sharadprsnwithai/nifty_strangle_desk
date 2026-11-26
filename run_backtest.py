@@ -88,12 +88,18 @@ def run_backtest_cli(args=None) -> int:
     parser.add_argument("--slippage", type=float, default=0.50, help="Slippage in Rs per share (default: 0.50)")
     parser.add_argument("--lots", type=int, default=10, help="Number of lots (default: 10)")
     parser.add_argument("--lot-size", type=int, default=65, help="Lot size (default: 65)")
-    parser.add_argument("--strategy-max-loss", "--max-loss", type=float, default=10000.0, dest="strategy_max_loss", help="Strategy total loss exit in Rs across all legs (default: 10000.0)")
-    parser.add_argument("--use-leg-sl", dest="use_leg_sl", action="store_true", default=True, help="Enable single-leg exit on 50% stop loss (default: True)")
+    parser.add_argument("--strategy-max-loss", "--max-loss", type=float, default=0.0, dest="strategy_max_loss", help="Strategy total loss exit in Rs across all legs (<= 0 disables, default: 0.0 / No SL)")
+    parser.add_argument("--no-max-loss", dest="strategy_max_loss", action="store_const", const=0.0, help="Disable strategy-level portfolio max loss stop loss")
+    parser.add_argument("--use-leg-sl", dest="use_leg_sl", action="store_true", default=True, help="Enable single-leg exit on stop loss (default: True)")
     parser.add_argument("--no-leg-sl", dest="use_leg_sl", action="store_false", help="Disable single-leg exit (use simultaneous dual-leg exit)")
-    parser.add_argument("--trail-cost", dest="trail_opposite_to_cost", action="store_true", default=True, help="Trail opposite leg to cost/breakeven after stop-loss (default: True)")
+    parser.add_argument("--leg-sl-pct", type=float, default=0.70, help="Single-leg stop loss percentage as decimal (e.g. 0.50 for 50%%, 0.70 for 70%%, default: 0.70)")
+    parser.add_argument("--trail-cost", dest="trail_opposite_to_cost", action="store_true", default=False, help="Trail opposite leg to cost/breakeven after stop-loss (default: False)")
     parser.add_argument("--no-trail-cost", dest="trail_opposite_to_cost", action="store_false", help="Disable trailing opposite leg to cost")
-    parser.add_argument("--exit-cutoff", type=str, default="14:45", help="Intraday square-off cutoff time HH:MM (default: 14:45)")
+    parser.add_argument("--no-sl", action="store_true", help="Disable all stop losses (disables leg SL, trail-to-cost, and portfolio max loss)")
+    parser.add_argument("--roll-untested", dest="roll_untested", action="store_true", default=True, help="Roll untested leg to ATM on 80%% decay target when combined P&L <= 0 (default: True)")
+    parser.add_argument("--no-roll-untested", dest="roll_untested", action="store_false", help="Disable rolling untested leg on decay target")
+    parser.add_argument("--entry-time", type=str, default="10:00", help="Intraday entry time HH:MM (default: 10:00)")
+    parser.add_argument("--exit-cutoff", type=str, default="15:15", help="Intraday square-off cutoff time HH:MM (default: 15:15)")
     parser.add_argument("--expiry-weekday", type=int, default=1, help="Expiry weekday (0=Mon, 1=Tue, ..., 3=Thu. Default: 1 for Tuesday)")
     parser.add_argument("--iv", type=float, default=0.13, help="Option IV (default: 0.13)")
     parser.add_argument("--strike-mode", choices=["ATR", "PRICE"], default="ATR", help="Strike selection mode (ATR: 1.25x ATR distance, PRICE: Rs 30 premium, default: ATR)")
@@ -106,6 +112,12 @@ def run_backtest_cli(args=None) -> int:
     parser.add_argument("--force-fetch", action="store_true", help="Force fresh fetch from Kite Connect API, bypassing local cache")
 
     parsed = parser.parse_args(args)
+    if parsed.no_sl:
+        parsed.use_leg_sl = False
+        parsed.trail_opposite_to_cost = False
+        parsed.strategy_max_loss = 0.0
+    entry_h, entry_m = map(int, parsed.entry_time.split(":"))
+    entry_time = time(entry_h, entry_m)
     cutoff_h, cutoff_m = map(int, parsed.exit_cutoff.split(":"))
     exit_cutoff = time(cutoff_h, cutoff_m)
 
@@ -122,7 +134,10 @@ def run_backtest_cli(args=None) -> int:
             expiry_weekday=parsed.expiry_weekday,
             strategy_max_loss=parsed.strategy_max_loss,
             use_leg_sl=parsed.use_leg_sl,
+            leg_sl_pct=parsed.leg_sl_pct,
             trail_opposite_to_cost=parsed.trail_opposite_to_cost,
+            roll_untested=parsed.roll_untested,
+            entry_time=entry_time,
             exit_cutoff_time=exit_cutoff,
             morning_filter=parsed.morning_filter,
             morning_filter_threshold_pct=parsed.morning_filter_pct,

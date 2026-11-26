@@ -101,7 +101,7 @@ class StrangleDesk:
         self.state = None
 
     @staticmethod
-    def _print_plan(strikes: Dict[str, Any], mode: str = "PAPER", exit_time_str: str = "14:45") -> None:
+    def _print_plan(strikes: Dict[str, Any], mode: str = "PAPER", exit_time_str: str = "15:15") -> None:
         ce_info = strikes["ce"]
         pe_info = strikes["pe"]
         print("\n" + "=" * 65)
@@ -297,16 +297,109 @@ class StrangleDesk:
 
     @staticmethod
     def _get_current_day_pnl(state: Dict[str, Any], qty: int) -> float:
-        """Computes current realized day P&L from closed strangle legs."""
+        """Computes current realized day P&L from closed strangle legs and any rolled leg."""
         ce_pnl = 0.0
         pe_pnl = 0.0
+        rolled_pnl = float(state.get("rolled_realized_pnl") or 0.0)
         ce = state.get("ce", {})
         pe = state.get("pe", {})
         if ce and ce.get("status") == "CLOSED" and ce.get("exit_price") is not None:
             ce_pnl = (float(ce["entry_price"]) - float(ce["exit_price"])) * qty
         if pe and pe.get("status") == "CLOSED" and pe.get("exit_price") is not None:
             pe_pnl = (float(pe["entry_price"]) - float(pe["exit_price"])) * qty
-        return ce_pnl + pe_pnl
+        return rolled_pnl + ce_pnl + pe_pnl
+
+    def _roll_untested_leg(
+        self,
+        leg_name: str,
+        opt_type: str,
+        qty: int,
+        kite: Optional[KiteConnect],
+        state: Dict[str, Any],
+        order_type: str,
+        limit_buffer_pct: float,
+        order_timeout: int,
+        leg_sl_pct: float = 0.70,
+    ) -> bool:
+        """
+        Rolls an untested/decayed leg closer to ATM spot when the strangle is underwater.
+        Books the closed leg's realized P&L into `rolled_realized_pnl`, sells the ATM strike
+        for the same expiry, and updates `state[leg_name]`.
+        """
+        try:
+            if kite is None:
+                logger.warning("Cannot roll %s leg: Kite client is None.", leg_name.upper())
+                return False
+
+            spot_quote = kite.ltp(["NSE:NIFTY 50"])
+            spot_ltp = float(spot_quote.get("NSE:NIFTY 50", {}).get("last_price") or 0.0)
+            if spot_ltp <= 0:
+                logger.warning("Cannot roll %s leg: invalid NIFTY 50 LTP (%.2f).", leg_name.upper(), spot_ltp)
+                return False
+
+            atm_strike = round(spot_ltp / 50.0) * 50.0
+            target_expiry = state.get("expiry")
+            instruments = kite.instruments("NFO")
+            candidates = [
+                inst for inst in instruments
+                if inst.get("name") == "NIFTY"
+                and inst.get("instrument_type") == opt_type.upper()
+                and float(inst.get("strike") or 0) == float(atm_strike)
+                and (not target_expiry or _normalize_date(inst.get("expiry")) == str(target_expiry))
+            ]
+            if not candidates:
+                logger.warning("Cannot roll %s leg: no NFO instrument found for NIFTY %s %.0f (%s).", leg_name.upper(), opt_type, atm_strike, target_expiry)
+                return False
+
+            new_sym = candidates[0]["tradingsymbol"]
+            new_quotes = kite.ltp([f"NFO:{new_sym}"])
+            new_ltp = self._extract_ltp(new_quotes, new_sym, default=0.0)
+            if new_ltp <= 0:
+                logger.warning("Cannot roll %s leg: invalid LTP for %s (%.2f).", leg_name.upper(), new_sym, new_ltp)
+                return False
+
+            old_leg = state.get(leg_name, {})
+            old_entry = float(old_leg.get("entry_price") or 0.0)
+            old_exit = float(old_leg.get("exit_price") or 0.0)
+            leg_realized = (old_entry - old_exit) * qty
+            state["rolled_realized_pnl"] = float(state.get("rolled_realized_pnl") or 0.0) + leg_realized
+
+            leg_product = old_leg.get("product") or state.get("product") or getattr(self.order_manager, "product", "MIS")
+            sell_res = self.order_manager.sell(
+                new_sym, qty, new_ltp, order_type=order_type, buffer_pct=limit_buffer_pct, product=leg_product
+            )
+            order_id = sell_res.get("order_id") if isinstance(sell_res, dict) else None
+            exec_px = new_ltp
+            mode = getattr(self.order_manager, "mode", "PAPER")
+            if mode == "LIVE" and order_id:
+                st = self.wait_for_order_completion(order_id, timeout_seconds=order_timeout, poll_seconds=2)
+                if st.get("status") != "COMPLETE":
+                    logger.error("Roll sell order %s for %s did not complete (%s).", order_id, new_sym, st)
+                    return False
+                if st.get("average_price") and float(st["average_price"]) > 0:
+                    exec_px = float(st["average_price"])
+
+            state[leg_name] = {
+                "symbol": new_sym,
+                "strike": float(atm_strike),
+                "entry_price": exec_px,
+                "sl_price": round(exec_px * (1.0 + leg_sl_pct), 2),
+                "target_price": round(exec_px * 0.20, 2),
+                "status": "OPEN",
+                "product": leg_product,
+                "order_id": order_id,
+            }
+            state["rolled"] = True
+            self.save_state(state)
+            logger.info("Rolled %s leg to ATM %s @ Rs %.2f (New Target: Rs %.2f).", leg_name.upper(), new_sym, exec_px, state[leg_name]["target_price"])
+            if self.notifier:
+                self.notifier.send_message(
+                    f"🔄 <b>ROLLED {leg_name.upper()} LEG TO ATM</b>: Sold <code>{new_sym}</code> @ ₹{exec_px:.2f} (Target: ₹{state[leg_name]['target_price']:.2f})"
+                )
+            return True
+        except Exception as e:
+            logger.error("Failed to roll %s leg: %s", leg_name.upper(), e)
+            return False
 
     def wait_for_orders_completion(
         self,
@@ -795,9 +888,11 @@ class StrangleDesk:
         dry_run: bool = False,
         execute_once: bool = False,
         kite: Optional[KiteConnect] = None,
-        strategy_max_loss: Optional[float] = 10000.0,
-        use_leg_sl: bool = False,
+        strategy_max_loss: Optional[float] = 0.0,
+        use_leg_sl: bool = True,
+        leg_sl_pct: float = 0.70,
         trail_to_cost: bool = False,
+        roll_untested: bool = True,
         order_type: str = "LIMIT",
         limit_buffer_pct: float = 0.05,
         ignore_holidays: bool = False,
@@ -808,7 +903,7 @@ class StrangleDesk:
         strike_mode: str = "ATR",
         atr_multiplier: float = 1.25,
         target_price: float = 30.0,
-        exit_time_str: str = "14:45",
+        exit_time_str: str = "15:15",
     ) -> Optional[Dict[str, Any]]:
         """
         Executes and monitors the 10:00 AM Short Strangle intraday session.
@@ -1215,15 +1310,15 @@ class StrangleDesk:
             if pe_exec_price <= 0:
                 pe_exec_price = pe_info["ltp"]
 
-            ce_sl = round(ce_exec_price * 1.50, 2)
+            ce_sl = round(ce_exec_price * (1.0 + leg_sl_pct), 2)
             ce_tgt = round(ce_exec_price * 0.20, 2)
-            pe_sl = round(pe_exec_price * 1.50, 2)
+            pe_sl = round(pe_exec_price * (1.0 + leg_sl_pct), 2)
             pe_tgt = round(pe_exec_price * 0.20, 2)
 
             if self.notifier:
-                risk_cap_str = f"Max Rs {strategy_max_loss:,.0f} portfolio loss" if strategy_max_loss is not None else "None"
+                risk_cap_str = f"Max Rs {strategy_max_loss:,.0f} portfolio loss" if (strategy_max_loss is not None and strategy_max_loss > 0) else "None"
                 exit_rule_desc = (
-                    f"Single-Leg 50% SL (winner stays open & trails to cost) | Target: 80% decay | Cutoff: {exit_time_str} IST"
+                    f"Single-Leg {leg_sl_pct*100:.0f}% SL | Target: 80% decay | Cutoff: {exit_time_str} IST"
                     if use_leg_sl
                     else f"Portfolio SL: {risk_cap_str} | Target: 80% decay (both exit) | Cutoff: {exit_time_str} IST"
                 )
@@ -1395,10 +1490,15 @@ class StrangleDesk:
             )
 
             # 1. Evaluate strategy-level portfolio stop loss (circuit breaker)
-            effective_max_loss = strategy_max_loss if strategy_max_loss is not None else 10000.0
+            if strategy_max_loss is None:
+                effective_max_loss: Optional[float] = 10000.0
+            elif strategy_max_loss <= 0:
+                effective_max_loss = None
+            else:
+                effective_max_loss = strategy_max_loss
             single_leg_exited_this_tick = False
             attempted_exit_legs = set()
-            if total_strategy_pnl <= -effective_max_loss:
+            if effective_max_loss is not None and total_strategy_pnl <= -effective_max_loss:
                 if use_leg_sl:
                     # In single-leg mode, exit ONLY the losing leg and arm cost trail (never cascade in the same tick!)
                     if state["ce"].get("status") == "OPEN" and state["pe"].get("status") == "OPEN":
@@ -1535,11 +1635,16 @@ class StrangleDesk:
                     elif ce_target is not None and ce_ltp <= ce_target:
                         logger.info("CE Decay Target reached! LTP: %.2f <= Target: %.2f.", ce_ltp, ce_target)
                         if self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
-                            if not use_leg_sl and state["pe"].get("status") == "OPEN":
-                                self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                            ce_fin = float(state["ce"]["exit_price"]) if state["ce"].get("exit_price") is not None else ce_ltp
+                            if state["pe"].get("status") == "OPEN":
+                                comb_pnl = ((ce_entry - ce_fin) + (pe_entry - pe_ltp)) * qty + float(state.get("rolled_realized_pnl") or 0.0)
+                                if roll_untested and comb_pnl <= 0 and not state.get("rolled"):
+                                    if not self._roll_untested_leg("ce", "CE", qty, kite, state, order_type, limit_buffer_pct, order_timeout, leg_sl_pct=leg_sl_pct) and not use_leg_sl:
+                                        self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                                elif not use_leg_sl:
+                                    self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
                             if self.notifier:
                                 ce_entry = float(state["ce"]["entry_price"])
-                                ce_fin = float(state["ce"]["exit_price"]) if state["ce"].get("exit_price") is not None else ce_ltp
                                 leg_pnl = (ce_entry - ce_fin) * qty
                                 total_day_pnl = self._get_current_day_pnl(state, qty)
                                 self.notifier.send_message(
@@ -1582,11 +1687,16 @@ class StrangleDesk:
                     elif pe_target is not None and pe_ltp <= pe_target:
                         logger.info("PE Decay Target reached! LTP: %.2f <= Target: %.2f.", pe_ltp, pe_target)
                         if self._safe_exit_leg("pe", pe_sym, qty, pe_ltp, "DECAY_TARGET", order_type, limit_buffer_pct, state, min_buffer_rs=1.5):
-                            if not use_leg_sl and state["ce"].get("status") == "OPEN":
-                                self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                            pe_fin = float(state["pe"]["exit_price"]) if state["pe"].get("exit_price") is not None else pe_ltp
+                            if state["ce"].get("status") == "OPEN":
+                                comb_pnl = ((ce_entry - ce_ltp) + (pe_entry - pe_fin)) * qty + float(state.get("rolled_realized_pnl") or 0.0)
+                                if roll_untested and comb_pnl <= 0 and not state.get("rolled"):
+                                    if not self._roll_untested_leg("pe", "PE", qty, kite, state, order_type, limit_buffer_pct, order_timeout, leg_sl_pct=leg_sl_pct) and not use_leg_sl:
+                                        self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
+                                elif not use_leg_sl:
+                                    self._safe_exit_leg("ce", ce_sym, qty, ce_ltp, "CO_TARGET_EXIT", order_type, limit_buffer_pct, state, min_buffer_rs=1.5)
                             if self.notifier:
                                 pe_entry = float(state["pe"]["entry_price"])
-                                pe_fin = float(state["pe"]["exit_price"]) if state["pe"].get("exit_price") is not None else pe_ltp
                                 leg_pnl = (pe_entry - pe_fin) * qty
                                 total_day_pnl = self._get_current_day_pnl(state, qty)
                                 self.notifier.send_message(
@@ -1633,15 +1743,17 @@ class StrangleDesk:
         lots: int = 10,
         poll_seconds: int = 5,
         kite: Optional[KiteConnect] = None,
-        strategy_max_loss: Optional[float] = 10000.0,
-        use_leg_sl: bool = False,
+        strategy_max_loss: Optional[float] = 0.0,
+        use_leg_sl: bool = True,
+        leg_sl_pct: float = 0.70,
         trail_to_cost: bool = False,
+        roll_untested: bool = True,
         order_type: str = "LIMIT",
         limit_buffer_pct: float = 0.05,
         ignore_holidays: bool = False,
         order_timeout: int = 300,
         entry_time_str: str = "10:00",
-        exit_time_str: str = "14:45",
+        exit_time_str: str = "15:15",
         idle_sleep_seconds: int = 15,
         max_iterations: Optional[int] = None,
         morning_filter: bool = True,
@@ -1737,7 +1849,9 @@ class StrangleDesk:
                         kite=kite,
                         strategy_max_loss=strategy_max_loss,
                         use_leg_sl=use_leg_sl,
+                        leg_sl_pct=leg_sl_pct,
                         trail_to_cost=trail_to_cost,
+                        roll_untested=roll_untested,
                         order_type=order_type,
                         limit_buffer_pct=limit_buffer_pct,
                         ignore_holidays=ignore_holidays,
@@ -1814,7 +1928,9 @@ class StrangleDesk:
                         kite=kite,
                         strategy_max_loss=strategy_max_loss,
                         use_leg_sl=use_leg_sl,
+                        leg_sl_pct=leg_sl_pct,
                         trail_to_cost=trail_to_cost,
+                        roll_untested=roll_untested,
                         order_type=order_type,
                         limit_buffer_pct=limit_buffer_pct,
                         ignore_holidays=ignore_holidays,
