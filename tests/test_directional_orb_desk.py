@@ -224,3 +224,41 @@ def test_live_rejected_entry_and_broker_reconcile_and_bar_cache(tmp_path):
     status2 = desk.step(kite=kite, instruments=instruments, lots=1, orb_end_time=time(9, 45), min_adx=0.0, use_rsi_filter=False, use_rsi_exit=False, now_dt=datetime(2026, 11, 27, 11, 0))
     assert status2 == "CLOSED"
     assert desk.state["exit_reason"] == "BROKER_RECONCILED"
+    ledger_file = tmp_path / "trade_ledger.csv"
+    assert ledger_file.exists()
+    content = ledger_file.read_text(encoding="utf-8")
+    assert "DESK4_ORB" in content
+    assert "BROKER_RECONCILED" in content
+
+
+def test_ledger_records_why_taken_times_and_pnl(tmp_path):
+    import csv
+    from strategy.ledger import append_trade_ledger
+
+    ledger_file = tmp_path / "trade_ledger.csv"
+    append_trade_ledger(
+        {
+            "date": "2026-11-27",
+            "desk": "DESK4_ORB",
+            "mode": "LIVE",
+            "direction": "BULL",
+            "instrument": "NFO:NIFTY26DEC0125500PE",
+            "lots": 2,
+            "quantity": 130,
+            "entry_time": "09:50:02",
+            "exit_time": "14:20:05",
+            "entry_price": 120.0,
+            "exit_price": 30.0,
+            "why_taken": "ORB BULL @ 09:45 | Spot=25650.0 RSI5=62.1 RSI15=56.4",
+            "exit_reason": "TARGET_DECAY",
+            "realized_pnl": 11700.0,
+        },
+        ledger_path=ledger_file,
+    )
+    with open(ledger_file, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    assert rows[0]["entry_time"] == "09:50:02"
+    assert rows[0]["exit_time"] == "14:20:05"
+    assert "RSI5=62.1" in rows[0]["why_taken"]
+    assert rows[0]["realized_pnl"] == "11700.0"

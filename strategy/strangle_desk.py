@@ -11,6 +11,7 @@ from kite.client import is_token_error
 from strategy.order_manager import OrderManager
 from strategy.option_chain import find_strangle_strikes, resolve_target_expiry, _normalize_date, fetch_daily_adr
 from strategy.holidays import is_trading_holiday
+from strategy.ledger import append_trade_ledger
 from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger("strategy.desk")
@@ -99,6 +100,38 @@ class StrangleDesk:
                 except Exception as e:
                     logger.warning("Could not delete state file %s: %s", f, e)
         self.state = None
+
+    def _record_completed_ledger(self, state: Dict[str, Any], exit_reason: str = "") -> None:
+        """Persist a completed strangle session once to trade_ledger.csv."""
+        if state.get("ledger_recorded"):
+            return
+        ce = state.get("ce") or {}
+        pe = state.get("pe") or {}
+        ce_entry = float(ce.get("entry_price") or 0.0)
+        pe_entry = float(pe.get("entry_price") or 0.0)
+        ce_exit = float(ce.get("exit_price") if ce.get("exit_price") is not None else ce_entry)
+        pe_exit = float(pe.get("exit_price") if pe.get("exit_price") is not None else pe_entry)
+        reason = exit_reason or f"CE:{ce.get('exit_reason', 'CLOSED')} | PE:{pe.get('exit_reason', 'CLOSED')}"
+        append_trade_ledger(
+            {
+                "date": state.get("date", ""),
+                "desk": "DESK1_STRANGLE",
+                "mode": state.get("mode", getattr(self.order_manager, "mode", "")),
+                "direction": "STRANGLE",
+                "instrument": f"{ce.get('symbol', '')} + {pe.get('symbol', '')}",
+                "lots": state.get("lots", ""),
+                "quantity": state.get("quantity", 0),
+                "entry_time": state.get("entry_time", ""),
+                "exit_time": datetime.now().strftime("%H:%M:%S"),
+                "entry_price": round(ce_entry + pe_entry, 2),
+                "exit_price": round(ce_exit + pe_exit, 2),
+                "why_taken": state.get("why_taken", ""),
+                "exit_reason": reason,
+                "realized_pnl": round(float(state.get("realized_pnl") or 0.0), 2),
+            },
+            ledger_path=self.state_file.parent / "trade_ledger.csv",
+        )
+        state["ledger_recorded"] = True
 
     @staticmethod
     def _print_plan(strikes: Dict[str, Any], mode: str = "PAPER", exit_time_str: str = "15:15") -> None:
@@ -611,6 +644,7 @@ class StrangleDesk:
                     qty = int(state.get("quantity") or 0)
                     if qty > 0:
                         state["realized_pnl"] = self._get_current_day_pnl(state, qty)
+                    self._record_completed_ledger(state, "BROKER_RECONCILED")
                     changed = True
                     logger.warning("Reconciliation: Both strangle legs are closed on Kite. Synchronizing local state to COMPLETED.")
 
@@ -1367,6 +1401,8 @@ class StrangleDesk:
                 "lots": strikes["total_lots"],
                 "lot_size": strikes.get("lot_size", 65),
                 "quantity": total_qty,
+                "entry_time": datetime.now().strftime("%H:%M:%S"),
+                "why_taken": f"10:00 Strangle ({strike_mode} {atr_multiplier:.2f}x) | Spot={strikes.get('spot', 0):.1f}",
                 "ce": {
                     "symbol": ce_info["symbol"],
                     "strike": ce_info["strike"],
@@ -1442,6 +1478,7 @@ class StrangleDesk:
                     total_day_pnl = self._get_current_day_pnl(state, qty)
                     state["status"] = "COMPLETED"
                     state["realized_pnl"] = total_day_pnl
+                    self._record_completed_ledger(state)
                     self.save_state(state)
                     if self.notifier:
                         ce_fin = float(state["ce"]["exit_price"]) if state["ce"].get("exit_price") is not None else ce_ltp
@@ -1737,6 +1774,7 @@ class StrangleDesk:
                 state["status"] = "COMPLETED"
                 gross_pnl = self._get_current_day_pnl(state, qty)
                 state["realized_pnl"] = gross_pnl
+                self._record_completed_ledger(state)
                 if self.notifier:
                     ce_fin = float(state["ce"]["exit_price"]) if state["ce"].get("exit_price") is not None else float(state["ce"]["entry_price"])
                     pe_fin = float(state["pe"]["exit_price"]) if state["pe"].get("exit_price") is not None else float(state["pe"]["entry_price"])

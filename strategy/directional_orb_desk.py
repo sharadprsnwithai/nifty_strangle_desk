@@ -13,6 +13,7 @@ import pandas as pd
 from kite.client import ensure_kite_session, is_token_error
 from notifications.telegram import TelegramNotifier
 from strategy.holidays import is_market_open
+from strategy.ledger import append_trade_ledger
 from strategy.option_chain import NIFTY_INDEX_TOKEN, resolve_target_expiry
 from strategy.order_manager import OrderManager
 
@@ -412,6 +413,25 @@ class DirectionalOrbDesk:
                     "exit_reason": "BROKER_RECONCILED",
                 })
                 self.save_state()
+                append_trade_ledger(
+                    {
+                        "date": self.state.get("date", ""),
+                        "desk": "DESK4_ORB",
+                        "mode": self.mode,
+                        "direction": self.state.get("direction", ""),
+                        "instrument": symbol,
+                        "lots": self.state.get("lots", ""),
+                        "quantity": self.state.get("quantity", 0),
+                        "entry_time": self.state.get("entry_time", ""),
+                        "exit_time": self.state.get("exit_time", ""),
+                        "entry_price": self.state.get("entry_price", 0.0),
+                        "exit_price": self.state.get("current_ltp", 0.0),
+                        "why_taken": self.state.get("why_taken", ""),
+                        "exit_reason": "BROKER_RECONCILED",
+                        "realized_pnl": self.state.get("realized_pnl", 0.0),
+                    },
+                    ledger_path=self.state_file.parent / "trade_ledger.csv",
+                )
                 self._notify(f"<b>[ORB-LIVE] BROKER RECONCILED</b>\n<code>{symbol}</code> has 0 qty in Kite. Marked CLOSED.")
                 return False
         except Exception as e:
@@ -462,6 +482,12 @@ class DirectionalOrbDesk:
             self._notify(f"<b>[ORB-{self.mode}] ENTRY FAILED</b>\n<code>{symbol}</code>: {fill_msg}")
             return False
 
+        why_taken = (
+            f"ORB {signal['direction']} @ {signal.get('bar_time', '')} | "
+            f"Spot={signal['spot']:.1f} ORB=[{signal['orb_low']:.1f},{signal['orb_high']:.1f}] "
+            f"TWAP={signal['twap']:.1f} ADX14={signal.get('adx14', 0):.1f} "
+            f"RSI5={signal.get('rsi5', 0):.1f} RSI15={signal.get('rsi15', 0):.1f}"
+        )
         self.state.update({
             "status": "OPEN",
             "direction": signal["direction"],
@@ -469,11 +495,13 @@ class DirectionalOrbDesk:
             "symbol": symbol,
             "strike": strike,
             "expiry": str(expiry),
+            "lots": lots,
             "quantity": filled_qty,
             "entry_price": fill_px,
             "current_ltp": fill_px,
             "trailed_to_cost": False,
             "entry_time": datetime.now().strftime("%H:%M:%S"),
+            "why_taken": why_taken,
         })
         self.save_state()
 
@@ -549,6 +577,25 @@ class DirectionalOrbDesk:
             "exit_reason": reason,
         })
         self.save_state()
+        append_trade_ledger(
+            {
+                "date": self.state.get("date", ""),
+                "desk": "DESK4_ORB",
+                "mode": self.mode,
+                "direction": self.state.get("direction", ""),
+                "instrument": symbol,
+                "lots": self.state.get("lots", ""),
+                "quantity": filled_qty,
+                "entry_time": self.state.get("entry_time", ""),
+                "exit_time": self.state.get("exit_time", ""),
+                "entry_price": entry_px,
+                "exit_price": exit_px,
+                "why_taken": self.state.get("why_taken", ""),
+                "exit_reason": reason,
+                "realized_pnl": pnl,
+            },
+            ledger_path=self.state_file.parent / "trade_ledger.csv",
+        )
 
         self._notify(
             f"<b>[ORB-{self.mode}] EXIT ({reason})</b>\n"
