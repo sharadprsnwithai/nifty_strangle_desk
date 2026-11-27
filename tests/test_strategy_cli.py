@@ -196,8 +196,8 @@ def test_run_strategy_cli_once_flag():
 def test_strangle_desk_run_session_sl_removed_and_target_exit(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
-        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
-        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2099-12-31", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2099-12-31", "strike": 23700, "lot_size": 65},
     ]
     # 1st call to ltp: strike discovery
     # 2nd call to ltp: monitoring loop (CE LTP 49.0 > 48.0 (+50%), PE hits Target 6.0 <= 6.2)
@@ -231,8 +231,8 @@ def test_strangle_desk_run_session_sl_removed_and_target_exit(tmp_path):
 def test_strangle_desk_run_session_single_leg_sl_exit(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
-        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
-        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2099-12-31", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2099-12-31", "strike": 23700, "lot_size": 65},
     ]
     # CE Entry: 32.0 (SL 48.0), PE Entry: 31.0
     # Tick 2: CE LTP 49.0 (> 48.0 SL), PE LTP 25.0 (> 6.2 target)
@@ -262,8 +262,8 @@ def test_strangle_desk_run_session_single_leg_sl_exit(tmp_path):
 def test_strangle_desk_run_session_no_exit_when_sl_exceeded_and_no_target(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
-        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
-        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2099-12-31", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2099-12-31", "strike": 23700, "lot_size": 65},
     ]
     # In legacy mode (use_leg_sl=False), individual leg SL is bypassed
     mock_kite.ltp.side_effect = [
@@ -290,8 +290,8 @@ def test_strangle_desk_run_session_no_exit_when_sl_exceeded_and_no_target(tmp_pa
 def test_strangle_desk_run_session_time_exit(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
-        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
-        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2099-12-31", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2099-12-31", "strike": 23700, "lot_size": 65},
     ]
     mock_kite.ltp.return_value = {
         "NFO:NIFTY26NOV24200CE": {"last_price": 32.0},
@@ -318,8 +318,8 @@ def test_strangle_desk_run_session_time_exit(tmp_path):
 def test_strangle_desk_run_session_1445_cutoff_exit(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
-        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
-        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2099-12-31", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2099-12-31", "strike": 23700, "lot_size": 65},
     ]
     mock_kite.ltp.return_value = {
         "NFO:NIFTY26NOV24200CE": {"last_price": 32.0},
@@ -346,8 +346,8 @@ def test_strangle_desk_run_session_1445_cutoff_exit(tmp_path):
 def test_strangle_desk_run_session_dry_run(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
-        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
-        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2099-12-31", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2099-12-31", "strike": 23700, "lot_size": 65},
     ]
     mock_kite.ltp.return_value = {
         "NFO:NIFTY26NOV24200CE": {"last_price": 32.0},
@@ -399,8 +399,8 @@ def test_load_historical_nifty_data_chunked_kite_fetch(monkeypatch):
 def test_strangle_desk_run_session_strategy_max_loss_exit(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
-        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
-        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2099-12-31", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2099-12-31", "strike": 23700, "lot_size": 65},
     ]
     # CE Entry: 35.0, PE Entry: 35.0. Total qty = 650.
     # At tick 2: CE LTP 52.0 (loss = (52 - 35) * 650 = 11,050).
@@ -438,8 +438,8 @@ def test_strangle_desk_run_session_strategy_max_loss_exit(tmp_path):
 def test_strangle_desk_run_session_single_leg_10k_loss_exit(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
-        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
-        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2099-12-31", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2099-12-31", "strike": 23700, "lot_size": 65},
     ]
     # CE Entry: 35.0, PE Entry: 35.0. Total qty = 650.
     # At tick 2: CE LTP 52.0 (loss = (52 - 35) * 650 = 11,050).
@@ -647,8 +647,8 @@ def test_run_strategy_cli_log_flags(tmp_path):
 def test_strangle_desk_run_session_order_timeout_zero_fill_aborts(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
-        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
-        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2099-12-31", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2099-12-31", "strike": 23700, "lot_size": 65},
     ]
     mock_kite.ltp.return_value = {
         "NFO:NIFTY26NOV24200CE": {"last_price": 32.0},
@@ -687,8 +687,8 @@ def test_strangle_desk_run_session_order_timeout_zero_fill_aborts(tmp_path):
 def test_strangle_desk_run_session_partial_fill_aborts_and_squares_off(tmp_path):
     mock_kite = MagicMock()
     mock_kite.instruments.return_value = [
-        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2026-11-26", "strike": 24200, "lot_size": 65},
-        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2026-11-26", "strike": 23700, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "CE", "tradingsymbol": "NIFTY26NOV24200CE", "expiry": "2099-12-31", "strike": 24200, "lot_size": 65},
+        {"name": "NIFTY", "instrument_type": "PE", "tradingsymbol": "NIFTY26NOV23700PE", "expiry": "2099-12-31", "strike": 23700, "lot_size": 65},
     ]
     mock_kite.ltp.return_value = {
         "NFO:NIFTY26NOV24200CE": {"last_price": 32.5},

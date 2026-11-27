@@ -18,7 +18,24 @@ from strategy.order_manager import OrderManager
 
 logger = logging.getLogger("strategy.directional_orb")
 
+NIFTY_INDEX_TOKEN = 256265
 DEFAULT_LOT_SIZE = 65
+
+
+def compute_adx14(df: pd.DataFrame) -> pd.Series:
+    """Compute 14-period Wilder ADX on OHLC bars."""
+    high, low, close_s = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
+    prev_close = close_s.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    atr14 = tr.ewm(alpha=1 / 14, adjust=False).mean().replace(0, np.nan)
+    plus_di = 100.0 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / 14, adjust=False).mean() / atr14
+    minus_di = 100.0 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / 14, adjust=False).mean() / atr14
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=1 / 14, adjust=False).mean().fillna(0.0)
 
 
 class DirectionalOrbDesk:
@@ -40,6 +57,9 @@ class DirectionalOrbDesk:
         self.mode = order_manager.mode
         self.notifier = notifier
         self.lot_size = lot_size
+        self._last_checked_bar_start: Optional[datetime] = None
+        self._last_reconcile_ts: float = 0.0
+        self._last_state_save_ts: float = 0.0
 
         data_dir = Path("data")
         default_name = (
@@ -89,6 +109,7 @@ class DirectionalOrbDesk:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(self.state, f, indent=2)
         os.replace(tmp_path, self.state_file)
+        self._last_state_save_ts = py_time.time()
 
     def _notify(self, msg: str) -> None:
         if self.notifier:
@@ -129,20 +150,7 @@ class DirectionalOrbDesk:
         df = df.sort_values("dt").reset_index(drop=True)
         df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
         df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
-
-        # 5m ADX(14)
-        high, low, close_s = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
-        prev_close = close_s.shift(1)
-        tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-        up_move = high - high.shift(1)
-        down_move = low.shift(1) - low
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-        atr14 = tr.ewm(alpha=1 / 14, adjust=False).mean().replace(0, np.nan)
-        plus_di = 100.0 * pd.Series(plus_dm).ewm(alpha=1 / 14, adjust=False).mean() / atr14
-        minus_di = 100.0 * pd.Series(minus_dm).ewm(alpha=1 / 14, adjust=False).mean() / atr14
-        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-        df["adx14"] = dx.ewm(alpha=1 / 14, adjust=False).mean().fillna(0.0)
+        df["adx14"] = compute_adx14(df)
 
         t_date = target_date or df["dt"].dt.date.max()
         day_df = df[df["dt"].dt.date == t_date].copy()
@@ -241,6 +249,79 @@ class DirectionalOrbDesk:
         data = kite.ltp([symbol])
         return float(data[symbol]["last_price"])
 
+    def _verify_order_fill(
+        self,
+        order_id: str,
+        fallback_price: float,
+        expected_qty: int,
+        timeout_sec: int = 15,
+    ) -> Tuple[bool, int, float, str]:
+        """Poll OrderManager.get_order_status until filled, rejected, or timeout-cancelled."""
+        if self.mode == "PAPER" or not order_id:
+            st = self.order_manager.get_order_status(order_id) if order_id else {}
+            fq = int(st.get("filled_quantity") or expected_qty)
+            ap = float(st.get("average_price") or fallback_price)
+            return True, fq, ap, "COMPLETE"
+
+        deadline = py_time.time() + max(1, timeout_sec)
+        while py_time.time() < deadline:
+            st = self.order_manager.get_order_status(order_id)
+            status = st.get("status", "UNKNOWN")
+            fq = int(st.get("filled_quantity") or 0)
+            ap = float(st.get("average_price") or fallback_price)
+            if status == "COMPLETE":
+                return (fq > 0), fq, ap, "COMPLETE"
+            if status in ("REJECTED", "CANCELLED", "ERROR"):
+                return (fq > 0), fq, ap, (st.get("status_message") or status)
+            py_time.sleep(1)
+
+        try:
+            self.order_manager.cancel_order(order_id)
+        except Exception as e:
+            logger.warning("Cancel order %s on timeout failed: %s", order_id, e)
+        st = self.order_manager.get_order_status(order_id)
+        fq = int(st.get("filled_quantity") or 0)
+        ap = float(st.get("average_price") or fallback_price)
+        return (fq > 0), fq, ap, ("TIMEOUT_PARTIAL" if fq > 0 else "TIMEOUT_CANCELLED")
+
+    def reconcile_positions(self, kite: Any, now_dt: Optional[datetime] = None) -> bool:
+        """
+        In LIVE mode, verify OPEN position still exists in kite.positions().
+        If manually closed in Zerodha, mark CLOSED (BROKER_RECONCILED) and persist JSON.
+        Returns True if still open (or PAPER mode), False if closed externally.
+        """
+        if self.mode != "LIVE" or self.state.get("status") != "OPEN":
+            return True
+        now_ts = py_time.time()
+        if (now_ts - self._last_reconcile_ts) < 60.0:
+            return True
+        self._last_reconcile_ts = now_ts
+
+        symbol = self.state.get("symbol") or ""
+        tsym = symbol.split(":")[-1]
+        try:
+            net_positions = kite.positions().get("net", [])
+            broker_qty = sum(
+                int(p.get("quantity") or 0)
+                for p in net_positions
+                if p.get("tradingsymbol") == tsym
+            )
+            if broker_qty == 0:
+                now_dt = now_dt or datetime.now()
+                self.state.update({
+                    "status": "CLOSED",
+                    "exit_time": now_dt.strftime("%H:%M:%S"),
+                    "exit_reason": "BROKER_RECONCILED",
+                })
+                self.save_state()
+                self._notify(f"<b>[ORB-LIVE] BROKER RECONCILED</b>\n<code>{symbol}</code> has 0 qty in Kite. Marked CLOSED.")
+                return False
+        except Exception as e:
+            if is_token_error(e):
+                raise
+            logger.warning("Broker position reconciliation skipped: %s", e)
+        return True
+
     def enter_position(
         self,
         kite: Any,
@@ -272,7 +353,16 @@ class DirectionalOrbDesk:
             order_type=order_type,
             buffer_pct=limit_buffer_pct,
         )
-        fill_px = float(order_res.get("fill_price") or order_res.get("price") or ltp)
+        ok, filled_qty, fill_px, fill_msg = self._verify_order_fill(
+            order_id=str(order_res.get("order_id") or ""),
+            fallback_price=ltp,
+            expected_qty=qty,
+            timeout_sec=15,
+        )
+        if not ok or filled_qty <= 0:
+            logger.warning("[%s] Entry order %s not filled (%s). Staying IDLE.", self.mode, symbol, fill_msg)
+            self._notify(f"<b>[ORB-{self.mode}] ENTRY FAILED</b>\n<code>{symbol}</code>: {fill_msg}")
+            return False
 
         self.state.update({
             "status": "OPEN",
@@ -281,7 +371,7 @@ class DirectionalOrbDesk:
             "symbol": symbol,
             "strike": strike,
             "expiry": str(expiry),
-            "quantity": qty,
+            "quantity": filled_qty,
             "entry_price": fill_px,
             "current_ltp": fill_px,
             "trailed_to_cost": False,
@@ -291,7 +381,7 @@ class DirectionalOrbDesk:
 
         self._notify(
             f"<b>[ORB-{self.mode}] ENTRY {signal['direction']}</b>\n"
-            f"Sold <code>{symbol}</code> x {qty} @ ₹{fill_px:.2f}\n"
+            f"Sold <code>{symbol}</code> x {filled_qty} @ ₹{fill_px:.2f}\n"
             f"Spot: {signal['spot']:.1f} | ORB: [{signal['orb_low']:.1f}, {signal['orb_high']:.1f}]"
         )
         return True
@@ -317,22 +407,53 @@ class DirectionalOrbDesk:
             order_type=order_type,
             buffer_pct=limit_buffer_pct,
         )
-        exit_px = float(buy_res.get("fill_price") or buy_res.get("price") or cur_ltp)
-        pnl = round((entry_px - exit_px) * qty, 2)
+        _, filled_qty, exit_px, _ = self._verify_order_fill(
+            order_id=str(buy_res.get("order_id") or ""),
+            fallback_price=cur_ltp,
+            expected_qty=qty,
+            timeout_sec=15,
+        )
+        rem_qty = max(0, qty - filled_qty)
+        if rem_qty > 0:
+            esc_res = self.order_manager.buy_to_cover(
+                symbol=symbol,
+                quantity=rem_qty,
+                price=cur_ltp,
+                reason=f"{reason}_MARKET_ESC",
+                order_type="MARKET",
+            )
+            _, esc_fq, esc_px, _ = self._verify_order_fill(
+                order_id=str(esc_res.get("order_id") or ""),
+                fallback_price=cur_ltp,
+                expected_qty=rem_qty,
+                timeout_sec=10,
+            )
+            if esc_fq > 0:
+                total_f = filled_qty + esc_fq
+                exit_px = round((filled_qty * exit_px + esc_fq * esc_px) / total_f, 2)
+                filled_qty = total_f
+                rem_qty = max(0, qty - filled_qty)
+
+        pnl = round((entry_px - exit_px) * filled_qty, 2) if filled_qty > 0 else 0.0
+        self.state["realized_pnl"] = round(float(self.state.get("realized_pnl", 0.0)) + pnl, 2)
+        if rem_qty > 0:
+            self.state["quantity"] = rem_qty
+            self.save_state()
+            return pnl
 
         self.state.update({
             "status": "CLOSED",
+            "quantity": 0,
             "current_ltp": exit_px,
             "exit_price": exit_px,
             "exit_time": datetime.now().strftime("%H:%M:%S"),
             "exit_reason": reason,
-            "realized_pnl": pnl,
         })
         self.save_state()
 
         self._notify(
             f"<b>[ORB-{self.mode}] EXIT ({reason})</b>\n"
-            f"Bought <code>{symbol}</code> x {qty} @ ₹{exit_px:.2f} (Entry: ₹{entry_px:.2f})\n"
+            f"Bought <code>{symbol}</code> x {filled_qty} @ ₹{exit_px:.2f} (Entry: ₹{entry_px:.2f})\n"
             f"Realized P&amp;L: <b>₹{pnl:+,.2f}</b>"
         )
         return pnl
@@ -367,6 +488,10 @@ class DirectionalOrbDesk:
         if status == "IDLE":
             if now_t < orb_end_time or now_t > entry_cutoff_time or now_t >= exit_cutoff_time:
                 return "IDLE"
+            cur_bar_start = now_dt.replace(minute=(now_dt.minute // 5) * 5, second=0, microsecond=0, tzinfo=None)
+            if self._last_checked_bar_start == cur_bar_start:
+                return "IDLE"
+            self._last_checked_bar_start = cur_bar_start
             bars_df = self._fetch_recent_5m_bars(kite, now_dt)
             signal = self.evaluate_signal(
                 bars_df,
@@ -388,6 +513,9 @@ class DirectionalOrbDesk:
                     limit_buffer_pct=limit_buffer_pct,
                 )
             return self.state["status"]
+
+        if not self.reconcile_positions(kite, now_dt=now_dt):
+            return "CLOSED"
 
         # Manage OPEN position
         symbol = self.state["symbol"]
@@ -414,7 +542,7 @@ class DirectionalOrbDesk:
             self.exit_position(kite, reason, order_type="MARKET", limit_buffer_pct=limit_buffer_pct)
         elif cur_ltp <= target_px:
             self.exit_position(kite, "TARGET_DECAY", order_type=order_type, limit_buffer_pct=limit_buffer_pct)
-        else:
+        elif (py_time.time() - self._last_state_save_ts) >= 30.0:
             self.save_state()
 
         return self.state["status"]
@@ -437,6 +565,9 @@ class DirectionalOrbDesk:
             today_str = now_dt.strftime("%Y-%m-%d")
             if self.state.get("date") != today_str:
                 self.state = self._empty_state(today_str)
+                self._last_checked_bar_start = None
+                self._last_reconcile_ts = 0.0
+                self.save_state()
                 instruments = None
 
             if instruments is None:
@@ -454,7 +585,7 @@ class DirectionalOrbDesk:
 
             try:
                 status = self.step(kite=kite, instruments=instruments, now_dt=now_dt, **step_kwargs)
-                if status == "CLOSED" and now_dt.time() >= step_kwargs.get("exit_cutoff_time", time(15, 15)):
+                if status == "CLOSED":
                     py_time.sleep(60)
                     continue
             except Exception as e:

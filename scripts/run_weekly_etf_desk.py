@@ -31,6 +31,7 @@ logger = logging.getLogger("strategy.etf_swing.run")
 
 from config import load_config
 from kite import get_kite_client
+from kite.client import ensure_kite_session
 from notifications.telegram import TelegramNotifier
 from strategy.etf_swing import ETFSwingConfig, ETFSwingDesk
 
@@ -50,7 +51,7 @@ def parse_args():
     parser.add_argument("--rebalance", action="store_true", 
                         help="Execute rebalance immediately (exit non-conforming holdings, enter top candidates)")
     parser.add_argument("--loop", action="store_true",
-                        help="Run continuously as daemon loop scheduling Friday 15:20 scan and Monday 09:16 rebalance")
+                        help="Run continuously as daemon loop scheduling Monday 09:16 IST full scan & CNC rebalance")
     parser.add_argument("--state-file", type=str, default="data/etf_swing_state.json", 
                         help="Path to JSON state file")
     parser.add_argument("--telegram", action="store_true", default=True, 
@@ -104,11 +105,10 @@ def main():
     if args.loop:
         logger.info("=" * 65)
         logger.info("STARTING WEEKLY ETF SWING DESK DAEMON LOOP...")
-        logger.info(f"Target Schedule: Friday 15:20 IST (Weekly Scan) | Monday 09:16 IST (Rebalance Execution)")
+        logger.info("Target Schedule: Monday 09:16 IST (Complete Scan & CNC Rebalance Execution)")
         logger.info(f"Capital: Rs {args.capital:,.0f} | Slots: {args.slots} | Mode: {mode}")
         logger.info("=" * 65)
         
-        last_friday_scan_date = None
         last_monday_exec_date = None
         
         # Initial status check at container startup
@@ -123,18 +123,17 @@ def main():
             try:
                 now = datetime.datetime.now()
                 today_str = now.strftime("%Y-%m-%d")
-                weekday = now.weekday() # 0 = Monday, 4 = Friday
+                weekday = now.weekday() # 0 = Monday
                 time_str = now.strftime("%H:%M")
                 
-                # Friday 15:20-15:25 Scan Preview
-                if weekday == 4 and "15:20" <= time_str <= "15:25" and last_friday_scan_date != today_str:
-                    logger.info("Triggering Friday pre-market-close weekly scan...")
-                    desk.scan_status()
-                    last_friday_scan_date = today_str
-                    
-                # Monday 09:16-09:20 Rebalance Execution
+                # Monday 09:16-09:20 Complete Scan & CNC Rebalance Execution
                 if weekday == 0 and "09:16" <= time_str <= "09:20" and last_monday_exec_date != today_str:
-                    logger.info(f"Triggering Monday market-open weekly rebalance in {mode} mode...")
+                    logger.info(f"Triggering Monday 09:16 complete scan & CNC rebalance in {mode} mode...")
+                    if mode == "LIVE":
+                        refreshed = ensure_kite_session(desk.kite, force_login=False)
+                        desk.kite = refreshed
+                        desk.scanner.kite = refreshed
+                        desk.orders.kite = refreshed
                     desk.execute_rebalance()
                     last_monday_exec_date = today_str
                     

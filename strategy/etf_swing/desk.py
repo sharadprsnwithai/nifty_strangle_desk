@@ -82,6 +82,7 @@ class ETFSwingDesk:
         
         exited_trades = []
         new_entries = []
+        failed_entries = []
         
         # 1. Process EXITS
         for symbol in exits_to_run:
@@ -171,21 +172,26 @@ class ETFSwingDesk:
                         "price": fill_price,
                         "cost": cost
                     })
+                else:
+                    reason = res.get("reason", f"Order status: {res.get('status', 'UNKNOWN')}")
+                    logger.error(f"Failed to buy {sym}: {reason}")
+                    failed_entries.append({"symbol": sym, "reason": reason})
 
         self.state["last_rebalance"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._save_state()
 
         # Send Telegram Summary
-        self._notify_telegram(exited_trades, new_entries, scan_results)
+        self._notify_telegram(exited_trades, new_entries, scan_results, failed_entries=failed_entries)
 
         return {
             "exits": exited_trades,
             "entries": new_entries,
+            "failed_entries": failed_entries,
             "active_positions": self.state["positions"],
             "cash": self.state["cash"]
         }
 
-    def _notify_telegram(self, exits: List[Dict], entries: List[Dict], scan_results: Dict):
+    def _notify_telegram(self, exits: List[Dict], entries: List[Dict], scan_results: Dict, failed_entries: Optional[List[Dict]] = None):
         if not self.notifier:
             return
 
@@ -208,8 +214,17 @@ class ETFSwingDesk:
                 msg_lines.append(f"✅ {en['symbol']}: Bought {en['quantity']} @ Rs {en['price']} (Alloc: Rs {en['cost']:,.0f})")
             msg_lines.append("")
 
-        if not exits and not entries:
-            msg_lines.append("⏸️ <b>NO REBALANCE NEEDED:</b> All current holdings valid above S1.\n")
+        if failed_entries:
+            msg_lines.append("⚠️ <b>FAILED ENTRIES:</b>")
+            for fe in failed_entries:
+                msg_lines.append(f"❌ {fe['symbol']}: {fe['reason']}")
+            msg_lines.append("")
+
+        if not exits and not entries and not failed_entries:
+            if len(self.state["positions"]) == 0:
+                msg_lines.append("⏸️ <b>NO TRADES EXECUTED:</b> 0 qualifying buy candidates found.\n")
+            else:
+                msg_lines.append("⏸️ <b>NO REBALANCE NEEDED:</b> All current holdings valid above S1.\n")
 
         msg_lines.append("📌 <b>CURRENT PORTFOLIO:</b>")
         for sym, pos in self.state["positions"].items():

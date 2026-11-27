@@ -168,3 +168,31 @@ def test_desk_cost_trail_and_eod_exit(tmp_path):
     assert status == "CLOSED"
     assert desk.state["exit_reason"] == "EOD_CUTOFF"
     assert desk.state["realized_pnl"] > 0
+
+
+def test_live_rejected_entry_and_broker_reconcile_and_bar_cache(tmp_path):
+    kite = MagicMock()
+    om = OrderManager(mode="LIVE", kite=kite)
+    desk = DirectionalOrbDesk(order_manager=om, state_file=tmp_path / "live.json")
+
+    kite.historical_data.return_value = _make_bars([25800] * 6 + [25860]).to_dict("records")
+    kite.ltp.return_value = {"NFO:NIFTY26DEC0125750PE": {"last_price": 120.0}}
+    kite.place_order.return_value = "ORD_REJ"
+    kite.order_history.return_value = [{"status": "REJECTED", "filled_quantity": 0, "average_price": 0.0, "status_message": "Margin shortfall"}]
+
+    instruments = _mock_instruments()
+    # First poll in 09:50 bar fetches historical_data once; rejected order keeps IDLE
+    status = desk.step(kite=kite, instruments=instruments, lots=1, min_adx=0.0, now_dt=datetime(2026, 11, 27, 9, 51))
+    assert status == "IDLE"
+    assert kite.historical_data.call_count == 1
+
+    # Second poll in same 09:50 bar skips historical_data call
+    desk.step(kite=kite, instruments=instruments, lots=1, min_adx=0.0, now_dt=datetime(2026, 11, 27, 9, 52))
+    assert kite.historical_data.call_count == 1
+
+    # Manual broker close reconciliation marks CLOSED
+    desk.state.update({"status": "OPEN", "symbol": "NFO:NIFTY26DEC0125750PE", "quantity": 65, "entry_price": 120.0})
+    kite.positions.return_value = {"net": []}
+    status2 = desk.step(kite=kite, instruments=instruments, lots=1, min_adx=0.0, now_dt=datetime(2026, 11, 27, 11, 0))
+    assert status2 == "CLOSED"
+    assert desk.state["exit_reason"] == "BROKER_RECONCILED"

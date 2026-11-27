@@ -16,6 +16,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from strategy.backtest import get_weekly_expiry_for_date
 from strategy.costs import calculate_trade_costs
+from strategy.directional_orb_desk import compute_adx14
 from strategy.options_model import black_76_price, compute_fractional_dte
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -105,17 +106,7 @@ def run_directional_orb_backtest(
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     if "vix" not in df.columns:
         df["vix"] = iv * 100.0
-
-    h, l, c_s = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
-    tr = pd.concat([h - l, (h - c_s.shift(1)).abs(), (l - c_s.shift(1)).abs()], axis=1).max(axis=1)
-    up, dn = h - h.shift(1), l.shift(1) - l
-    pdm = np.where((up > dn) & (up > 0), up, 0.0)
-    mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    atr14 = tr.ewm(alpha=1 / 14, adjust=False).mean().replace(0, np.nan)
-    pdi = 100.0 * pd.Series(pdm).ewm(alpha=1 / 14, adjust=False).mean() / atr14
-    mdi = 100.0 * pd.Series(mdm).ewm(alpha=1 / 14, adjust=False).mean() / atr14
-    dx = 100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
-    df["adx14"] = dx.ewm(alpha=1 / 14, adjust=False).mean().fillna(0.0)
+    df["adx14"] = compute_adx14(df)
 
     qty = lots * lot_size
     trades: List[Dict[str, Any]] = []

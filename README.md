@@ -60,7 +60,7 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
   - **Exit / Stop Loss**: Weekly Friday close $< S1$. Executed on Monday 09:16 AM open. Eliminates mid-week intraday noise shakeouts.
 - **Configured Capital**: ₹10,00,000 divided across 3 concurrent ETF slots (₹3.33 Lakhs per ETF).
 - **Execution & Safeguards**: CNC Delivery equity product (zero leverage, zero margin calls) with marketable limit orders (0.5% cap) to protect against bid-ask slippage.
-- **Docker & Daemon Support**: Runs as a daemon scheduling Friday 15:20 IST preview scans and Monday 09:16 IST rebalances.
+- **Docker & Daemon Support**: Runs as a daemon scheduling the complete weekly scan and CNC rebalance every Monday at 09:16 IST.
 - CLI runner: `python scripts/run_weekly_etf_desk.py --scan` or `--rebalance` or `--loop`.
 
 ### 3. Desk 3: MCX SILVERM US Post-Open IV Crush Evening Strangle Desk
