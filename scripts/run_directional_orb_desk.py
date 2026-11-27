@@ -42,16 +42,20 @@ def main(args=None) -> int:
     parser.add_argument("--leg-sl-pct", type=float, default=0.50, help="Option stop-loss fraction (default: 0.50)")
     parser.add_argument("--trail-decay-pct", type=float, default=0.30, help="Decay fraction to arm cost-trail (default: 0.30)")
     parser.add_argument("--target-decay-pct", type=float, default=0.75, help="Target decay fraction (default: 0.75)")
-    parser.add_argument("--max-loss", type=float, default=0.0, help="Optional portfolio max loss in Rs (0 = disabled)")
+    parser.add_argument("--max-loss", type=float, default=15000.0, help="Portfolio max loss cap in Rs (0 = disabled, default: 15000.0)")
     parser.add_argument("--orb-end", type=str, default="09:45", help="ORB end time IST HH:MM (default: 09:45)")
     parser.add_argument("--entry-cutoff", type=str, default="13:30", help="Latest entry time IST HH:MM (default: 13:30)")
     parser.add_argument("--exit-time", type=str, default="15:15", help="Mandatory EOD exit IST HH:MM (default: 15:15)")
     parser.add_argument("--min-adx", type=float, default=20.0, help="Minimum 5m ADX(14) required (0 = disabled, default: 20.0)")
-    parser.add_argument("--max-orb-width-pct", type=float, default=0.65, help="Max 30m ORB range %% of open (0 = disabled, default: 0.65)")
+    parser.add_argument("--max-orb-width-pct", type=float, default=0.65, help="Max ORB range %% of open (0 = disabled, default: 0.65)")
+    parser.add_argument("--rsi-filter", dest="rsi_filter", action="store_true", default=True, help="Require 5m vs 15m RSI alignment on entry (default: True)")
+    parser.add_argument("--no-rsi-filter", dest="rsi_filter", action="store_false")
+    parser.add_argument("--rsi-exit", dest="rsi_exit", action="store_true", default=False, help="Exit when 5m RSI crosses against 15m RSI (default: False)")
+    parser.add_argument("--no-rsi-exit", dest="rsi_exit", action="store_false")
     parser.add_argument("--order-type", choices=["LIMIT", "MARKET"], default="LIMIT")
     parser.add_argument("--limit-buffer-pct", type=float, default=0.05)
     parser.add_argument("--product", choices=["MIS", "NRML"], default="MIS")
-    parser.add_argument("--poll", type=int, default=5, help="Poll interval seconds (default: 5)")
+    parser.add_argument("--poll", type=int, default=120, help="Poll interval seconds (default: 120 / 2 min)")
     parser.add_argument("--ignore-holidays", action="store_true")
     parser.add_argument("--once", action="store_true", help="Run a single step and exit")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default=os.getenv("LOG_LEVEL", "INFO"))
@@ -88,6 +92,8 @@ def main(args=None) -> int:
         exit_cutoff_time=_parse_hhmm(parsed.exit_time),
         min_adx=parsed.min_adx,
         max_orb_width_pct=parsed.max_orb_width_pct,
+        use_rsi_filter=parsed.rsi_filter,
+        use_rsi_exit=parsed.rsi_exit,
         order_type=parsed.order_type,
         limit_buffer_pct=parsed.limit_buffer_pct,
     )

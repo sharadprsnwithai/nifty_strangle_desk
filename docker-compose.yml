@@ -104,8 +104,8 @@ services:
       - ./logs:/app/logs
       - ./.env:/app/.env
     entrypoint: ["python", "scripts/run_directional_orb_desk.py"]
-    # 1. Paper Trading (Default — 5 Lots for Rs 10L, 30m ORB 09:45, 100 OTM Naked, 50% SL, ADX>=20, ORB<=0.65%, 15:15 EOD):
-    command: ["--live", "--lots", "5", "--orb-end", "09:45", "--otm-offset", "100", "--leg-sl-pct", "0.50", "--min-adx", "20", "--max-orb-width-pct", "0.65", "--exit-time", "15:15"]
+    # 1. Live Production (5 Lots for Rs 10L, 09:45 ORB, 5m/15m RSI Entry Only, 100 OTM, 50% SL, 15k Cap, 2m poll):
+    command: ["--live", "--lots", "5", "--orb-end", "09:45", "--poll", "120", "--otm-offset", "100", "--leg-sl-pct", "0.50", "--max-loss", "15000", "--min-adx", "20", "--max-orb-width-pct", "0.65", "--exit-time", "15:15"]
     # 2. Live Production:
     # command: ["--live", "--lots", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--orb-end", "09:45", "--otm-offset", "100", "--leg-sl-pct", "0.50", "--min-adx", "20", "--max-orb-width-pct", "0.65", "--exit-time", "15:15"]
 

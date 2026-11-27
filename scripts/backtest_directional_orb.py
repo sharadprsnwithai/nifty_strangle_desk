@@ -16,7 +16,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from strategy.backtest import get_weekly_expiry_for_date
 from strategy.costs import calculate_trade_costs
-from strategy.directional_orb_desk import compute_adx14
+from strategy.directional_orb_desk import compute_adx14, compute_mtf_rsi
 from strategy.options_model import black_76_price, compute_fractional_dte
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -86,6 +86,9 @@ def run_directional_orb_backtest(
     use_ema_exit: bool = True,
     min_adx: float = 0.0,
     max_orb_width_pct: float = 0.0,
+    use_rsi_filter: bool = False,
+    use_rsi_exit: bool = False,
+    max_loss_rs: float = 0.0,
     lots: int = 10,
     lot_size: int = 65,
     slippage: float = 0.50,
@@ -95,10 +98,8 @@ def run_directional_orb_backtest(
 ) -> Dict[str, Any]:
     """Simulate intraday ORB + TWAP + EMA(9/21) directional option selling."""
     df = bars_df.copy()
-    ts_col = "date" if "date" in df.columns else ("timestamps" if "timestamps" in df.columns else df.columns[0])
-    df["dt"] = pd.to_datetime(df[ts_col])
+    df = compute_mtf_rsi(df, now_dt=None)
     df["trade_date"] = df["dt"].dt.date
-    df = df.sort_values("dt").reset_index(drop=True)
 
     # Continuous EMAs and 5m ADX(14) across the 5m series
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
@@ -158,9 +159,13 @@ def run_directional_orb_backtest(
                 if min_adx > 0 and float(row["adx14"]) < min_adx:
                     continue
                 if close > orb_high and close > twap and ema9 > ema21:
+                    if use_rsi_filter and not (float(row["rsi5"]) > float(row["rsi15"]) and float(row["rsi5"]) > 50.0):
+                        continue
                     direction = "BULL"
                     opt_type = "PE"
                 elif close < orb_low and close < twap and ema9 < ema21:
+                    if use_rsi_filter and not (float(row["rsi5"]) < float(row["rsi15"]) and float(row["rsi5"]) < 50.0):
+                        continue
                     direction = "BEAR"
                     opt_type = "CE"
                 else:
@@ -205,12 +210,19 @@ def run_directional_orb_backtest(
 
             if bar_t >= exit_cutoff_time:
                 exit_reason = "EOD_CUTOFF"
+            elif max_loss_rs > 0 and ((short_entry_px - cur_short_px) * qty <= -abs(max_loss_rs)):
+                exit_reason = "MAX_LOSS_CAP"
             elif cur_short_px >= sl_trigger_px:
                 exit_reason = "COST_TRAIL_SL" if trailed_to_cost else "LEG_SL"
             elif cur_short_px <= target_px:
                 exit_reason = "TARGET_DECAY"
             elif use_ema_exit and ((direction == "BULL" and close < ema21) or (direction == "BEAR" and close > ema21)):
                 exit_reason = "EMA21_REVERSAL"
+            elif use_rsi_exit and (
+                (direction == "BULL" and float(row["rsi5"]) < float(row["rsi15"]))
+                or (direction == "BEAR" and float(row["rsi5"]) > float(row["rsi15"]))
+            ):
+                exit_reason = "RSI_REVERSAL"
 
             if exit_reason:
                 exit_dt = bar_dt

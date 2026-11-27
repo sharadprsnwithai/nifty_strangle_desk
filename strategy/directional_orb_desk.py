@@ -22,6 +22,65 @@ NIFTY_INDEX_TOKEN = 256265
 DEFAULT_LOT_SIZE = 65
 
 
+def compute_rsi14(series: pd.Series, period: int = 14) -> pd.Series:
+    """Compute Wilder 14-period RSI on a price series."""
+    s = series.astype(float)
+    delta = s.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean().replace(0, np.nan)
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.fillna(50.0)
+
+
+def compute_mtf_rsi(df_5m: pd.DataFrame, now_dt: Optional[datetime] = None) -> pd.DataFrame:
+    """
+    Compute completed-candle 5m RSI(14) and 15m RSI(14) on 5m bars using prior days' history.
+    Drops any still-forming 5m/15m bar when now_dt is provided.
+    """
+    df = df_5m.copy()
+    ts_col = "date" if "date" in df.columns else ("timestamps" if "timestamps" in df.columns else df.columns[0])
+    df["dt"] = pd.to_datetime(df[ts_col])
+    if df["dt"].dt.tz is not None:
+        df["dt"] = df["dt"].dt.tz_localize(None)
+
+    if now_dt is not None:
+        cur_5m_start = now_dt.replace(minute=(now_dt.minute // 5) * 5, second=0, microsecond=0, tzinfo=None)
+        df = df[df["dt"] < cur_5m_start]
+    if df.empty:
+        return df
+
+    df = df.sort_values("dt").reset_index(drop=True)
+    df["rsi5"] = compute_rsi14(df["close"], 14)
+
+    # Resample to 15m completed bars (NSE 15m candles align to :15/:30/:45/:00 -> offset='15min' or origin='start_day')
+    df_idx = df.set_index("dt")
+    df_15m = df_idx.resample("15min").agg({"close": "last"}).dropna().reset_index()
+    if now_dt is not None:
+        cur_15m_start = now_dt.replace(minute=(now_dt.minute // 15) * 15, second=0, microsecond=0, tzinfo=None)
+        df_15m = df_15m[df_15m["dt"] < cur_15m_start]
+
+    if df_15m.empty:
+        df["rsi15"] = 50.0
+        return df
+
+    df_15m["rsi15"] = compute_rsi14(df_15m["close"], 14)
+    # A 15m bar starting at T closes at T + 15min; merge_asof on bar close time avoids lookahead
+    df_15m["close_dt"] = df_15m["dt"] + pd.Timedelta(minutes=15)
+    df["bar_close_dt"] = df["dt"] + pd.Timedelta(minutes=5)
+    df = pd.merge_asof(
+        df.sort_values("bar_close_dt"),
+        df_15m[["close_dt", "rsi15"]].sort_values("close_dt"),
+        left_on="bar_close_dt",
+        right_on="close_dt",
+        direction="backward",
+    )
+    df["rsi15"] = df["rsi15"].ffill().fillna(50.0)
+    return df
+
+
 def compute_adx14(df: pd.DataFrame) -> pd.Series:
     """Compute 14-period Wilder ADX on OHLC bars."""
     high, low, close_s = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
@@ -126,28 +185,20 @@ class DirectionalOrbDesk:
         entry_cutoff_time: time = time(13, 30),
         min_adx: float = 20.0,
         max_orb_width_pct: float = 0.65,
+        use_rsi_filter: bool = True,
         now_dt: Optional[datetime] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Evaluate completed 5m NIFTY bars for an ORB + TWAP + EMA(9/21) + ADX(14) breakout signal.
-        Drops any currently forming 5m bar when now_dt is provided.
+        Evaluate completed 5m NIFTY bars for an ORB + TWAP + EMA(9/21) + ADX(14) + MTF RSI breakout signal.
+        Drops any currently forming 5m/15m bar when now_dt is provided.
         """
         if bars_df is None or bars_df.empty:
             return None
 
-        df = bars_df.copy()
-        ts_col = "date" if "date" in df.columns else ("timestamps" if "timestamps" in df.columns else df.columns[0])
-        df["dt"] = pd.to_datetime(df[ts_col])
-        if df["dt"].dt.tz is not None:
-            df["dt"] = df["dt"].dt.tz_localize(None)
+        df = compute_mtf_rsi(bars_df, now_dt=now_dt)
+        if df.empty:
+            return None
 
-        if now_dt is not None:
-            cur_bar_start = now_dt.replace(minute=(now_dt.minute // 5) * 5, second=0, microsecond=0, tzinfo=None)
-            df = df[df["dt"] < cur_bar_start]
-            if df.empty:
-                return None
-
-        df = df.sort_values("dt").reset_index(drop=True)
         df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
         df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
         df["adx14"] = compute_adx14(df)
@@ -184,11 +235,15 @@ class DirectionalOrbDesk:
         ema9 = float(latest["ema9"])
         ema21 = float(latest["ema21"])
         adx14 = float(latest["adx14"])
+        rsi5 = float(latest["rsi5"])
+        rsi15 = float(latest["rsi15"])
 
         if min_adx > 0 and adx14 < min_adx:
             return None
 
         if close > orb_high and close > twap and ema9 > ema21:
+            if use_rsi_filter and not (rsi5 > rsi15 and rsi5 > 50.0):
+                return None
             return {
                 "direction": "BULL",
                 "opt_type": "PE",
@@ -197,9 +252,13 @@ class DirectionalOrbDesk:
                 "orb_low": orb_low,
                 "twap": twap,
                 "adx14": round(adx14, 1),
+                "rsi5": round(rsi5, 1),
+                "rsi15": round(rsi15, 1),
                 "bar_time": latest["dt"].strftime("%H:%M"),
             }
         if close < orb_low and close < twap and ema9 < ema21:
+            if use_rsi_filter and not (rsi5 < rsi15 and rsi5 < 50.0):
+                return None
             return {
                 "direction": "BEAR",
                 "opt_type": "CE",
@@ -208,9 +267,32 @@ class DirectionalOrbDesk:
                 "orb_low": orb_low,
                 "twap": twap,
                 "adx14": round(adx14, 1),
+                "rsi5": round(rsi5, 1),
+                "rsi15": round(rsi15, 1),
                 "bar_time": latest["dt"].strftime("%H:%M"),
             }
         return None
+
+    @staticmethod
+    def should_exit_on_rsi(
+        bars_df: pd.DataFrame,
+        direction: str,
+        now_dt: Optional[datetime] = None,
+    ) -> bool:
+        """Exit BULL when completed 5m RSI < 15m RSI; exit BEAR when completed 5m RSI > 15m RSI."""
+        if bars_df is None or bars_df.empty:
+            return False
+        df = compute_mtf_rsi(bars_df, now_dt=now_dt)
+        if df.empty:
+            return False
+        latest = df.iloc[-1]
+        rsi5 = float(latest["rsi5"])
+        rsi15 = float(latest["rsi15"])
+        if direction == "BULL":
+            return rsi5 < rsi15
+        if direction == "BEAR":
+            return rsi5 > rsi15
+        return False
 
     @staticmethod
     def resolve_option_contract(
@@ -473,6 +555,8 @@ class DirectionalOrbDesk:
         exit_cutoff_time: time = time(15, 15),
         min_adx: float = 20.0,
         max_orb_width_pct: float = 0.65,
+        use_rsi_filter: bool = True,
+        use_rsi_exit: bool = False,
         order_type: str = "LIMIT",
         limit_buffer_pct: float = 0.05,
         now_dt: Optional[datetime] = None,
@@ -500,6 +584,7 @@ class DirectionalOrbDesk:
                 entry_cutoff_time=entry_cutoff_time,
                 min_adx=min_adx,
                 max_orb_width_pct=max_orb_width_pct,
+                use_rsi_filter=use_rsi_filter,
                 now_dt=now_dt,
             )
             if signal:
@@ -542,8 +627,17 @@ class DirectionalOrbDesk:
             self.exit_position(kite, reason, order_type="MARKET", limit_buffer_pct=limit_buffer_pct)
         elif cur_ltp <= target_px:
             self.exit_position(kite, "TARGET_DECAY", order_type=order_type, limit_buffer_pct=limit_buffer_pct)
-        elif (py_time.time() - self._last_state_save_ts) >= 30.0:
-            self.save_state()
+        else:
+            if use_rsi_exit:
+                cur_bar_start = now_dt.replace(minute=(now_dt.minute // 5) * 5, second=0, microsecond=0, tzinfo=None)
+                if self._last_checked_bar_start != cur_bar_start:
+                    self._last_checked_bar_start = cur_bar_start
+                    bars_df = self._fetch_recent_5m_bars(kite, now_dt)
+                    if self.should_exit_on_rsi(bars_df, self.state.get("direction", ""), now_dt=now_dt):
+                        self.exit_position(kite, "RSI_REVERSAL", order_type=order_type, limit_buffer_pct=limit_buffer_pct)
+                        return self.state["status"]
+            if (py_time.time() - self._last_state_save_ts) >= 30.0:
+                self.save_state()
 
         return self.state["status"]
 

@@ -48,7 +48,7 @@ def _mock_instruments():
 def test_evaluate_signal_bull_and_bear():
     closes = [25800] * 6 + [25840, 25860]
     sig = DirectionalOrbDesk.evaluate_signal(
-        _make_bars(closes), orb_end_time=time(9, 45), min_adx=0.0
+        _make_bars(closes), orb_end_time=time(9, 45), min_adx=0.0, use_rsi_filter=False
     )
     assert sig is not None
     assert sig["direction"] == "BULL"
@@ -56,7 +56,7 @@ def test_evaluate_signal_bull_and_bear():
 
     closes_bear = [25800] * 6 + [25760, 25740]
     sig_bear = DirectionalOrbDesk.evaluate_signal(
-        _make_bars(closes_bear), orb_end_time=time(9, 45), min_adx=0.0
+        _make_bars(closes_bear), orb_end_time=time(9, 45), min_adx=0.0, use_rsi_filter=False
     )
     assert sig_bear is not None
     assert sig_bear["direction"] == "BEAR"
@@ -70,6 +70,7 @@ def test_completed_bar_guard_and_orb_width_filter():
         _make_bars(closes),
         orb_end_time=time(9, 45),
         min_adx=0.0,
+        use_rsi_filter=False,
         now_dt=datetime(2026, 11, 27, 9, 47),
     )
     assert sig_early is None
@@ -79,6 +80,7 @@ def test_completed_bar_guard_and_orb_width_filter():
         _make_bars(closes),
         orb_end_time=time(9, 45),
         min_adx=0.0,
+        use_rsi_filter=False,
         now_dt=datetime(2026, 11, 27, 9, 50),
     )
     assert sig_closed is not None and sig_closed["direction"] == "BULL"
@@ -89,6 +91,7 @@ def test_completed_bar_guard_and_orb_width_filter():
         _make_bars(wide_closes),
         orb_end_time=time(9, 45),
         min_adx=0.0,
+        use_rsi_filter=False,
         max_orb_width_pct=0.65,
     )
     assert sig_wide is None
@@ -98,16 +101,35 @@ def test_adx_filter_blocks_chop_allows_trend():
     # Trending series builds ADX >= 20
     trend_closes = [25800 + i * 2 for i in range(6)] + [25830 + i * 15 for i in range(15)]
     sig = DirectionalOrbDesk.evaluate_signal(
-        _make_bars(trend_closes), orb_end_time=time(9, 45), min_adx=20.0, max_orb_width_pct=0.65
+        _make_bars(trend_closes), orb_end_time=time(9, 45), min_adx=20.0, max_orb_width_pct=0.65, use_rsi_filter=False
     )
     assert sig is not None and sig["adx14"] >= 20.0
 
     # Alternating choppy series has low ADX and is blocked by min_adx=20.0
     chop_closes = [25800, 25810, 25795, 25810, 25795, 25805] * 6 + [25816]
     sig_blocked = DirectionalOrbDesk.evaluate_signal(
-        _make_bars(chop_closes), orb_end_time=time(9, 45), min_adx=20.0
+        _make_bars(chop_closes), orb_end_time=time(9, 45), min_adx=20.0, use_rsi_filter=False
     )
     assert sig_blocked is None
+
+
+def test_mtf_rsi_entry_and_exit_on_completed_candles():
+    # Uptrend across 20 bars so completed 15m RSI is high, then sharp 5m dip/reversal pulls 5m RSI below 15m RSI
+    prior_day = _make_bars([25500 + i * 15 for i in range(18)], start_hour=13, start_min=30)
+    prior_day["date"] = prior_day["date"] - pd.Timedelta(days=1)
+    # Today: 09:15..09:25 ORB [25800], then 09:30..09:45 rally -> 5m RSI > 15m RSI -> BULL signal
+    today_bull = _make_bars([25800, 25805, 25802, 25830, 25860, 25890])
+    df_bull = pd.concat([prior_day, today_bull], ignore_index=True)
+    sig = DirectionalOrbDesk.evaluate_signal(
+        df_bull, target_date=date(2026, 11, 27), orb_end_time=time(9, 30), min_adx=0.0, use_rsi_filter=True
+    )
+    assert sig is not None and sig["direction"] == "BULL"
+    assert sig["rsi5"] > sig["rsi15"]
+
+    # Now add 3 pullback bars so completed 5m RSI drops below 15m RSI -> triggers RSI_REVERSAL exit
+    pullback = _make_bars([25840, 25810, 25790], start_hour=9, start_min=45)
+    df_rev = pd.concat([df_bull, pullback], ignore_index=True)
+    assert DirectionalOrbDesk.should_exit_on_rsi(df_rev, "BULL") is True
 
 
 def test_desk_entry_and_50pct_sl_exit(tmp_path):
@@ -125,7 +147,10 @@ def test_desk_entry_and_50pct_sl_exit(tmp_path):
         lots=2,
         otm_offset=100,
         leg_sl_pct=0.50,
+        orb_end_time=time(9, 45),
         min_adx=0.0,
+        use_rsi_filter=False,
+        use_rsi_exit=False,
         now_dt=datetime(2026, 11, 27, 9, 50),
     )
     assert status == "OPEN"
@@ -139,7 +164,10 @@ def test_desk_entry_and_50pct_sl_exit(tmp_path):
         lots=2,
         otm_offset=100,
         leg_sl_pct=0.50,
+        orb_end_time=time(9, 45),
         min_adx=0.0,
+        use_rsi_filter=False,
+        use_rsi_exit=False,
         now_dt=datetime(2026, 11, 27, 11, 0),
     )
     assert status == "CLOSED"
@@ -155,16 +183,16 @@ def test_desk_cost_trail_and_eod_exit(tmp_path):
     kite.ltp.return_value = {"NFO:NIFTY26DEC0125850CE": {"last_price": 100.0}}
 
     instruments = _mock_instruments()
-    desk.step(kite=kite, instruments=instruments, lots=1, min_adx=0.0, now_dt=datetime(2026, 11, 27, 9, 50))
+    desk.step(kite=kite, instruments=instruments, lots=1, orb_end_time=time(9, 45), min_adx=0.0, use_rsi_filter=False, use_rsi_exit=False, now_dt=datetime(2026, 11, 27, 9, 50))
     assert desk.state["symbol"] == "NFO:NIFTY26DEC0125850CE"
 
     kite.ltp.return_value = {"NFO:NIFTY26DEC0125850CE": {"last_price": 65.0}}
-    desk.step(kite=kite, instruments=instruments, lots=1, min_adx=0.0, now_dt=datetime(2026, 11, 27, 12, 0))
+    desk.step(kite=kite, instruments=instruments, lots=1, orb_end_time=time(9, 45), min_adx=0.0, use_rsi_filter=False, use_rsi_exit=False, now_dt=datetime(2026, 11, 27, 12, 0))
     assert desk.state["trailed_to_cost"] is True
     assert desk.state["status"] == "OPEN"
 
     kite.ltp.return_value = {"NFO:NIFTY26DEC0125850CE": {"last_price": 40.0}}
-    status = desk.step(kite=kite, instruments=instruments, lots=1, min_adx=0.0, now_dt=datetime(2026, 11, 27, 15, 15))
+    status = desk.step(kite=kite, instruments=instruments, lots=1, orb_end_time=time(9, 45), min_adx=0.0, use_rsi_filter=False, use_rsi_exit=False, now_dt=datetime(2026, 11, 27, 15, 15))
     assert status == "CLOSED"
     assert desk.state["exit_reason"] == "EOD_CUTOFF"
     assert desk.state["realized_pnl"] > 0
@@ -182,17 +210,17 @@ def test_live_rejected_entry_and_broker_reconcile_and_bar_cache(tmp_path):
 
     instruments = _mock_instruments()
     # First poll in 09:50 bar fetches historical_data once; rejected order keeps IDLE
-    status = desk.step(kite=kite, instruments=instruments, lots=1, min_adx=0.0, now_dt=datetime(2026, 11, 27, 9, 51))
+    status = desk.step(kite=kite, instruments=instruments, lots=1, orb_end_time=time(9, 45), min_adx=0.0, use_rsi_filter=False, use_rsi_exit=False, now_dt=datetime(2026, 11, 27, 9, 51))
     assert status == "IDLE"
     assert kite.historical_data.call_count == 1
 
     # Second poll in same 09:50 bar skips historical_data call
-    desk.step(kite=kite, instruments=instruments, lots=1, min_adx=0.0, now_dt=datetime(2026, 11, 27, 9, 52))
+    desk.step(kite=kite, instruments=instruments, lots=1, orb_end_time=time(9, 45), min_adx=0.0, use_rsi_filter=False, use_rsi_exit=False, now_dt=datetime(2026, 11, 27, 9, 52))
     assert kite.historical_data.call_count == 1
 
     # Manual broker close reconciliation marks CLOSED
     desk.state.update({"status": "OPEN", "symbol": "NFO:NIFTY26DEC0125750PE", "quantity": 65, "entry_price": 120.0})
     kite.positions.return_value = {"net": []}
-    status2 = desk.step(kite=kite, instruments=instruments, lots=1, min_adx=0.0, now_dt=datetime(2026, 11, 27, 11, 0))
+    status2 = desk.step(kite=kite, instruments=instruments, lots=1, orb_end_time=time(9, 45), min_adx=0.0, use_rsi_filter=False, use_rsi_exit=False, now_dt=datetime(2026, 11, 27, 11, 0))
     assert status2 == "CLOSED"
     assert desk.state["exit_reason"] == "BROKER_RECONCILED"
