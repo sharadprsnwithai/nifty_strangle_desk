@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from kiteconnect import KiteConnect
 from kite.client import is_token_error
 from strategy.order_manager import OrderManager
-from strategy.option_chain import find_strangle_strikes, resolve_target_expiry, _normalize_date
+from strategy.option_chain import find_strangle_strikes, resolve_target_expiry, _normalize_date, fetch_daily_adr
 from strategy.holidays import is_trading_holiday
 from notifications.telegram import TelegramNotifier
 
@@ -904,6 +904,7 @@ class StrangleDesk:
         atr_multiplier: float = 1.25,
         target_price: float = 30.0,
         exit_time_str: str = "15:15",
+        max_adr14: float = 0.0,
     ) -> Optional[Dict[str, Any]]:
         """
         Executes and monitors the 10:00 AM Short Strangle intraday session.
@@ -971,6 +972,31 @@ class StrangleDesk:
                 raise ValueError("KiteConnect instance required to discover strikes and fetch live quotes.")
 
             kite = self._ensure_kite_session(kite)
+
+            # Evaluate 14-Day ADR Regime Filter (skip Desk 1 in high-range trending regimes)
+            if max_adr14 > 0 and not dry_run:
+                adr14 = fetch_daily_adr(kite, period=14, default_adr=0.0)
+                if adr14 > max_adr14:
+                    err_msg = (
+                        f"14-Day ADR Regime Filter triggered: NIFTY 14-day ADR is "
+                        f"{adr14:.1f} pts > max {max_adr14:.0f} pts. Skipping Desk 1 Strangle today."
+                    )
+                    logger.warning(err_msg)
+                    if self.notifier:
+                        self.notifier.send_message(
+                            f"⚠️ <b>14-Day ADR Regime Filter</b>: NIFTY 14-day ADR is "
+                            f"<b>{adr14:.1f} pts</b> &gt; max {max_adr14:.0f} pts. "
+                            f"Skipping Desk 1 Strangle today (high-range regime)."
+                        )
+                    skipped_state = {
+                        "status": "SKIPPED_TREND_DAY",
+                        "reason": err_msg,
+                        "date": today_str,
+                        "underlying": underlying,
+                        "filter_details": {"adr14": adr14, "max_adr14": max_adr14},
+                    }
+                    self.save_state(skipped_state)
+                    return skipped_state
 
             # Evaluate Morning Range Trend Filter (skips violent morning moves >= 0.60%)
             if morning_filter and not dry_run:
@@ -1760,7 +1786,8 @@ class StrangleDesk:
         morning_filter_pct: float = 0.60,
         strike_mode: str = "ATR",
         atr_multiplier: float = 1.25,
-        target_price: float = 30.0
+        target_price: float = 30.0,
+        max_adr14: float = 0.0,
     ) -> None:
         """
         Runs the automated daily daemon scheduler for the 10:00 AM Short Strangle Desk.
@@ -1862,6 +1889,7 @@ class StrangleDesk:
                         atr_multiplier=atr_multiplier,
                         target_price=target_price,
                         exit_time_str=exit_time_str,
+                        max_adr14=max_adr14,
                     )
                 except Exception as e:
                     logger.exception("Error during active strangle session: %s", e)
@@ -1941,6 +1969,7 @@ class StrangleDesk:
                         atr_multiplier=atr_multiplier,
                         target_price=target_price,
                         exit_time_str=exit_time_str,
+                        max_adr14=max_adr14,
                     )
                     if isinstance(session_res, dict) and session_res.get("status") in ("ABORTED", "COMPLETED", "SKIPPED_TREND_DAY"):
                         logger.info("Strangle session returned %s. Pausing before next scheduler cycle.", session_res.get("status"))

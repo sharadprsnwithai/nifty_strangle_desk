@@ -29,11 +29,11 @@ services:
       # Code is baked into the image; rebuild to apply code changes: docker compose up -d --build
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Paper Trading (Simulation — Active):
-    command: ["--paper", "--lots", "12", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--no-max-loss", "--single-leg-exit", "--leg-sl-pct", "0.70", "--no-trail-cost", "--roll-untested", "--entry-time", "10:00", "--exit-time", "15:15", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
+    # 1. Live Production (12 Lots, 10:00 -> 15:15 IST, 70% Single-Leg SL, No Max-Loss Cap, Roll Untested Leg, Morning Filter, Max ADR14 220, ATR Strikes):
+    command: ["--live", "--lots", "12", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--no-max-loss", "--single-leg-exit", "--leg-sl-pct", "0.70", "--no-trail-cost", "--roll-untested", "--entry-time", "10:00", "--exit-time", "15:15", "--morning-filter", "--morning-filter-pct", "0.60", "--max-adr14", "220", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
     #
-    # 2. Live Production (12 Lots, 10:00 -> 15:15 IST, 70% Single-Leg SL, No Max-Loss Cap, Roll Untested Leg, Morning Filter, ATR Strikes):
-    # command: ["--live", "--lots", "12", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--no-max-loss", "--single-leg-exit", "--leg-sl-pct", "0.70", "--no-trail-cost", "--roll-untested", "--entry-time", "10:00", "--exit-time", "15:15", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
+    # 2. Paper Trading (Simulation):
+    # command: ["--paper", "--lots", "12", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--no-max-loss", "--single-leg-exit", "--leg-sl-pct", "0.70", "--no-trail-cost", "--roll-untested", "--entry-time", "10:00", "--exit-time", "15:15", "--morning-filter", "--morning-filter-pct", "0.60", "--max-adr14", "220", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
     #
     # 2. Live Conservative / Re-entry (5 Lots, Rs 5k Risk Cap, Single-Leg Exit + Cost Trailing):
     # command: ["--live", "--lots", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "5000", "--single-leg-exit", "--trail-cost", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]

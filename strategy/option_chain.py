@@ -54,6 +54,49 @@ def fetch_daily_atr(
         return default_atr
 
 
+def fetch_daily_adr(
+    kite: KiteConnect,
+    instrument_token: int = NIFTY_INDEX_TOKEN,
+    period: int = 14,
+    default_adr: float = 150.0,
+) -> float:
+    """
+    Fetches daily candles via Kite Connect and computes prior-day completed N-day Average Daily Range (High - Low).
+    Excludes today's incomplete candle so the regime gate has zero lookahead bias.
+    """
+    to_date = datetime.now()
+    from_date = to_date - timedelta(days=period * 3 + 10)
+    try:
+        candles = kite.historical_data(
+            instrument_token,
+            from_date=from_date.strftime("%Y-%m-%d"),
+            to_date=to_date.strftime("%Y-%m-%d"),
+            interval="day",
+        )
+        if not candles:
+            logger.warning("Insufficient daily candles (0) to compute ADR. Using default: %.1f", default_adr)
+            return default_adr
+
+        today_d = to_date.date()
+        completed = [c for c in candles if (_normalize_date(c.get("date")) or today_d) < today_d]
+        if not completed:
+            completed = candles
+
+        ranges = [float(c["high"]) - float(c["low"]) for c in completed[-period:]]
+        if not ranges:
+            return default_adr
+
+        calculated_adr = round(sum(ranges) / len(ranges), 2)
+        logger.info("Calculated %d-day prior Daily ADR: %.2f pts (sample size: %d days)", period, calculated_adr, len(ranges))
+        return calculated_adr
+    except Exception as e:
+        from kite.client import is_token_error
+        if is_token_error(e):
+            raise
+        logger.warning("Failed to fetch daily ADR (%s). Falling back to default ADR %.1f pts.", e, default_adr)
+        return default_adr
+
+
 def _normalize_date(d: Any) -> Optional[date]:
     """Normalize date representation from datetime, date, or ISO string."""
     if isinstance(d, datetime):

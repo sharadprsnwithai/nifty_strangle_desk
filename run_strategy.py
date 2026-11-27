@@ -54,6 +54,7 @@ def run_strategy_cli(args=None) -> int:
     parser.add_argument("--morning-filter", dest="morning_filter", action="store_true", default=morning_filter_default, help="Enable 09:15-10:00 AM range trend filter (default: True)")
     parser.add_argument("--no-morning-filter", dest="morning_filter", action="store_false", help="Disable morning trend filter")
     parser.add_argument("--morning-filter-pct", type=float, default=float(os.getenv("STRANGLE_MORNING_FILTER_PCT", "0.60")), help="Morning range percentage threshold to skip session (default: 0.60)")
+    parser.add_argument("--max-adr14", type=float, default=float(os.getenv("STRANGLE_MAX_ADR14", "0.0")), help="Max prior-day 14-day NIFTY ADR in pts to allow entry (0 = disabled, e.g. 220)")
     parser.add_argument("--strike-mode", choices=["ATR", "PRICE"], default=os.getenv("STRANGLE_STRIKE_MODE", "ATR"), help="Strike selection mode (ATR: 1.25x ATR distance, PRICE: Rs 30 premium, default: ATR)")
     parser.add_argument("--atr-multiplier", type=float, default=float(os.getenv("STRANGLE_ATR_MULTIPLIER", "1.25")), help="ATR multiplier for strike distance (default: 1.25)")
     parser.add_argument("--target-price", type=float, default=float(os.getenv("STRANGLE_TARGET_PRICE", "30.0")), help="Target premium in Rs for PRICE mode or fallback (default: 30.0)")
@@ -165,6 +166,8 @@ def run_strategy_cli(args=None) -> int:
             extra_time_kwargs["roll_untested"] = False
         if parsed.leg_sl_pct != 0.70:
             extra_time_kwargs["leg_sl_pct"] = parsed.leg_sl_pct
+        if parsed.max_adr14 > 0:
+            extra_time_kwargs["max_adr14"] = parsed.max_adr14
         if mode == "LIVE" and (parsed.dry_run or parsed.once):
             extra_time_kwargs["check_market_hours"] = True
 

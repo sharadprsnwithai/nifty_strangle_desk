@@ -1649,5 +1649,39 @@ def test_run_strategy_cli_logs_kite_profile_and_nifty_ltp(capsys):
     assert "NIFTY 50 live data check OK: LTP = Rs 24150.25" in captured
 
 
+def test_run_session_skips_when_max_adr14_exceeded(tmp_path):
+    om = OrderManager(mode="PAPER")
+    notifier = MagicMock()
+    desk = StrangleDesk(order_manager=om, state_file=tmp_path / "state.json", notifier=notifier)
+    mock_kite = MagicMock()
+
+    with patch.object(desk, "_ensure_kite_session", return_value=mock_kite), \
+         patch("strategy.strangle_desk.fetch_daily_adr", return_value=285.5):
+        res = desk.run_session(
+            lots=5,
+            kite=mock_kite,
+            execute_once=True,
+            ignore_holidays=True,
+            max_adr14=220.0,
+        )
+
+    assert res["status"] == "SKIPPED_TREND_DAY"
+    assert res["filter_details"]["adr14"] == 285.5
+    notifier.send_message.assert_called_once()
+
+
+def test_run_strategy_cli_passes_max_adr14():
+    with patch("run_strategy.load_config"), \
+         patch("run_strategy.get_kite_client", return_value=MagicMock()), \
+         patch("run_strategy.OrderManager"), \
+         patch("run_strategy.StrangleDesk") as mock_desk_cls:
+        mock_desk = MagicMock()
+        mock_desk_cls.return_value = mock_desk
+        exit_code = run_strategy_cli(["--paper", "--once", "--max-adr14", "220"])
+        assert exit_code == 0
+        assert mock_desk.run_session.call_args.kwargs["max_adr14"] == 220.0
+
+
+
 
 
