@@ -1682,6 +1682,30 @@ def test_run_strategy_cli_passes_max_adr14():
         assert mock_desk.run_session.call_args.kwargs["max_adr14"] == 220.0
 
 
+def test_run_scheduler_sends_sod_desk_plan_telegram(tmp_path):
+    om = MagicMock()
+    om.mode = "LIVE"
+    mock_notifier = MagicMock()
+    desk = StrangleDesk(order_manager=om, state_file=tmp_path / "t.json", notifier=mock_notifier)
+    mock_kite = MagicMock()
+    fake_now = datetime(2026, 11, 2, 9, 16, 0)
+
+    with patch("strategy.strangle_desk.datetime") as mock_dt, \
+         patch.object(desk, "perform_daily_morning_login", return_value=mock_kite), \
+         patch("strategy.strangle_desk.fetch_daily_adr", return_value=303.0), \
+         patch("strategy.strangle_desk.time.sleep"):
+        mock_dt.now.return_value = fake_now
+        desk.run_scheduler(lots=12, kite=mock_kite, max_adr14=220.0, idle_sleep_seconds=1, max_iterations=1)
+
+    mock_notifier.send_message.assert_called_once()
+    msg = mock_notifier.send_message.call_args.args[0]
+    assert "Daily Desk Plan" in msg
+    assert "303.0 pts" in msg
+    assert "Desk 1 (Strangle):</b> PAUSED" in msg
+    assert "Desk 4 (Directional ORB):</b> ACTIVE" in msg
+
+
+
 
 
 

@@ -243,7 +243,15 @@ class DirectionalOrbDesk:
 
         if close > orb_high and close > twap and ema9 > ema21:
             if use_rsi_filter and not (rsi5 > rsi15 and rsi5 > 50.0):
+                logger.info(
+                    "[ORB] BULL breakout @ %s blocked by RSI | Spot=%.2f RSI5=%.2f RSI15=%.2f (need RSI5>RSI15 & >50)",
+                    latest["dt"].strftime("%H:%M"), close, rsi5, rsi15,
+                )
                 return None
+            logger.info(
+                "[ORB] Signal SATISFIED (BULL) @ %s | Spot=%.2f ORB=[%.2f, %.2f] TWAP=%.2f ADX14=%.1f | RSI5=%.2f RSI15=%.2f (5m>15m & >50 OK)",
+                latest["dt"].strftime("%H:%M"), close, orb_low, orb_high, twap, adx14, rsi5, rsi15,
+            )
             return {
                 "direction": "BULL",
                 "opt_type": "PE",
@@ -258,7 +266,15 @@ class DirectionalOrbDesk:
             }
         if close < orb_low and close < twap and ema9 < ema21:
             if use_rsi_filter and not (rsi5 < rsi15 and rsi5 < 50.0):
+                logger.info(
+                    "[ORB] BEAR breakout @ %s blocked by RSI | Spot=%.2f RSI5=%.2f RSI15=%.2f (need RSI5<RSI15 & <50)",
+                    latest["dt"].strftime("%H:%M"), close, rsi5, rsi15,
+                )
                 return None
+            logger.info(
+                "[ORB] Signal SATISFIED (BEAR) @ %s | Spot=%.2f ORB=[%.2f, %.2f] TWAP=%.2f ADX14=%.1f | RSI5=%.2f RSI15=%.2f (5m<15m & <50 OK)",
+                latest["dt"].strftime("%H:%M"), close, orb_low, orb_high, twap, adx14, rsi5, rsi15,
+            )
             return {
                 "direction": "BEAR",
                 "opt_type": "CE",
@@ -323,7 +339,7 @@ class DirectionalOrbDesk:
         )
 
     def _fetch_recent_5m_bars(self, kite: Any, now_dt: datetime) -> pd.DataFrame:
-        start_dt = now_dt - timedelta(days=5)
+        start_dt = now_dt - timedelta(days=10)
         records = kite.historical_data(NIFTY_INDEX_TOKEN, start_dt, now_dt, "5minute")
         return pd.DataFrame(records)
 
@@ -464,7 +480,8 @@ class DirectionalOrbDesk:
         self._notify(
             f"<b>[ORB-{self.mode}] ENTRY {signal['direction']}</b>\n"
             f"Sold <code>{symbol}</code> x {filled_qty} @ ₹{fill_px:.2f}\n"
-            f"Spot: {signal['spot']:.1f} | ORB: [{signal['orb_low']:.1f}, {signal['orb_high']:.1f}]"
+            f"Spot: {signal['spot']:.1f} | ORB: [{signal['orb_low']:.1f}, {signal['orb_high']:.1f}]\n"
+            f"ADX14: {signal.get('adx14', 0):.1f} | RSI5: {signal.get('rsi5', 0):.1f} | RSI15: {signal.get('rsi15', 0):.1f}"
         )
         return True
 

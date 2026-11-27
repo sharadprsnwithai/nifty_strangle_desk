@@ -1812,6 +1812,7 @@ class StrangleDesk:
         last_heartbeat_hour: int = -1
         last_holiday_date: Optional[date] = None
         last_totp_login_date: Optional[date] = None
+        last_sod_plan_date: Optional[date] = None
         last_idle_reconcile_time: float = 0.0
         last_phase_logged: Optional[str] = None
         iteration = 0
@@ -1860,6 +1861,37 @@ class StrangleDesk:
                 except Exception as e:
                     logger.error("Failed daily 08:00 AM morning TOTP login: %s", e, exc_info=True)
                     pass  # Non-trade error alert removed per policy
+
+            # Start-of-Day Desk Plan Telegram alert (once per trading day when ADR regime gate is enabled)
+            if (
+                max_adr14 > 0
+                and dt_time(9, 15) <= current_t <= dt_time(15, 30)
+                and last_sod_plan_date != today_d
+                and kite is not None
+            ):
+                try:
+                    adr14 = fetch_daily_adr(kite, period=14, default_adr=0.0)
+                    last_sod_plan_date = today_d
+                    if adr14 > max_adr14:
+                        plan_msg = (
+                            f"📊 <b>Daily Desk Plan ({today_d})</b>\n"
+                            f"NIFTY 14D ADR: <b>{adr14:.1f} pts</b> (&gt; {max_adr14:.0f} pts)\n"
+                            f"• <b>Desk 1 (Strangle):</b> PAUSED today\n"
+                            f"• <b>Desk 4 (Directional ORB):</b> ACTIVE"
+                        )
+                        logger.info("Daily Desk Plan (%s): ADR14=%.1f > %.0f -> Desk 1 PAUSED, Desk 4 ACTIVE", today_d, adr14, max_adr14)
+                    else:
+                        plan_msg = (
+                            f"📊 <b>Daily Desk Plan ({today_d})</b>\n"
+                            f"NIFTY 14D ADR: <b>{adr14:.1f} pts</b> (&lt;= {max_adr14:.0f} pts)\n"
+                            f"• <b>Desk 1 (Strangle):</b> ACTIVE\n"
+                            f"• <b>Desk 4 (Directional ORB):</b> ACTIVE"
+                        )
+                        logger.info("Daily Desk Plan (%s): ADR14=%.1f <= %.0f -> BOTH Desk 1 & Desk 4 ACTIVE", today_d, adr14, max_adr14)
+                    if self.notifier:
+                        self.notifier.send_message(plan_msg)
+                except Exception as e:
+                    logger.warning("Failed to send start-of-day desk plan: %s", e)
 
             # Check today's state
             state = self.load_state()

@@ -55,7 +55,7 @@ def main(args=None) -> int:
     parser.add_argument("--order-type", choices=["LIMIT", "MARKET"], default="LIMIT")
     parser.add_argument("--limit-buffer-pct", type=float, default=0.05)
     parser.add_argument("--product", choices=["MIS", "NRML"], default="MIS")
-    parser.add_argument("--poll", type=int, default=120, help="Poll interval seconds (default: 120 / 2 min)")
+    parser.add_argument("--poll", type=int, default=5, help="Poll interval seconds (default: 5)")
     parser.add_argument("--ignore-holidays", action="store_true")
     parser.add_argument("--once", action="store_true", help="Run a single step and exit")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default=os.getenv("LOG_LEVEL", "INFO"))

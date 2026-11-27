@@ -63,4 +63,4 @@ COPY --from=builder-runtime /app/.venv /app/.venv
 FROM runtime-base AS directional-orb
 COPY --from=builder-etf /app/.venv /app/.venv
 ENTRYPOINT ["python", "scripts/run_directional_orb_desk.py"]
-CMD ["--paper", "--lots", "5", "--orb-end", "09:45", "--poll", "120", "--otm-offset", "100", "--leg-sl-pct", "0.50", "--max-loss", "15000", "--min-adx", "20", "--max-orb-width-pct", "0.65", "--exit-time", "15:15"]
+CMD ["--paper", "--lots", "5", "--orb-end", "09:45", "--poll", "5", "--otm-offset", "100", "--leg-sl-pct", "0.50", "--max-loss", "15000", "--min-adx", "20", "--max-orb-width-pct", "0.65", "--exit-time", "15:15"]
