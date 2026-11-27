@@ -1,0 +1,467 @@
+"""30m ORB Directional NIFTY Option Selling Desk (100 OTM Naked, 50% SL)."""
+import json
+import logging
+import os
+import time as py_time
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from kite.client import ensure_kite_session, is_token_error
+from notifications.telegram import TelegramNotifier
+from strategy.holidays import is_market_open
+from strategy.option_chain import NIFTY_INDEX_TOKEN, resolve_target_expiry
+from strategy.order_manager import OrderManager
+
+logger = logging.getLogger("strategy.directional_orb")
+
+DEFAULT_LOT_SIZE = 65
+
+
+class DirectionalOrbDesk:
+    """
+    Intraday NIFTY 50 Directional ORB Option Selling Desk.
+    Default strategy: 30m ORB (09:15-09:45) + TWAP + EMA(9/21),
+    100 OTM Naked Short Option, 50% SL with 30% decay cost-trailing,
+    75% target decay, and 15:15 IST EOD square-off.
+    """
+
+    def __init__(
+        self,
+        order_manager: OrderManager,
+        state_file: Optional[Path] = None,
+        notifier: Optional[TelegramNotifier] = None,
+        lot_size: int = DEFAULT_LOT_SIZE,
+    ):
+        self.order_manager = order_manager
+        self.mode = order_manager.mode
+        self.notifier = notifier
+        self.lot_size = lot_size
+
+        data_dir = Path("data")
+        default_name = (
+            "directional_orb_paper_state.json"
+            if self.mode == "PAPER"
+            else "directional_orb_state.json"
+        )
+        self.state_file = Path(state_file) if state_file else (data_dir / default_name)
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state: Dict[str, Any] = self._load_or_init_state()
+
+    def _empty_state(self, today_str: str) -> Dict[str, Any]:
+        return {
+            "date": today_str,
+            "mode": self.mode,
+            "status": "IDLE",  # IDLE -> OPEN -> CLOSED
+            "direction": None,
+            "opt_type": None,
+            "symbol": None,
+            "strike": None,
+            "expiry": None,
+            "quantity": 0,
+            "entry_price": 0.0,
+            "current_ltp": 0.0,
+            "trailed_to_cost": False,
+            "entry_time": None,
+            "exit_time": None,
+            "exit_price": 0.0,
+            "exit_reason": None,
+            "realized_pnl": 0.0,
+        }
+
+    def _load_or_init_state(self) -> Dict[str, Any]:
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("date") == today_str and data.get("mode", self.mode) == self.mode:
+                    return data
+            except Exception as e:
+                logger.warning("Failed to load state file %s: %s. Starting fresh.", self.state_file, e)
+        return self._empty_state(today_str)
+
+    def save_state(self) -> None:
+        tmp_path = self.state_file.with_suffix(".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(self.state, f, indent=2)
+        os.replace(tmp_path, self.state_file)
+
+    def _notify(self, msg: str) -> None:
+        if self.notifier:
+            try:
+                self.notifier.send_message(msg)
+            except Exception as e:
+                logger.warning("Telegram notification failed: %s", e)
+
+    @staticmethod
+    def evaluate_signal(
+        bars_df: pd.DataFrame,
+        target_date: Optional[date] = None,
+        orb_end_time: time = time(9, 45),
+        entry_cutoff_time: time = time(13, 30),
+        min_adx: float = 20.0,
+        max_orb_width_pct: float = 0.65,
+        now_dt: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Evaluate completed 5m NIFTY bars for an ORB + TWAP + EMA(9/21) + ADX(14) breakout signal.
+        Drops any currently forming 5m bar when now_dt is provided.
+        """
+        if bars_df is None or bars_df.empty:
+            return None
+
+        df = bars_df.copy()
+        ts_col = "date" if "date" in df.columns else ("timestamps" if "timestamps" in df.columns else df.columns[0])
+        df["dt"] = pd.to_datetime(df[ts_col])
+        if df["dt"].dt.tz is not None:
+            df["dt"] = df["dt"].dt.tz_localize(None)
+
+        if now_dt is not None:
+            cur_bar_start = now_dt.replace(minute=(now_dt.minute // 5) * 5, second=0, microsecond=0, tzinfo=None)
+            df = df[df["dt"] < cur_bar_start]
+            if df.empty:
+                return None
+
+        df = df.sort_values("dt").reset_index(drop=True)
+        df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+        df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+
+        # 5m ADX(14)
+        high, low, close_s = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
+        prev_close = close_s.shift(1)
+        tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+        up_move = high - high.shift(1)
+        down_move = low.shift(1) - low
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        atr14 = tr.ewm(alpha=1 / 14, adjust=False).mean().replace(0, np.nan)
+        plus_di = 100.0 * pd.Series(plus_dm).ewm(alpha=1 / 14, adjust=False).mean() / atr14
+        minus_di = 100.0 * pd.Series(minus_dm).ewm(alpha=1 / 14, adjust=False).mean() / atr14
+        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        df["adx14"] = dx.ewm(alpha=1 / 14, adjust=False).mean().fillna(0.0)
+
+        t_date = target_date or df["dt"].dt.date.max()
+        day_df = df[df["dt"].dt.date == t_date].copy()
+        if day_df.empty:
+            return None
+
+        day_df["tp"] = (day_df["high"] + day_df["low"] + day_df["close"]) / 3.0
+        day_df["twap"] = day_df["tp"].expanding().mean()
+
+        orb_bars = day_df[day_df["dt"].dt.time < orb_end_time]
+        if orb_bars.empty:
+            return None
+        orb_high = float(orb_bars["high"].max())
+        orb_low = float(orb_bars["low"].min())
+        orb_open = float(orb_bars.iloc[0]["open"])
+        if max_orb_width_pct > 0 and orb_open > 0:
+            orb_width_pct = ((orb_high - orb_low) / orb_open) * 100.0
+            if orb_width_pct > max_orb_width_pct:
+                return None
+
+        post_orb = day_df[
+            (day_df["dt"].dt.time >= orb_end_time)
+            & (day_df["dt"].dt.time <= entry_cutoff_time)
+        ]
+        if post_orb.empty:
+            return None
+
+        latest = post_orb.iloc[-1]
+        close = float(latest["close"])
+        twap = float(latest["twap"])
+        ema9 = float(latest["ema9"])
+        ema21 = float(latest["ema21"])
+        adx14 = float(latest["adx14"])
+
+        if min_adx > 0 and adx14 < min_adx:
+            return None
+
+        if close > orb_high and close > twap and ema9 > ema21:
+            return {
+                "direction": "BULL",
+                "opt_type": "PE",
+                "spot": close,
+                "orb_high": orb_high,
+                "orb_low": orb_low,
+                "twap": twap,
+                "adx14": round(adx14, 1),
+                "bar_time": latest["dt"].strftime("%H:%M"),
+            }
+        if close < orb_low and close < twap and ema9 < ema21:
+            return {
+                "direction": "BEAR",
+                "opt_type": "CE",
+                "spot": close,
+                "orb_high": orb_high,
+                "orb_low": orb_low,
+                "twap": twap,
+                "adx14": round(adx14, 1),
+                "bar_time": latest["dt"].strftime("%H:%M"),
+            }
+        return None
+
+    @staticmethod
+    def resolve_option_contract(
+        instruments: List[Dict[str, Any]],
+        spot: float,
+        opt_type: str,
+        otm_offset: int = 100,
+        today_date: Optional[date] = None,
+    ) -> Tuple[str, float, date, int]:
+        """Resolve exact NFO NIFTY option tradingsymbol, strike, expiry, and lot_size."""
+        target_expiry = resolve_target_expiry(instruments, today_date=today_date, underlying="NIFTY")
+        atm = round(spot / 50.0) * 50.0
+        target_strike = atm - otm_offset if opt_type.upper() == "PE" else atm + otm_offset
+
+        for inst in instruments:
+            if (
+                inst.get("name") == "NIFTY"
+                and inst.get("instrument_type") == opt_type.upper()
+                and float(inst.get("strike", 0)) == float(target_strike)
+                and str(inst.get("expiry"))[:10] == str(target_expiry)
+            ):
+                symbol = f"NFO:{inst['tradingsymbol']}"
+                lot_size = int(inst.get("lot_size") or DEFAULT_LOT_SIZE)
+                return symbol, float(target_strike), target_expiry, lot_size
+
+        raise ValueError(
+            f"Could not find NIFTY {int(target_strike)} {opt_type} for expiry {target_expiry}"
+        )
+
+    def _fetch_recent_5m_bars(self, kite: Any, now_dt: datetime) -> pd.DataFrame:
+        start_dt = now_dt - timedelta(days=5)
+        records = kite.historical_data(NIFTY_INDEX_TOKEN, start_dt, now_dt, "5minute")
+        return pd.DataFrame(records)
+
+    def _fetch_ltp(self, kite: Any, symbol: str) -> float:
+        data = kite.ltp([symbol])
+        return float(data[symbol]["last_price"])
+
+    def enter_position(
+        self,
+        kite: Any,
+        instruments: List[Dict[str, Any]],
+        signal: Dict[str, Any],
+        lots: int = 10,
+        otm_offset: int = 100,
+        order_type: str = "LIMIT",
+        limit_buffer_pct: float = 0.05,
+    ) -> bool:
+        """Sell the directional 100 OTM option leg and persist state."""
+        symbol, strike, expiry, inst_lot_size = self.resolve_option_contract(
+            instruments,
+            spot=signal["spot"],
+            opt_type=signal["opt_type"],
+            otm_offset=otm_offset,
+            today_date=datetime.now().date(),
+        )
+        qty = lots * inst_lot_size
+        ltp = self._fetch_ltp(kite, symbol)
+        if ltp <= 0:
+            logger.warning("Skipping entry: %s LTP is %.2f", symbol, ltp)
+            return False
+
+        order_res = self.order_manager.sell(
+            symbol=symbol,
+            quantity=qty,
+            price=ltp,
+            order_type=order_type,
+            buffer_pct=limit_buffer_pct,
+        )
+        fill_px = float(order_res.get("fill_price") or order_res.get("price") or ltp)
+
+        self.state.update({
+            "status": "OPEN",
+            "direction": signal["direction"],
+            "opt_type": signal["opt_type"],
+            "symbol": symbol,
+            "strike": strike,
+            "expiry": str(expiry),
+            "quantity": qty,
+            "entry_price": fill_px,
+            "current_ltp": fill_px,
+            "trailed_to_cost": False,
+            "entry_time": datetime.now().strftime("%H:%M:%S"),
+        })
+        self.save_state()
+
+        self._notify(
+            f"<b>[ORB-{self.mode}] ENTRY {signal['direction']}</b>\n"
+            f"Sold <code>{symbol}</code> x {qty} @ ₹{fill_px:.2f}\n"
+            f"Spot: {signal['spot']:.1f} | ORB: [{signal['orb_low']:.1f}, {signal['orb_high']:.1f}]"
+        )
+        return True
+
+    def exit_position(
+        self,
+        kite: Any,
+        reason: str,
+        order_type: str = "MARKET",
+        limit_buffer_pct: float = 0.05,
+    ) -> float:
+        """Square off the open option leg and mark CLOSED."""
+        symbol = self.state["symbol"]
+        qty = int(self.state["quantity"])
+        entry_px = float(self.state["entry_price"])
+        cur_ltp = self._fetch_ltp(kite, symbol)
+
+        buy_res = self.order_manager.buy_to_cover(
+            symbol=symbol,
+            quantity=qty,
+            price=cur_ltp,
+            reason=reason,
+            order_type=order_type,
+            buffer_pct=limit_buffer_pct,
+        )
+        exit_px = float(buy_res.get("fill_price") or buy_res.get("price") or cur_ltp)
+        pnl = round((entry_px - exit_px) * qty, 2)
+
+        self.state.update({
+            "status": "CLOSED",
+            "current_ltp": exit_px,
+            "exit_price": exit_px,
+            "exit_time": datetime.now().strftime("%H:%M:%S"),
+            "exit_reason": reason,
+            "realized_pnl": pnl,
+        })
+        self.save_state()
+
+        self._notify(
+            f"<b>[ORB-{self.mode}] EXIT ({reason})</b>\n"
+            f"Bought <code>{symbol}</code> x {qty} @ ₹{exit_px:.2f} (Entry: ₹{entry_px:.2f})\n"
+            f"Realized P&amp;L: <b>₹{pnl:+,.2f}</b>"
+        )
+        return pnl
+
+    def step(
+        self,
+        kite: Any,
+        instruments: List[Dict[str, Any]],
+        lots: int = 10,
+        otm_offset: int = 100,
+        leg_sl_pct: float = 0.50,
+        trail_decay_pct: float = 0.30,
+        target_decay_pct: float = 0.75,
+        max_loss_rs: float = 0.0,
+        orb_end_time: time = time(9, 45),
+        entry_cutoff_time: time = time(13, 30),
+        exit_cutoff_time: time = time(15, 15),
+        min_adx: float = 20.0,
+        max_orb_width_pct: float = 0.65,
+        order_type: str = "LIMIT",
+        limit_buffer_pct: float = 0.05,
+        now_dt: Optional[datetime] = None,
+    ) -> str:
+        """Run one monitoring/execution cycle. Returns current state status."""
+        now_dt = now_dt or datetime.now()
+        now_t = now_dt.time()
+        status = self.state.get("status", "IDLE")
+
+        if status == "CLOSED":
+            return "CLOSED"
+
+        if status == "IDLE":
+            if now_t < orb_end_time or now_t > entry_cutoff_time or now_t >= exit_cutoff_time:
+                return "IDLE"
+            bars_df = self._fetch_recent_5m_bars(kite, now_dt)
+            signal = self.evaluate_signal(
+                bars_df,
+                target_date=now_dt.date(),
+                orb_end_time=orb_end_time,
+                entry_cutoff_time=entry_cutoff_time,
+                min_adx=min_adx,
+                max_orb_width_pct=max_orb_width_pct,
+                now_dt=now_dt,
+            )
+            if signal:
+                self.enter_position(
+                    kite=kite,
+                    instruments=instruments,
+                    signal=signal,
+                    lots=lots,
+                    otm_offset=otm_offset,
+                    order_type=order_type,
+                    limit_buffer_pct=limit_buffer_pct,
+                )
+            return self.state["status"]
+
+        # Manage OPEN position
+        symbol = self.state["symbol"]
+        entry_px = float(self.state["entry_price"])
+        qty = int(self.state["quantity"])
+        cur_ltp = self._fetch_ltp(kite, symbol)
+        self.state["current_ltp"] = cur_ltp
+
+        if not self.state.get("trailed_to_cost") and cur_ltp <= entry_px * (1.0 - trail_decay_pct):
+            self.state["trailed_to_cost"] = True
+            self.save_state()
+            logger.info("[%s] %s decayed >= %.0f%%; SL trailed to cost ₹%.2f", self.mode, symbol, trail_decay_pct * 100, entry_px)
+
+        sl_px = entry_px if self.state.get("trailed_to_cost") else entry_px * (1.0 + leg_sl_pct)
+        target_px = entry_px * (1.0 - target_decay_pct)
+        unrealized_pnl = (entry_px - cur_ltp) * qty
+
+        if now_t >= exit_cutoff_time:
+            self.exit_position(kite, "EOD_CUTOFF", order_type="MARKET", limit_buffer_pct=limit_buffer_pct)
+        elif max_loss_rs > 0 and unrealized_pnl <= -abs(max_loss_rs):
+            self.exit_position(kite, "MAX_LOSS_CAP", order_type="MARKET", limit_buffer_pct=limit_buffer_pct)
+        elif cur_ltp >= sl_px:
+            reason = "COST_TRAIL_SL" if self.state.get("trailed_to_cost") else "LEG_SL"
+            self.exit_position(kite, reason, order_type="MARKET", limit_buffer_pct=limit_buffer_pct)
+        elif cur_ltp <= target_px:
+            self.exit_position(kite, "TARGET_DECAY", order_type=order_type, limit_buffer_pct=limit_buffer_pct)
+        else:
+            self.save_state()
+
+        return self.state["status"]
+
+    def run_loop(
+        self,
+        kite: Any,
+        poll_seconds: int = 5,
+        ignore_holidays: bool = False,
+        **step_kwargs: Any,
+    ) -> None:
+        """Continuous intraday daemon loop with market-hours and holiday guards."""
+        instruments = None
+        while True:
+            now_dt = datetime.now()
+            if not is_market_open(now_dt, ignore_holidays=ignore_holidays):
+                py_time.sleep(60)
+                continue
+
+            today_str = now_dt.strftime("%Y-%m-%d")
+            if self.state.get("date") != today_str:
+                self.state = self._empty_state(today_str)
+                instruments = None
+
+            if instruments is None:
+                try:
+                    instruments = kite.instruments("NFO")
+                except Exception as e:
+                    if is_token_error(e):
+                        kite = ensure_kite_session(kite, force_login=False)
+                        self.order_manager.kite = kite if self.mode == "LIVE" else None
+                        instruments = kite.instruments("NFO")
+                    else:
+                        logger.error("Failed to fetch NFO instruments: %s", e)
+                        py_time.sleep(poll_seconds)
+                        continue
+
+            try:
+                status = self.step(kite=kite, instruments=instruments, now_dt=now_dt, **step_kwargs)
+                if status == "CLOSED" and now_dt.time() >= step_kwargs.get("exit_cutoff_time", time(15, 15)):
+                    py_time.sleep(60)
+                    continue
+            except Exception as e:
+                if is_token_error(e):
+                    kite = ensure_kite_session(kite, force_login=False)
+                    self.order_manager.kite = kite if self.mode == "LIVE" else None
+                else:
+                    logger.exception("Error in DirectionalOrbDesk step: %s", e)
+
+            py_time.sleep(poll_seconds)

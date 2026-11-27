@@ -185,14 +185,29 @@ uv run python scripts/backtest_silver_strangle_1y.py
 
 ---
 
+### 5. Desk 4: NIFTY 30m ORB Directional Option Selling Desk
+```bash
+# Paper simulation (5 Lots for Rs 10L, 30m ORB 09:45, 100 OTM Naked, 50% SL, ADX>=20, ORB<=0.65%)
+uv run python scripts/run_directional_orb_desk.py --paper --lots 5
+
+# Live Production Execution
+uv run python scripts/run_directional_orb_desk.py --live --lots 5 --order-type LIMIT --limit-buffer-pct 0.05
+
+# Backtest (124-day cache & 20-day actual Kite VIX)
+uv run python scripts/backtest_directional_orb.py --single --orb-end 09:45 --otm-offset 100 --leg-sl 0.50 --lots 5
+uv run python scripts/backtest_directional_orb.py --fetch-kite --use-vix --days 20 --single --orb-end 09:45 --otm-offset 100 --leg-sl 0.50 --lots 5
+```
+
+---
+
 ## Docker & Container Deployment
 
 The platform is fully containerized using Docker and Docker Compose with `Asia/Kolkata` timezone pre-configured.
 
 ### Multi-Desk `docker-compose.yml` Services:
-- `strangle-desk`: NIFTY Adaptive Short Strangle Desk (Live 10 Lots).
+- `strangle-desk`: NIFTY Adaptive Short Strangle Desk (Paper 12 Lots).
 - `etf-swing-desk`: Weekly Monthly-Fibonacci ETF Swing Desk (Live Rs 10 Lakhs).
-- `silver-desk`: MCX SILVERM Evening Strangle Desk (Live 2 Lots).
+- `directional-orb-desk`: NIFTY 30m ORB Directional Option Selling Desk (Paper 5 Lots, 100 OTM Naked, 50% SL, ADX>=20, ORB<=0.65%).
 
 ```bash
 # Start all desks in the background
@@ -244,6 +259,7 @@ uv run pytest
 ├── strategy/                      # Trading strategies & shared modules
 │   ├── backtest.py                # NIFTY 5-minute Strangle simulator
 │   ├── costs.py                   # NSE F&O statutory taxes & slippage
+│   ├── directional_orb_desk.py    # NIFTY 30m ORB Directional Option Desk
 │   ├── holidays.py                # NSE & MCX calendars & market hours guard
 │   ├── logger.py                  # Rotating file loggers
 │   ├── option_chain.py            # NIFTY ATR/PRICE OTM strike discovery
@@ -262,6 +278,8 @@ uv run pytest
 │       ├── models.py
 │       └── order_manager.py
 ├── scripts/                       # Runners, backtesters, and utilities
+│   ├── backtest_directional_orb.py
+│   ├── run_directional_orb_desk.py
 │   ├── run_silver_desk.py
 │   ├── run_weekly_etf_desk.py
 │   ├── backtest_nifty_3y.py

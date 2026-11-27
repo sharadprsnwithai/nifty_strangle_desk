@@ -29,8 +29,11 @@ services:
       # Code is baked into the image; rebuild to apply code changes: docker compose up -d --build
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Live Production (12 Lots, 10:00 -> 15:15 IST, 70% Single-Leg SL, No Max-Loss Cap, Roll Untested Leg, Morning Filter, ATR Strikes):
-    command: ["--live", "--lots", "12", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--no-max-loss", "--single-leg-exit", "--leg-sl-pct", "0.70", "--no-trail-cost", "--roll-untested", "--entry-time", "10:00", "--exit-time", "15:15", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
+    # 1. Paper Trading (Simulation — Active):
+    command: ["--paper", "--lots", "12", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--no-max-loss", "--single-leg-exit", "--leg-sl-pct", "0.70", "--no-trail-cost", "--roll-untested", "--entry-time", "10:00", "--exit-time", "15:15", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
+    #
+    # 2. Live Production (12 Lots, 10:00 -> 15:15 IST, 70% Single-Leg SL, No Max-Loss Cap, Roll Untested Leg, Morning Filter, ATR Strikes):
+    # command: ["--live", "--lots", "12", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--no-max-loss", "--single-leg-exit", "--leg-sl-pct", "0.70", "--no-trail-cost", "--roll-untested", "--entry-time", "10:00", "--exit-time", "15:15", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
     #
     # 2. Live Conservative / Re-entry (5 Lots, Rs 5k Risk Cap, Single-Leg Exit + Cost Trailing):
     # command: ["--live", "--lots", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--max-loss", "5000", "--single-leg-exit", "--trail-cost", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
@@ -75,6 +78,36 @@ services:
     # 2. Paper Trading Simulation:
     # command: ["--paper", "--capital", "1000000", "--slots", "3", "--loop"]
     # -----------------------------------------------------------------------------------
+
+  directional-orb-desk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: directional-orb
+    container_name: nifty_directional_orb_desk
+    image: ${DOCKER_USER:-sharadprsn}/nifty_directional_orb_desk:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Kolkata
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-5}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    entrypoint: ["python", "scripts/run_directional_orb_desk.py"]
+    # 1. Paper Trading (Default — 5 Lots for Rs 10L, 30m ORB 09:45, 100 OTM Naked, 50% SL, ADX>=20, ORB<=0.65%, 15:15 EOD):
+    command: ["--live", "--lots", "5", "--orb-end", "09:45", "--otm-offset", "100", "--leg-sl-pct", "0.50", "--min-adx", "20", "--max-orb-width-pct", "0.65", "--exit-time", "15:15"]
+    # 2. Live Production:
+    # command: ["--live", "--lots", "5", "--order-type", "LIMIT", "--limit-buffer-pct", "0.05", "--orb-end", "09:45", "--otm-offset", "100", "--leg-sl-pct", "0.50", "--min-adx", "20", "--max-orb-width-pct", "0.65", "--exit-time", "15:15"]
 
 
 

@@ -2,6 +2,7 @@
 # Targets:
 #   - runtime (default): minimal image for strangle-desk
 #   - etf: adds pandas, numpy, and yfinance for etf-swing-desk
+#   - directional-orb: pandas + numpy runtime for directional-orb-desk
 
 FROM python:3.12-slim-bookworm AS builder-base
 
@@ -43,7 +44,7 @@ COPY config.py main.py run_strategy.py ./
 COPY kite/ ./kite/
 COPY notifications/ ./notifications/
 COPY strategy/ ./strategy/
-COPY scripts/run_weekly_etf_desk.py ./scripts/
+COPY scripts/run_weekly_etf_desk.py scripts/run_directional_orb_desk.py ./scripts/
 
 RUN mkdir -p /app/data /app/logs
 
@@ -57,3 +58,9 @@ COPY --from=builder-etf /app/.venv /app/.venv
 
 FROM runtime-base AS runtime
 COPY --from=builder-runtime /app/.venv /app/.venv
+
+
+FROM runtime-base AS directional-orb
+COPY --from=builder-etf /app/.venv /app/.venv
+ENTRYPOINT ["python", "scripts/run_directional_orb_desk.py"]
+CMD ["--paper", "--lots", "5", "--orb-end", "09:45", "--otm-offset", "100", "--leg-sl-pct", "0.50", "--min-adx", "20", "--max-orb-width-pct", "0.65", "--exit-time", "15:15"]
