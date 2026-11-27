@@ -16,15 +16,15 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
      |                                            |                                            |
 +---------------------------------+      +---------------------------------+      +---------------------------------+
 |             DESK 1              |      |             DESK 2              |      |             DESK 3              |
-|      NIFTY Adaptive Strangle    |      |   Weekly Fibonacci ETF Swing    |      |   MCX SILVERM Evening Strangle  |
-|        (Option Selling)         |      |          (Cash Swing)           |      |        (Commodity Strangle)     |
+|      NIFTY Adaptive Strangle    |      |   Weekly Fibonacci ETF Swing    |      |   NIFTY 30m ORB Directional     |
+|        (Option Selling)         |      |          (Cash Swing)           |      |     (Directional Selling)       |
 +---------------------------------+      +---------------------------------+      +---------------------------------+
-| • Dynamic 1.25x ATR Strikes     |      | • Nifty, Junior, Gold, Silver   |      | • MCX SILVERM (5kg) / SILVER    |
-| • 09:15-10:00 Morning Filter    |      | • Monthly Fibonacci P & S1      |      | • 1.5% OTM Liquidity-Filtered   |
-| • Single-Leg Exit + Cost Trail  |      | • Friday Weekly Close Trigger   |      | • [20:00, 23:10) Window & EOD   |
-| • 80% Decay Target / 10k Loss   |      | • Monday 09:16 AM Rebalance     |      | • Single-Leg 40% SL + Cost Trail|
-| • Freeze-Split + 14:45 EOD Exit |      | • CNC Delivery / Zero Leverage  |      | • Dynamic Lots*SL Cap & 0-DTE   |
-| • Paper & Live Isolated State   |      | • Rs 10 Lakhs Portfolio Ballast |      | • 0 Overnight / Devolvement Risk|
+| • Dynamic 1.25x ATR Strikes     |      | • Nifty, Junior, Gold, Silver   |      | • 30m ORB (09:45) + TWAP + EMA  |
+| • 09:15-10:00 Morning Filter    |      | • Monthly Fibonacci P & S1      |      | • 100 OTM Naked + 50% SL        |
+| • Single-Leg Exit + Cost Trail  |      | • Monday 09:16 AM Rebalance     |      | • 5m ADX>=20 & ORB<=0.65%       |
+| • 80% Decay Target / 10k Loss   |      | • Monday 09:16 AM Complete Run  |      | • 30% Cost Trail / 75% Decay    |
+| • Freeze-Split + 14:45 EOD Exit |      | • CNC Delivery / Zero Leverage  |      | • Completed-Bar + 15:15 EOD     |
+| • Paper & Live Isolated State   |      | • Rs 10 Lakhs Portfolio Ballast |      | • 5 Lots (Rs 10L) / 0 Overnight |
 +---------------------------------+      +---------------------------------+      +---------------------------------+
      |                                            |                                            |
      +--------------------------------------------+--------------------------------------------+
@@ -63,21 +63,15 @@ A production-grade algorithmic trading platform connected to the Zerodha Kite Co
 - **Docker & Daemon Support**: Runs as a daemon scheduling the complete weekly scan and CNC rebalance every Monday at 09:16 IST.
 - CLI runner: `python scripts/run_weekly_etf_desk.py --scan` or `--rebalance` or `--loop`.
 
-### 3. Desk 3: MCX SILVERM US Post-Open IV Crush Evening Strangle Desk
-- **Instrument & Expiry Handling**: MCX `SILVERM` (`5 kg`/lot) or `SILVER` (`30 kg`/lot) options. Aligns underlying futures contract to active option expiry and skips 0-DTE option expiry days by default (`--no-skip-0dte` to override).
-- **US Session Timing**: Enters in the `[20:00, 23:10)` IST window after initial US opening macro volatility subsides, capturing evening IV crush and theta decay until mandatory **23:10 IST** EOD square-off (never opens fresh legs at or after cutoff).
-- **Liquidity-Filtered 1.5% OTM Strikes**: Selects OTM strikes (step 500 or 1000 above ₹1,20,000) gated by minimum OI (`>= 100`), non-empty bid/ask depth, and `<= 3%` bid-ask spread, scanning further OTM rather than stepping inward toward ATM.
-- **Depth-Anchored Execution & Safe Escalation**: Anchors `LIMIT` orders to live `best_bid` / `best_ask` within `max_limit_slippage_pct` (1%). Urgent exits (`SL`, `MAX_PORTFOLIO_LOSS`, `EOD`, abort rollback) escalate unfilled balances to `MARKET`, while voluntary `TARGET_DECAY` exits remain limit-protected.
-- **Single-Leg 40% SL, Pending Cost Trailing & Target Decay**: Tracks `exit_filled_lots` and weighted open/closed P&L (`effective_points`) accurately across partial fills, trails surviving legs via `cost_trail_pending` on stop-out or $\ge 30\%$ decay, and closes remaining legs at `70%` target decay (or supports dual-leg mode via `--no-single-leg-exit`).
-- **Dynamic Risk Cap, Reconciliation & State Safety**: Portfolio max loss cap scales by lots (`sl_per_lot * lots`, e.g., ₹3,000/lot × 2 lots = ₹6,000), periodic 60s LIVE broker reconciliation detects manual Kite closes (`BROKER_RECONCILED`), pre-entry `19:45 IST` token validation avoids stale sessions, and `save_state()` uses atomic file replacement with isolated `silver_paper_trades_today.json` in `PAPER` mode.
-- **Exact MCX Cost Modeling**: Computes per-leg brokerage, MCX exchange fee (`0.05%`), CTT (`0.0625%` sell), SEBI fee, stamp duty, and 18% GST via `calculate_silver_mcx_costs()`.
-- **Zero Overnight & Devolvement Risk**: Mandatorily squares off all positions by 23:10 IST every evening, avoiding overnight COMEX gaps and MCX tender delivery risk.
-- **CLI Runner**: `python scripts/run_silver_desk.py --live --lots 2 --loop`
+### 3. Desk 3: NIFTY 30m ORB Directional Option Selling Desk
+- **Directional Breakout + Trend Filters**: Evaluates completed 5-minute NIFTY 50 bars after the `09:15–09:44` 30-minute ORB (`ORB High`/`ORB Low`) aligned with intraday `TWAP`, `EMA(9/21)`, `5m ADX(14) >= 20`, and `ORB Width <= 0.65%`.
+- **100 OTM Naked Execution**: Sells `ATM - 100 PE` on bullish breakouts or `ATM + 100 CE` on bearish breakdowns (auto-rolling 0-DTE to next week), sized at 5 lots (`₹10L` capital).
+- **Risk Management & Verification**: `50%` SL with `30%` decay cost-trailing, `75%` target decay, `15:15 IST` EOD exit, `OrderManager` fill verification with `MARKET` escalation, 60s `LIVE` broker reconciliation, and isolated `PAPER`/`LIVE` state files.
 
 ### 4. Zero-Hit Off-Market Safety & Auth Core
-- **Zero Kite API Hits Off-Market**: NSE desks verify `is_market_open()` (`09:15–15:30 IST` + `NSE_HOLIDAYS_2026` + fixed national closures) and MCX Silver verifies `is_mcx_trading_holiday(..., session="EVENING")` before hitting broker endpoints on holidays/weekends.
-- **Automated Headless TOTP & Cross-Container Sync**: Daily login via `pyotp` RFC 6238 with proactive token validation (`08:00 AM` NSE / `19:45` MCX) that adopts already-fresh `.env` tokens from peer containers before forcing a new login.
-- **Atomic Inter-Process Lock**: File-locking (`data/.kite_auth.lock`) and per-desk `RLock` retries ensure concurrent containers (`strangle-desk`, `etf-swing-desk`, `silver-desk`) never invalidate each other's active sessions.
+- **Zero Kite API Hits Off-Market**: NSE desks verify `is_market_open()` (`09:15–15:30 IST` + `NSE_HOLIDAYS_2026` + fixed national closures) before hitting broker endpoints on holidays/weekends.
+- **Automated Headless TOTP & Cross-Container Sync**: Daily login via `pyotp` RFC 6238 with proactive token validation (`08:00 AM` NSE) that adopts already-fresh `.env` tokens from peer containers before forcing a new login.
+- **Atomic Inter-Process Lock**: File-locking (`data/.kite_auth.lock`) and per-desk `RLock` retries ensure concurrent containers (`strangle-desk`, `etf-swing-desk`, `directional-orb-desk`) never invalidate each other's active sessions.
 
 ---
 
@@ -167,25 +161,7 @@ uv run python scripts/run_weekly_etf_desk.py --live --rebalance
 
 ---
 
-### 4. Desk 3: MCX SILVERM Evening Strangle Desk
-```bash
-# Preview MCX SILVERM strikes, OI, and bid-ask spreads
-uv run python scripts/run_silver_desk.py --dry-run
-
-# Paper simulation (uses isolated data/silver_paper_trades_today.json)
-uv run python scripts/run_silver_desk.py --paper --lots 2 --sl-per-lot 3000 --sl-pct 0.40 --entry-time 20:00 --exit-time 23:10 --loop
-
-# Live Production daemon (2 lots, 6k max loss cap)
-uv run python scripts/run_silver_desk.py --live --lots 2 --sl-per-lot 3000 --sl-pct 0.40 --strike-otm-pct 0.015 --entry-time 20:00 --exit-time 23:10 --loop
-
-# Historical MCX SILVERM Backtests (with portfolio loss cap, 0-DTE roll & exact MCX taxes)
-uv run python scripts/backtest_silver_strangle.py
-uv run python scripts/backtest_silver_strangle_1y.py
-```
-
----
-
-### 5. Desk 4: NIFTY 30m ORB Directional Option Selling Desk
+### 4. Desk 3: NIFTY 30m ORB Directional Option Selling Desk
 ```bash
 # Paper simulation (5 Lots for Rs 10L, 30m ORB 09:45, 100 OTM Naked, 50% SL, ADX>=20, ORB<=0.65%)
 uv run python scripts/run_directional_orb_desk.py --paper --lots 5
@@ -219,7 +195,7 @@ docker compose build
 # Stream logs for a specific desk
 docker compose logs -f strangle-desk
 docker compose logs -f etf-swing-desk
-docker compose logs -f silver-desk
+docker compose logs -f directional-orb-desk
 
 # Stop all desks
 docker compose down
@@ -239,8 +215,8 @@ uv run pytest
 - **Authentication & Concurrency**: Headless TOTP generation, token validation, `.env` adoption, `interprocess_auth_lock`, and thread-safe `RLock` retries.
 - **Market Hours & Holidays**: NSE/MCX exchange calendars, fixed cross-year national holidays, weekends, and off-market guards.
 - **NIFTY Adaptive Strangle**: Shifted prior-day ATR strike selection, freeze-limit slicing & rollback, partial-fill exit escalation, `SINGLE_LEG_10K_EXIT` anti-cascade, and broker reconciliation.
-- **MCX SILVERM Strangle**: OI & bid/ask depth liquidity gating, 0-DTE expiry skip, partial-exit `effective_points` P&L, limit-only `TARGET_DECAY`, cost trailing, and atomic state isolation.
-- **ETF Swing Desk**: Monthly Fibonacci pivot calculations, weekly Friday close evaluation, Monday order rebalancing.
+- **NIFTY 30m ORB Directional**: Completed-5m-bar guard, `ADX(14) >= 20` & `ORB <= 0.65%` filters, fill verification, and 60s `LIVE` broker reconciliation.
+- **ETF Swing Desk**: Monthly Fibonacci pivot calculations, Monday `09:16` rebalance with token refresh.
 
 ---
 
@@ -271,22 +247,13 @@ uv run pytest
 │   │   ├── desk.py
 │   │   ├── order_manager.py
 │   │   └── scanner.py
-│   └── silver_options/            # MCX SILVERM Evening Strangle Desk
-│       ├── chain.py
-│       ├── config.py
-│       ├── desk.py
-│       ├── models.py
-│       └── order_manager.py
 ├── scripts/                       # Runners, backtesters, and utilities
 │   ├── backtest_directional_orb.py
 │   ├── run_directional_orb_desk.py
-│   ├── run_silver_desk.py
 │   ├── run_weekly_etf_desk.py
-│   ├── backtest_nifty_3y.py
-│   ├── backtest_silver_strangle.py
-│   └── backtest_silver_strangle_1y.py
+│   └── backtest_nifty_3y.py
 ├── tests/                         # Pytest test suite
-│   ├── test_silver_options/
+│   ├── test_directional_orb_desk.py
 │   ├── test_etf_swing.py
 │   └── ...
 └── data/                          # State JSON files, caches, and universes
