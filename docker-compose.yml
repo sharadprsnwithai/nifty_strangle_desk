@@ -45,13 +45,13 @@ services:
     # command: ["--paper", "--lots", "10", "--poll", "5", "--single-leg-exit", "--trail-cost", "--morning-filter", "--morning-filter-pct", "0.60", "--strike-mode", "ATR", "--atr-multiplier", "1.25"]
     # -----------------------------------------------------------------------------------
 
-  etf-swing-desk:
+  stock-swing-desk:
     build:
       context: .
       dockerfile: Dockerfile
-      target: etf
-    container_name: etf_swing_desk
-    image: ${DOCKER_USER:-sharadprsn}/etf_swing_desk:latest
+      target: stock-swing
+    container_name: nse_stock_swing_desk
+    image: ${DOCKER_USER:-sharadprsn}/nse_stock_swing_desk:latest
     restart: unless-stopped
     env_file:
       - .env
@@ -69,14 +69,14 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./.env:/app/.env
-    entrypoint: ["python", "scripts/run_weekly_etf_desk.py"]
+    entrypoint: ["python", "scripts/run_stock_swing_desk.py"]
     # -----------------------------------------------------------------------------------
     # Command Options:
-    # 1. Live Production Execution (Active: Rs 10 Lakhs, 3 Slots, Friday 15:20 Scan + Monday 09:16 Rebalance):
-    command: ["--live", "--capital", "1000000", "--slots", "3", "--loop"]
+    # 1. Live Production Execution (FP-ALL: Rs 10 Lakhs, 1.5% Risk, 5 Slots, Daily 15:20 IST CNC):
+    command: ["--live", "--capital", "1000000", "--risk", "0.015", "--slots", "5", "--loop"]
     #
     # 2. Paper Trading Simulation:
-    # command: ["--paper", "--capital", "1000000", "--slots", "3", "--loop"]
+    # command: ["--paper", "--capital", "1000000", "--risk", "0.015", "--slots", "5", "--loop"]
     # -----------------------------------------------------------------------------------
 
   directional-orb-desk:

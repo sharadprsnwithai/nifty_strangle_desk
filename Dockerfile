@@ -1,7 +1,7 @@
 # Multi-stage production Dockerfile for Sharad's Trading Desks
 # Targets:
 #   - runtime (default): minimal image for strangle-desk
-#   - etf: adds pandas, numpy, and yfinance for etf-swing-desk
+#   - stock-swing: adds pandas, numpy, and yfinance for stock-swing-desk
 #   - directional-orb: pandas + numpy runtime for directional-orb-desk
 
 FROM python:3.12-slim-bookworm AS builder-base
@@ -44,7 +44,7 @@ COPY config.py main.py run_strategy.py ./
 COPY kite/ ./kite/
 COPY notifications/ ./notifications/
 COPY strategy/ ./strategy/
-COPY scripts/run_weekly_etf_desk.py scripts/run_directional_orb_desk.py ./scripts/
+COPY scripts/run_stock_swing_desk.py scripts/run_directional_orb_desk.py ./scripts/
 
 RUN mkdir -p /app/data /app/logs
 
@@ -52,7 +52,7 @@ ENTRYPOINT ["python", "run_strategy.py"]
 CMD ["--paper", "--lots", "1", "--poll", "5"]
 
 
-FROM runtime-base AS etf
+FROM runtime-base AS stock-swing
 COPY --from=builder-etf /app/.venv /app/.venv
 
 
