@@ -86,8 +86,11 @@ def main() -> int:
             profile = kite_client.profile()
             logger.info("Connected to Kite as: %s (%s)", profile.get("user_name"), profile.get("user_id"))
         except Exception as e:
-            logger.error("Kite authentication failed: %s", e)
-            return 1
+            if args.loop:
+                logger.warning("Kite auth deferred until 15:20 IST (.env will be re-read): %s", e)
+            else:
+                logger.error("Kite authentication failed: %s", e)
+                return 1
 
     notifier = build_notifier(args.no_telegram)
     config = StockSwingConfig(
